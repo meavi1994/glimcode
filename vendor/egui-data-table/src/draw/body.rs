@@ -232,7 +232,6 @@ impl<R, V: RowViewer<R>> Renderer<'_, R, V> {
 
                     // Actual widget rendering happens within this line.
 
-                    // ui.set_enabled(false);
                     ui.style_mut()
                         .visuals
                         .widgets
@@ -250,7 +249,11 @@ impl<R, V: RowViewer<R>> Renderer<'_, R, V> {
                     // intercepts interactions, which is basically natural behavior(Upper layer
                     // widgets). However, this change breaks current implementation which relies on
                     // the previous table behavior.
+                    let opacity = ui.opacity();
                     ui.add_enabled_ui(false, |ui| {
+                        // Disable child interaction so the table handles selection, but keep
+                        // data readable. Preserve any opacity inherited from the parent UI.
+                        ui.set_opacity(opacity);
                         if !(is_editing && is_interactive_cell) {
                             viewer.show_cell_view(ui, &table.rows[row_id.0], col.0);
                         }

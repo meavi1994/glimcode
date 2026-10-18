@@ -88,7 +88,7 @@ This edits CSV/TSV data, with no XLSX workbook or formula-calculation support.
 
 ## Markdown
 
-[egui_commonmark](https://github.com/lampsitter/egui_commonmark) provides GitHub-style headings, tables, task lists, strikethrough, lists, blockquotes, links, and fenced code blocks with highlighting. Switch between **Source**, **Split**, and **Preview**. Preview has larger headings, a padded reading area, blue links, and paragraph spacing. Local image paths resolve relative to the document; HTTP(S) images, PNG/JPEG files, SVG logos and extensionless SVG badges are supported. Inert HTML `<img>` tags support `src`, `alt`, and numeric `width`. Other embedded HTML is omitted and scripts are never executed. Preview uses native widgets rather than GitHub's exact CSS.
+[Comrak](https://github.com/kivikakk/comrak) parses CommonMark and GitHub-flavored Markdown, with [egui_commonmark](https://github.com/lampsitter/egui_commonmark) drawing the native preview. The preview supports headings, tables, task lists, strikethrough, lists, blockquotes, reference links, autolinks, footnotes, and fenced code blocks with highlighting. Switch between **Source**, **Split**, and **Preview**. Preview has larger headings, a padded reading area, blue links, and paragraph spacing. Local image paths resolve relative to the document; HTTP(S) images, PNG/JPEG files, SVG logos and extensionless SVG badges are supported. Inert HTML `<img>` tags support `src`, `alt`, and numeric `width`. Other embedded HTML is omitted and scripts are never executed. Preview uses native widgets rather than GitHub's exact CSS.
 
 ## Preferences
 

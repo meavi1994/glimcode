@@ -1,10 +1,11 @@
+use crate::markdown::MarkdownCache;
 use crate::{
     chrome,
     document::{Content, Document, MarkdownMode},
     navigation::{self, Location, SearchKind, SearchUpdate},
 };
 use eframe::egui::{self, Align, Color32, FontId, Key, RichText};
-use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+use egui_commonmark::CommonMarkViewer;
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -61,7 +62,7 @@ pub struct Coder {
     results_revision: u64,
     search_view: crate::search_view::SearchView,
     search_note: String,
-    cache: CommonMarkCache,
+    cache: MarkdownCache,
     status: String,
     error: Option<String>,
     pending: Option<Pending>,
@@ -329,7 +330,7 @@ impl Coder {
             results_revision: 0,
             search_view: Default::default(),
             search_note: String::new(),
-            cache: CommonMarkCache::default(),
+            cache: MarkdownCache::default(),
             status: "Ready".into(),
             error: None,
             pending: None,
@@ -3167,7 +3168,7 @@ fn category_toggle(
     }
 }
 
-fn markdown_preview(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str, path: &Path) {
+fn markdown_preview(ui: &mut egui::Ui, cache: &mut MarkdownCache, text: &str, path: &Path) {
     let scroll = egui::ScrollArea::vertical();
     #[cfg(feature = "ui-capture")]
     let scroll = if std::env::var("CODER_UI_PREVIEW").as_deref() == Ok("markdown") {
@@ -3212,12 +3213,11 @@ fn markdown_preview(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str, 
                                 continue;
                             }
                             let mut widget = egui::Image::new(uri.to_string())
+                                .fit_to_original_size(1.0)
                                 .max_width(ui.available_width())
                                 .maintain_aspect_ratio(true);
                             if let Some(width) = image.width {
-                                widget = widget
-                                    .fit_to_original_size(1.0)
-                                    .max_width(width.min(ui.available_width()));
+                                widget = widget.max_width(width.min(ui.available_width()));
                             }
                             let linked = base.join(&image.href).ok().filter(|url| {
                                 !image.href.is_empty() && matches!(url.scheme(), "http" | "https")
@@ -3242,12 +3242,12 @@ fn markdown_preview(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str, 
                         render(ui);
                     }
                 };
-                let prepared = crate::markdown_images::prepare(text);
+                cache.prepare(text);
                 CommonMarkViewer::new()
                     .default_implicit_uri_scheme(directory.to_string())
                     .max_image_width(Some(ui.available_width().max(1.0) as usize))
                     .render_html_fn(Some(&html))
-                    .show(ui, cache, &prepared);
+                    .show_events(ui, &mut cache.native, cache.events.iter().cloned());
             });
         });
 }
@@ -5124,13 +5124,13 @@ mod tests {
         assert_eq!(images[1].src, "https://example.org/a?x=1&y=2");
         let ctx = egui::Context::default();
         chrome::install(&ctx);
-        let mut cache = CommonMarkCache::default();
+        let mut cache = MarkdownCache::default();
         let output = ctx.run(Default::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 markdown_preview(
                     ui,
                     &mut cache,
-                    "# Large heading\n\nBody [link](https://example.org)",
+                    "# Large heading\n\nBody [link](https://example.org)\n\n- [x] Done\n\n| Engine | Support |\n| --- | --- |\n| Comrak | GFM |\n\n```rust\nfn main() {}\n```\n",
                     Path::new("/tmp/README.md"),
                 );
             });
@@ -5144,11 +5144,100 @@ mod tests {
             })
             .expect("heading rendered");
         assert!(heading.galley.job.sections[0].format.font_id.size >= 30.0);
+        for expected in ["Done", "Engine", "Comrak", "fn main() {}"] {
+            assert!(
+                output.shapes.iter().any(|shape| matches!(
+                    &shape.shape,
+                    egui::Shape::Text(text) if text.galley.text().contains(expected)
+                )),
+                "Missing rendered Markdown content: {expected}"
+            );
+        }
         assert_eq!(
             ctx.style().text_styles[&egui::TextStyle::Body].size,
             13.0,
             "preview styles stay local"
         );
+    }
+
+    #[test]
+    fn markdown_images_use_natural_size_constrained_by_pane_width() {
+        for pane_width in [480.0, 960.0] {
+            for (source, dimensions, explicit_width) in [
+                (
+                    "Before\n\n![Screenshot](image.svg)\n\nAfter",
+                    [1200, 600],
+                    None,
+                ),
+                (
+                    "[![Screenshot](image.svg)](https://example.org)",
+                    [1200, 600],
+                    None,
+                ),
+                (
+                    "<img src=\"image.svg\" width=\"240\">",
+                    [1200, 600],
+                    Some(240.0),
+                ),
+                ("![Badge](image.svg)", [80, 20], Some(80.0)),
+            ] {
+                let ctx = egui::Context::default();
+                chrome::install(&ctx);
+                egui_extras::install_image_loaders(&ctx);
+                let svg = format!(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}"><rect width="100%" height="100%" fill="white"/></svg>"#,
+                    dimensions[0], dimensions[1]
+                );
+                // Give the fixture priority over the asynchronous file loader.
+                let bytes = Arc::new(egui::load::DefaultBytesLoader::default());
+                bytes.insert("file:///tmp/image.svg", svg.into_bytes());
+                ctx.add_bytes_loader(bytes);
+                let mut cache = MarkdownCache::default();
+                for _ in 0..2 {
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(pane_width, 900.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                markdown_preview(
+                                    ui,
+                                    &mut cache,
+                                    source,
+                                    Path::new("/tmp/README.md"),
+                                );
+                            });
+                        },
+                    );
+                    let bounds = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Rect(rect) if rect.brush.is_some() => Some(rect.rect),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("Image did not render: {source}"));
+                    if let Some(width) = explicit_width {
+                        assert!(
+                            (bounds.width() - width).abs() < 1.0,
+                            "Incorrect image width: {bounds:?}"
+                        );
+                    } else {
+                        assert!(
+                            bounds.width() > pane_width - 100.0,
+                            "Screenshot shrank to a thumbnail: {bounds:?}"
+                        );
+                        assert!(bounds.width() < pane_width, "Screenshot must fit the pane");
+                    }
+                    let aspect = dimensions[0] as f32 / dimensions[1] as f32;
+                    assert!((bounds.width() / bounds.height() - aspect).abs() < 0.01);
+                }
+            }
+        }
     }
 
     #[test]

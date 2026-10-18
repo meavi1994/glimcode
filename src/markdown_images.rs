@@ -45,92 +45,9 @@ impl ImageLoader for BadgeLoader {
     }
 }
 
-/// Keep image-only paragraphs in one layout row. In particular a linked badge must
-/// allocate the image's width, rather than an empty text hyperlink after the image.
-pub fn prepare(source: &str) -> String {
-    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
-    let mut paragraph = None;
-    let mut image: Option<(String, String, String)> = None;
-    let mut valid = false;
-    let mut link: Option<String> = None;
-    let mut tags = String::new();
-    let mut replacements = Vec::new();
-    for (event, range) in Parser::new_ext(source, pulldown_cmark::Options::all()).into_offset_iter()
-    {
-        match event {
-            Event::Start(Tag::Paragraph) => {
-                paragraph = Some(range.start);
-                valid = true;
-                tags.clear();
-            }
-            Event::Start(Tag::Link { dest_url, .. }) => link = Some(dest_url.into_string()),
-            Event::End(TagEnd::Link) => link = None,
-            Event::Start(Tag::Image { dest_url, .. }) if paragraph.is_some() => {
-                image = Some((
-                    dest_url.into_string(),
-                    link.clone().unwrap_or_default(),
-                    String::new(),
-                ));
-            }
-            Event::End(TagEnd::Image) => {
-                if let Some((src, href, alt)) = image.take() {
-                    tags.push_str(&format!(
-                        "<img src=\"{}\" data-href=\"{}\" alt=\"{}\">",
-                        escape(&src),
-                        escape(&href),
-                        escape(&alt)
-                    ));
-                }
-            }
-            Event::Text(text) => {
-                if let Some((_, _, alt)) = &mut image {
-                    alt.push_str(&text);
-                } else if !text.trim().is_empty() {
-                    valid = false;
-                }
-            }
-            Event::Code(_) | Event::InlineHtml(_) => valid = false,
-            Event::End(TagEnd::Paragraph) => {
-                if let Some(start) = paragraph.take()
-                    && valid
-                    && !tags.is_empty()
-                {
-                    replacements.push((
-                        start..range.end,
-                        format!("<div data-coder-images>\n{tags}\n</div>\n"),
-                    ));
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut result = source.to_owned();
-    for (range, replacement) in replacements.into_iter().rev() {
-        result.replace_range(range, &replacement);
-    }
-    result
-}
-
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn badge_rows_preserve_links_and_alt_without_rewriting_code_or_prose() {
-        let source = "[![passing](https://example.org/badge)](https://example.org/project) ![release](https://example.org/release)\n\nProse ![inline](photo.png).\n\n```md\n![code](not-an-image.png)\n```\n";
-        let prepared = prepare(source);
-        assert!(prepared.contains("<div data-coder-images>"));
-        assert!(prepared.contains("data-href=\"https://example.org/project\" alt=\"passing\""));
-        assert_eq!(prepared.matches("<img ").count(), 2);
-        assert!(prepared.contains("Prose ![inline](photo.png)."));
-        assert!(prepared.contains("```md\n![code](not-an-image.png)\n```"));
-    }
     #[test]
     fn extensionless_svg_badges_render_and_cache() {
         let ctx = egui::Context::default();

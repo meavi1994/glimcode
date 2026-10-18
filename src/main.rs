@@ -9,6 +9,7 @@ mod folding;
 mod git;
 mod git_view;
 mod highlighting;
+mod markdown;
 mod markdown_images;
 mod navigation;
 mod preferences;

@@ -126,11 +126,13 @@ cargo build --release --locked
 
 Tests cover navigation, Unicode handling, search, highlighting, CSV round trips and UI interactions, saving, Git views, terminal behavior, and native layouts. Sample files live in [`examples/`](examples/).
 
+The Markdown preview uses Comrak for parsing and native widgets for display; see [`vendor/egui_commonmark/PATCHES.md`](vendor/egui_commonmark/PATCHES.md) for the renderer adapter.
+
 The table integration is vendored with small local changes; see [`vendor/egui-data-table/PATCHES.md`](vendor/egui-data-table/PATCHES.md).
 
 ## Built with
 
-[egui / eframe](https://github.com/emilk/egui) · [ripgrep](https://github.com/BurntSushi/ripgrep) · [Tree-sitter](https://tree-sitter.github.io/tree-sitter/) · [Syntect](https://github.com/trishume/syntect) · [egui-data-table](https://github.com/kang-sw/egui-data-table) · [egui_commonmark](https://github.com/lampsitter/egui_commonmark)
+[egui / eframe](https://github.com/emilk/egui) · [ripgrep](https://github.com/BurntSushi/ripgrep) · [Tree-sitter](https://tree-sitter.github.io/tree-sitter/) · [Syntect](https://github.com/trishume/syntect) · [egui-data-table](https://github.com/kang-sw/egui-data-table) · [Comrak](https://github.com/kivikakk/comrak) · [egui_commonmark](https://github.com/lampsitter/egui_commonmark)
 
 ## License
 

@@ -43,6 +43,7 @@ pub struct Viewer {
     wrap: bool,
     selected: Option<(String, String)>,
     widths: Vec<f32>,
+    font_size: f32,
 }
 
 /// Score complete records so quoted delimiters and multiline fields stay intact.
@@ -155,6 +156,7 @@ impl Sheet {
                 wrap: false,
                 selected: None,
                 widths,
+                font_size: 14.0,
             },
             delimiter,
             has_headers,
@@ -194,6 +196,7 @@ impl Sheet {
             self.refresh_unique_values();
         }
         ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+        self.viewer.font_size = crate::preferences::editor_font_size(ui.ctx()).max(14.0);
         ui.visuals_mut().faint_bg_color = egui::Color32::from_rgb(32, 35, 41);
         ui.visuals_mut().widgets.noninteractive.bg_stroke =
             egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(47, 52, 62));
@@ -410,20 +413,25 @@ impl Sheet {
             });
         ui.push_id("data-grid", |ui| {
             let wrap = self.viewer.wrap;
+            let font_size = self.viewer.font_size;
+            ui.style_mut().text_styles.insert(
+                egui::TextStyle::Monospace,
+                egui::FontId::monospace(font_size),
+            );
             ui.add(
                 egui_data_table::Renderer::new(&mut self.table, &mut self.viewer)
                     .with_style_modify(|style| {
                         style.table_row_height = if wrap {
                             None
                         } else {
-                            Some(if self.compact { 27.0 } else { 36.0 })
+                            Some(font_size + if self.compact { 12.0 } else { 20.0 })
                         };
                         style.single_click_edit_mode = self.single_click;
                         style.auto_shrink = egui::Vec2b::new(false, false);
-                        style.bg_selected_cell = Some(crate::chrome::SELECTED);
+                        style.bg_selected_cell = Some(egui::Color32::from_rgb(37, 53, 77));
                         style.bg_selected_highlight_cell =
-                            Some(egui::Color32::from_rgb(49, 82, 135));
-                        style.focused_row_stroke = Some(crate::chrome::BLUE.gamma_multiply(0.45));
+                            Some(egui::Color32::from_rgb(43, 65, 98));
+                        style.focused_row_stroke = Some(egui::Color32::from_rgb(64, 84, 113));
                     }),
             );
         });
@@ -535,9 +543,11 @@ impl RowViewer<Row> for Viewer {
                 } else {
                     crate::chrome::TEXT
                 };
-                let galley =
-                    ui.painter()
-                        .layout_no_wrap(label, egui::FontId::proportional(12.0), color);
+                let galley = ui.painter().layout_no_wrap(
+                    label,
+                    egui::FontId::proportional(self.font_size),
+                    color,
+                );
                 let text_rect = egui::Rect::from_min_max(
                     rect.min,
                     egui::pos2(rect.right() - 28.0, rect.bottom()),
@@ -778,7 +788,7 @@ impl RowViewer<Row> for Viewer {
         _: bool,
     ) -> egui_data_table::viewer::TableColumnConfig {
         egui_data_table::viewer::TableColumnConfig::initial(
-            self.widths.get(column).copied().unwrap_or(140.0),
+            self.widths.get(column).copied().unwrap_or(140.0) * self.font_size / 13.0,
         )
         .at_least(70.0)
         .resizable(true)
@@ -791,11 +801,11 @@ impl RowViewer<Row> for Viewer {
         let value = &row[column];
         let numeric = value.trim().parse::<f64>().is_ok_and(f64::is_finite);
         let color = if numeric {
-            egui::Color32::from_rgb(115, 175, 225)
+            egui::Color32::from_rgb(137, 191, 242)
         } else if matches!(value.as_str(), "true" | "false") {
-            egui::Color32::from_rgb(195, 146, 220)
+            egui::Color32::from_rgb(205, 164, 235)
         } else {
-            ui.visuals().text_color()
+            crate::chrome::TEXT
         };
         let layout = if numeric {
             egui::Layout::right_to_left(egui::Align::Center)
@@ -803,7 +813,12 @@ impl RowViewer<Row> for Viewer {
             egui::Layout::left_to_right(egui::Align::Center)
         };
         ui.with_layout(layout, |ui| {
-            let label = egui::Label::new(egui::RichText::new(value).color(color));
+            ui.add_space(8.0);
+            let label = egui::Label::new(
+                egui::RichText::new(value)
+                    .font(egui::FontId::monospace(self.font_size))
+                    .color(color),
+            );
             ui.add(if self.wrap {
                 label.wrap()
             } else {
@@ -823,6 +838,8 @@ impl RowViewer<Row> for Viewer {
         }
         let response = ui.add(
             egui::TextEdit::multiline(&mut row[column])
+                .font(egui::FontId::monospace(self.font_size))
+                .text_color(crate::chrome::TEXT)
                 .desired_rows(1)
                 .desired_width(f32::INFINITY),
         );
@@ -976,6 +993,66 @@ impl RowCodec<Row> for Codec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cell_text_keeps_parent_opacity_and_follows_editor_font_size() -> Result<()> {
+        for (opacity, font_size) in [(1.0, 13.0), (0.4, 20.0)] {
+            let ctx = egui::Context::default();
+            crate::chrome::install(&ctx);
+            crate::preferences::Settings {
+                editor_font_size: font_size,
+                ..Default::default()
+            }
+            .apply(&ctx);
+            let mut sheet = Sheet::parse("name,value\nAlice,10\nBob,27\n", b',', true)?;
+            // A second pass gives the virtual table its measured column widths.
+            for _ in 0..2 {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1400.0, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.set_opacity(opacity);
+                            sheet.ui(ui);
+                        });
+                    },
+                );
+                for value in ["Alice", "10", "Bob", "27"] {
+                    let text = output.shapes.iter().find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == value => Some(text),
+                        _ => None,
+                    });
+                    let text = text.unwrap_or_else(|| panic!("Missing cell: {value}"));
+                    let color = if value.parse::<f64>().is_ok() {
+                        egui::Color32::from_rgb(137, 191, 242)
+                    } else {
+                        crate::chrome::TEXT
+                    }
+                    .gamma_multiply(opacity);
+                    assert!(
+                        text.galley.rows.iter().any(|row| row
+                            .visuals
+                            .mesh
+                            .vertices
+                            .iter()
+                            .any(|vertex| vertex.color == color)),
+                        "Cell {value} should retain its color at the parent opacity"
+                    );
+                    assert_eq!(
+                        text.galley.job.sections[0].format.font_id,
+                        egui::FontId::monospace(font_size.max(14.0))
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn detects_delimiters_without_splitting_quoted_values() -> Result<()> {
         for (source, delimiter) in [

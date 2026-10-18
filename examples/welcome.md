@@ -14,7 +14,7 @@ A small workspace for **code**, **data**, and **notes**.
 | Project search | ripgrep |
 | Code outline | Tree-sitter |
 | CSV sheets | egui-data-table |
-| Markdown | egui_commonmark |
+| Markdown | Comrak + egui_commonmark |
 
 > Use double Shift to navigate around the project.
 
