@@ -91,6 +91,7 @@ pub struct Coder {
     show_file_filter: bool,
     search_open: bool,
     search_docked: bool,
+    search_split: f32,
     result_selection: usize,
     search_focus: bool,
     preview: crate::preview::PreviewService,
@@ -128,6 +129,13 @@ impl Coder {
             app.files = navigation::files(&app.root).unwrap_or_default();
             app.tree = crate::explorer::FileTree::build(&app.root, &app.files);
             app.files_rx = None;
+            if mode == "workspace-search" {
+                app.show_project = false;
+                app.query =
+                    std::env::var("GLIMCODE_PREVIEW_QUERY").unwrap_or_else(|_| "main".into());
+                app.start_search(SearchKind::References, false);
+                return app;
+            }
             if mode.starts_with("csv-") {
                 app.show_project = false;
                 if mode == "csv-source"
@@ -351,6 +359,7 @@ impl Coder {
             show_file_filter: false,
             search_open: false,
             search_docked: false,
+            search_split: 0.7,
             result_selection: 0,
             search_focus: false,
             preview: Default::default(),
@@ -1236,7 +1245,7 @@ impl Coder {
                 .min_width(480.0)
                 .default_height((size.y * 0.78).clamp(350.0, 720.0))
                 .min_height(350.0)
-                .frame(chrome::popup_frame())
+                .frame(chrome::popup_frame().inner_margin(14))
                 .show(ctx, |ui| {
                     chrome::dialog_style(ui, ui.available_width());
                     self.search_contents(ui, false);
@@ -1249,6 +1258,9 @@ impl Coder {
 
     fn search_contents(&mut self, ui: &mut egui::Ui, docked: bool) {
         use crate::search_view::Scope;
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+        ui.spacing_mut().button_padding = egui::vec2(10.0, 4.0);
+        ui.spacing_mut().interact_size.y = 26.0;
         self.update_search_scope();
         self.search_view.refresh(
             &self.results,
@@ -1257,12 +1269,14 @@ impl Coder {
             self.extension_filter.as_deref(),
         );
         let minimum_height = (ui.available_height() - 32.0).max(250.0);
-        if !docked {
+        if docked {
+            ui.set_min_height(ui.available_height());
+        } else {
             ui.set_min_height(minimum_height);
         }
         ui.horizontal(|ui| {
             chrome::heading_icon(ui, chrome::Icon::Search, chrome::BLUE);
-            ui.label(RichText::new("Find in Files").size(18.0).strong());
+            ui.label(RichText::new("Find in Files").size(16.0).strong());
             ui.label(RichText::new(&self.search_note).color(chrome::MUTED));
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 if chrome::icon_button(
@@ -1301,13 +1315,13 @@ impl Coder {
                 }
             });
         });
-        ui.add_space(10.0);
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Find").size(16.0).color(chrome::MUTED));
             let field = ui.add(
                 egui::TextEdit::singleline(&mut self.query)
                     .frame(false)
-                    .font(FontId::proportional(20.0))
+                    .font(FontId::proportional(16.0))
                     .hint_text("Search in project…")
                     .desired_width((ui.available_width() - 255.0).max(100.0)),
             );
@@ -1419,114 +1433,156 @@ impl Coder {
         );
         let visible = self.search_view.indices.clone();
         self.result_selection = self.result_selection.min(visible.len().saturating_sub(1));
+        let mut reveal_selection = false;
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowDown)) {
-            self.result_selection =
-                (self.result_selection + 1).min(visible.len().saturating_sub(1));
+            if !visible.is_empty() {
+                self.result_selection = (self.result_selection + 1) % visible.len();
+            }
+            reveal_selection = true;
         }
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowUp)) {
-            self.result_selection = self.result_selection.saturating_sub(1);
+            if !visible.is_empty() {
+                self.result_selection = (self.result_selection + visible.len() - 1) % visible.len();
+            }
+            reveal_selection = true;
         }
         let mut navigate = None;
-        let space = (ui.available_height() - if docked { 168.0 } else { 240.0 }).max(40.0);
-        let list_height = space * 0.45;
-        let preview_height = space * 0.55;
-        egui::ScrollArea::vertical()
+        // Reserve only the preview heading, frame padding and divider; the rest is content.
+        let space = (ui.available_height() - 80.0).max(0.0);
+        let list_height = space * self.search_split;
+        let preview_height = space - list_height;
+        let mut matches = egui::ScrollArea::vertical()
             .id_salt("search-matches")
             .auto_shrink([false, false])
             .min_scrolled_height(list_height)
-            .max_height(list_height)
-            .show_rows(ui, 30.0, visible.len(), |ui, range| {
-                if visible.is_empty() {
-                    ui.weak(if self.search_rx.is_some() {
-                        "Searching…"
-                    } else {
-                        "No matching results"
-                    });
-                }
-                for index in range {
-                    let location = &self.results[visible[index]];
-                    let selected = index == self.result_selection;
-                    let (rect, response) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), 30.0),
-                        egui::Sense::click(),
-                    );
-                    if selected || response.hovered() {
-                        ui.painter().rect_filled(
-                            rect,
-                            4.0,
-                            if selected {
-                                chrome::SELECTED
-                            } else {
-                                chrome::HEADER
-                            },
-                        );
-                    }
-                    let suffix = format!(
-                        "{}{} :{}",
-                        if visible[index] < self.open_matches {
-                            "Open · "
+            .max_height(list_height);
+        if reveal_selection {
+            let id = ui.make_persistent_id(egui::Id::new("search-matches"));
+            let offset = egui::scroll_area::State::load(ui.ctx(), id)
+                .unwrap_or_default()
+                .offset
+                .y;
+            let row_top = self.result_selection as f32 * (30.0 + ui.spacing().item_spacing.y);
+            let offset = if row_top < offset {
+                row_top
+            } else if row_top + 30.0 > offset + list_height {
+                row_top + 30.0 - list_height
+            } else {
+                offset
+            };
+            matches = matches.vertical_scroll_offset(offset);
+        }
+        matches.show_rows(ui, 30.0, visible.len(), |ui, range| {
+            if visible.is_empty() {
+                ui.weak(if self.search_rx.is_some() {
+                    "Searching…"
+                } else {
+                    "No matching results"
+                });
+            }
+            for index in range {
+                let location = &self.results[visible[index]];
+                let selected = index == self.result_selection;
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 30.0),
+                    egui::Sense::click(),
+                );
+                if selected || response.hovered() {
+                    ui.painter().rect_filled(
+                        rect,
+                        4.0,
+                        if selected {
+                            chrome::SELECTED
                         } else {
-                            ""
+                            chrome::HEADER
                         },
-                        location
-                            .path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy(),
-                        location.line
                     );
-                    let galley = ui.fonts_mut(|fonts| {
-                        fonts.layout_no_wrap(
-                            suffix,
-                            FontId::proportional(13.0),
-                            if selected {
-                                chrome::TEXT
-                            } else {
-                                chrome::MUTED
-                            },
-                        )
-                    });
-                    let right_width = galley.size().x;
-                    ui.painter().galley(
-                        egui::pos2(
-                            rect.right() - right_width - 10.0,
-                            rect.center().y - galley.size().y / 2.0,
-                        ),
-                        galley,
-                        chrome::TEXT,
-                    );
-                    let mut painter = ui.painter().clone();
-                    painter.set_clip_rect(
-                        ui.clip_rect()
-                            .intersect(rect.shrink2(egui::vec2(8.0, 0.0)))
-                            .intersect(egui::Rect::from_min_max(
-                                rect.min,
-                                egui::pos2(rect.right() - right_width - 24.0, rect.bottom()),
-                            )),
-                    );
-                    let galley = ui.fonts_mut(|fonts| {
-                        fonts.layout_job(chrome::highlighted(
-                            location.preview.trim_start(),
-                            &self.query,
-                            14.0,
-                        ))
-                    });
-                    painter.galley(
-                        rect.left_center() + egui::vec2(10.0, -galley.size().y / 2.0),
-                        galley,
-                        chrome::TEXT,
-                    );
-                    if response.clicked() {
-                        self.result_selection = index;
-                    }
-                    if response.double_clicked() {
-                        navigate = Some(location.clone());
-                    }
                 }
-            });
+                let suffix = format!(
+                    "{}{} :{}",
+                    if visible[index] < self.open_matches {
+                        "Open · "
+                    } else {
+                        ""
+                    },
+                    location
+                        .path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                    location.line
+                );
+                let galley = ui.fonts_mut(|fonts| {
+                    fonts.layout_no_wrap(
+                        suffix,
+                        FontId::proportional(13.0),
+                        if selected {
+                            chrome::TEXT
+                        } else {
+                            chrome::MUTED
+                        },
+                    )
+                });
+                let right_width = galley.size().x;
+                ui.painter().galley(
+                    egui::pos2(
+                        rect.right() - right_width - 10.0,
+                        rect.center().y - galley.size().y / 2.0,
+                    ),
+                    galley,
+                    chrome::TEXT,
+                );
+                let mut painter = ui.painter().clone();
+                painter.set_clip_rect(
+                    ui.clip_rect()
+                        .intersect(rect.shrink2(egui::vec2(8.0, 0.0)))
+                        .intersect(egui::Rect::from_min_max(
+                            rect.min,
+                            egui::pos2(rect.right() - right_width - 24.0, rect.bottom()),
+                        )),
+                );
+                let galley = ui.fonts_mut(|fonts| {
+                    fonts.layout_job(chrome::highlighted(
+                        location.preview.trim_start(),
+                        &self.query,
+                        14.0,
+                    ))
+                });
+                painter.galley(
+                    rect.left_center() + egui::vec2(10.0, -galley.size().y / 2.0),
+                    galley,
+                    chrome::TEXT,
+                );
+                if response.clicked() {
+                    self.result_selection = index;
+                }
+                if response.double_clicked() {
+                    navigate = Some(location.clone());
+                }
+            }
+        });
+        let (divider, drag) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::drag());
+        ui.painter().hline(
+            divider.x_range(),
+            divider.center().y,
+            egui::Stroke::new(
+                1.0_f32,
+                if drag.hovered() || drag.dragged() {
+                    chrome::BLUE
+                } else {
+                    chrome::BORDER
+                },
+            ),
+        );
+        if drag.dragged() && space > 0.0 {
+            self.search_split =
+                (self.search_split + ui.input(|i| i.pointer.delta().y) / space).clamp(0.35, 0.85);
+        }
+        drag.on_hover_cursor(egui::CursorIcon::ResizeVertical)
+            .on_hover_text("Drag to resize results and preview · ↑/↓ to select · Enter to open");
         if let Some(index) = visible.get(self.result_selection) {
             let location = self.results[*index].clone();
-            ui.separator();
             ui.horizontal(|ui| {
                 ui.label(chrome::file_icon(&location.path));
                 ui.strong(
@@ -1549,7 +1605,6 @@ impl Coder {
                 navigate = Some(location);
             }
         } else {
-            ui.separator();
             ui.horizontal(|ui| {
                 ui.strong("Preview");
                 ui.weak("Select a result to browse its file");
@@ -1561,20 +1616,6 @@ impl Coder {
                     ui.allocate_space(egui::vec2(ui.available_width(), preview_height));
                 });
         }
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.weak(format!(
-                "{} results  ·  Arrow keys to preview  ·  Enter to open",
-                visible.len()
-            ));
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                if chrome::dialog_button(ui, "Open in Editor", Some(chrome::BLUE)).clicked()
-                    && let Some(index) = visible.get(self.result_selection)
-                {
-                    navigate = Some(self.results[*index].clone());
-                }
-            });
-        });
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
             self.search_open = false;
         }
@@ -4311,7 +4352,8 @@ mod tests {
                     assert_eq!(
                         frame(&mut app, vec![]).platform_output.cursor_icon,
                         cursor,
-                        "idle {panel} at {delta}"
+                        "idle {panel} at {delta}: original={handle:?} current={:?}",
+                        ctx.read_response(id).map(|r| r.rect)
                     );
                 }
             }
@@ -4778,6 +4820,92 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn search_keyboard_scrolls_virtual_results_and_wraps_without_a_footer() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("sample.rs");
+        std::fs::write(&path, "// preview\n".repeat(60))?;
+        let mut app = Coder::empty(dir.path().to_path_buf());
+        app.query = "result".into();
+        app.results = (0..40)
+            .map(|index| Location {
+                path: path.clone(),
+                line: index + 1,
+                column: 1,
+                preview: format!("result {index}"),
+                category: navigation::MatchCategory::Usage,
+            })
+            .collect();
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let mut time = 0.0;
+        let mut frame = |app: &mut Coder, key: Option<Key>| {
+            time += 0.1;
+            let mut id = egui::Id::NULL;
+            let mut bounds = egui::Rect::NOTHING;
+            let output = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 700.0),
+                    )),
+                    events: key
+                        .into_iter()
+                        .map(|key| egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        id = ui.make_persistent_id(egui::Id::new("search-matches"));
+                        app.search_contents(ui, false);
+                        bounds = ui.min_rect();
+                    });
+                },
+            );
+            (
+                output,
+                egui::scroll_area::State::load(&ctx, id)
+                    .unwrap_or_default()
+                    .offset
+                    .y,
+                bounds,
+            )
+        };
+        for _ in 0..3 {
+            frame(&mut app, None);
+        }
+        for _ in 0..25 {
+            frame(&mut app, Some(Key::ArrowDown));
+        }
+        let (output, offset, bounds) = frame(&mut app, None);
+        assert_eq!(app.result_selection, 25);
+        assert!(offset > 0.0, "Down must scroll past the last visible row");
+        assert!(
+            bounds.bottom() <= 700.0,
+            "search content must fit its height: {bounds:?}"
+        );
+        assert!(output.shapes.iter().any(
+            |shape| matches!(&shape.shape, egui::Shape::Text(t) if t.galley.text() == "result 25")
+        ));
+        assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(t) if t.galley.text() == "Open in Editor")));
+        app.result_selection = 39;
+        frame(&mut app, Some(Key::ArrowDown));
+        assert_eq!(app.result_selection, 0);
+        assert_eq!(frame(&mut app, None).1, 0.0);
+        frame(&mut app, Some(Key::ArrowUp));
+        assert_eq!(app.result_selection, 39);
+        assert!(frame(&mut app, None).1 > 0.0);
+        Ok(())
     }
 
     #[test]

@@ -67,6 +67,9 @@ impl MatchCategory {
     }
 }
 
+#[cfg(test)]
+static CLASSIFY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct Classifier {
     tree: tree_sitter::Tree,
 }
@@ -75,9 +78,12 @@ impl Classifier {
     fn new(path: &Path, source: &str) -> Option<Self> {
         let mut parser = Parser::new();
         parser.set_language(&language(path)?).ok()?;
-        Some(Self {
-            tree: parser.parse(source, None)?,
-        })
+        #[cfg(test)]
+        let start = Instant::now();
+        let tree = parser.parse(source, None)?;
+        #[cfg(test)]
+        CLASSIFY_NS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Some(Self { tree })
     }
 
     fn category(&self, start: usize, end: usize) -> MatchCategory {
@@ -657,11 +663,25 @@ fn search_stream(
         .word(kind != SearchKind::Text)
         .line_terminator(Some(b'\n'))
         .build(query)?;
-    // Two workers bound concurrent syntax trees and I/O buffers. The channel bounds
-    // queued results and provides backpressure when the consumer stops or hits its limit.
+    // Normalize editor aliases once, rather than resolving every scanned file.
+    let canonical_root = root.canonicalize()?;
+    let excluded: std::collections::HashSet<_> = excluded
+        .iter()
+        .flat_map(|path| {
+            let resolved = path.canonicalize().ok().and_then(|path| {
+                path.strip_prefix(&canonical_root)
+                    .ok()
+                    .map(|relative| root.join(relative))
+            });
+            std::iter::once(path.clone()).chain(resolved)
+        })
+        .collect();
+    // Cap concurrent syntax trees and I/O buffers, while using more than two cores
+    // on larger machines. The bounded channel provides backpressure.
+    let threads = std::thread::available_parallelism().map_or(2, |n| n.get().min(4));
     let walk = workspace_walk(root)?
         .max_filesize(Some(MAX_FILE_BYTES))
-        .threads(2)
+        .threads(threads)
         .build_parallel();
     let stopped = AtomicBool::new(false);
     let (sender, receiver) = std::sync::mpsc::sync_channel::<Result<Vec<Location>>>(4);
@@ -669,9 +689,12 @@ fn search_stream(
         let matcher = &matcher;
         let stopped = &stopped;
         let cancelled = &*cancelled;
+        let excluded = &excluded;
         scope.spawn(move || {
             walk.run(|| {
                 let sender = sender.clone();
+                // Clones share the compiled pattern but own their search scratch state.
+                let matcher = matcher.clone();
                 let mut searcher = SearcherBuilder::new()
                     .line_number(true)
                     .binary_detection(BinaryDetection::quit(b'\0'))
@@ -686,15 +709,12 @@ fn search_stream(
                             return Ok(());
                         }
                         let path = entry.path();
-                        if excluded.contains(path)
-                            || (!excluded.is_empty()
-                                && path.canonicalize().is_ok_and(|p| excluded.contains(&p)))
-                        {
+                        if excluded.contains(path) {
                             return Ok(());
                         }
                         search_file(
                             path,
-                            matcher,
+                            &matcher,
                             query,
                             kind,
                             &mut searcher,
@@ -1000,6 +1020,85 @@ mod tests {
             search(dir.path(), "needle", SearchKind::Text)?.locations[0].path,
             path
         );
+        Ok(())
+    }
+
+    /// Optional local comparison; requires rg only for the CLI baseline.
+    #[test]
+    #[ignore]
+    fn search_benchmark() -> Result<()> {
+        let root = PathBuf::from(std::env::var("GLIMCODE_BENCH_ROOT")?);
+        let query = std::env::var("GLIMCODE_BENCH_QUERY").unwrap_or_else(|_| "main".into());
+        for _ in 0..3 {
+            let start = Instant::now();
+            let output = std::process::Command::new("rg")
+                .args([
+                    "--json",
+                    "--fixed-strings",
+                    "--word-regexp",
+                    "--hidden",
+                    "-g",
+                    "!.git",
+                    "-g",
+                    "!target",
+                    "--max-filesize",
+                    "20M",
+                    "--",
+                    &query,
+                    ".",
+                ])
+                .current_dir(&root)
+                .output()?;
+            assert!(output.status.success() || output.status.code() == Some(1));
+            let cli = start.elapsed();
+            CLASSIFY_NS.store(0, Ordering::Relaxed);
+            let start = Instant::now();
+            let mut first = None;
+            let mut count = 0;
+            search_stream(
+                &root,
+                &query,
+                SearchKind::References,
+                &[root.join("cmd/cloud-controller-manager/main.go")].into(),
+                MAX_RESULTS,
+                Arc::new(AtomicBool::new(false)),
+                |batch| {
+                    first.get_or_insert_with(|| start.elapsed());
+                    count += batch.len();
+                },
+            )?;
+            eprintln!(
+                "cli={cli:?} embedded={:?} first={first:?} hits={count} tree_parse_sum={:?}",
+                start.elapsed(),
+                Duration::from_nanos(CLASSIFY_NS.load(Ordering::Relaxed))
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_editor_paths_are_excluded_through_a_project_alias() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("project");
+        std::fs::create_dir(&root)?;
+        let open = root.join("open.txt");
+        std::fs::write(&open, "needle")?;
+        std::fs::write(root.join("other.txt"), "needle")?;
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias)?;
+        let mut results = vec![];
+        search_stream(
+            &alias,
+            "needle",
+            SearchKind::Text,
+            &[open.canonicalize()?].into(),
+            MAX_RESULTS,
+            Arc::new(AtomicBool::new(false)),
+            |batch| results.extend(batch),
+        )?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, alias.join("other.txt"));
         Ok(())
     }
 

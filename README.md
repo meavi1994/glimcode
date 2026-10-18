@@ -28,7 +28,7 @@ If an AI agent handles much of your typing, you still need to find the right fil
 - **Highlighting built in.** Language-aware colors, folding, matching brackets, indentation guides, and a full-file search preview.
 - **The tools beside your code.** Git diffs and blame, a native terminal, editable CSV/TSV grids, and Markdown previews.
 
-Search uses the official `grep` library and `ignore` walker directly, with two background search workers, bounded result queues, and cancellation. It does not launch an external search process or parse command-line JSON output.
+Search uses the official `grep` library and `ignore` walker directly, with up to four background search workers, bounded result queues, and cancellation. It does not launch an external search process or parse command-line JSON output.
 
 The architecture is designed to keep memory overhead low. **We do not yet publish a measured RAM comparison with IntelliJ or a fixed memory-usage promise.** Usage depends on project size, open files, terminal sessions, and workload. Reproducible performance measurements and improvements are welcome.
 

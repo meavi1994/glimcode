@@ -40,6 +40,16 @@ Include your OS and architecture, the commit you built, reproduction steps, expe
 
 For performance reports, include debug versus release build, repository size, open files, terminal sessions, measurement method, and the workload. Memory numbers should be reproducible and comparisons should use equivalent workloads.
 
+## Optional search timing comparison
+
+With `rg` installed for the baseline only, compare release-mode search on a real repository:
+
+```sh
+GLIMCODE_BENCH_ROOT=/path/to/project GLIMCODE_BENCH_QUERY=main cargo test --release --locked search_benchmark -- --ignored --nocapture
+```
+
+The output reports CLI completion, embedded completion, first embedded result, hit count, and summed syntax-parser time across workers. The embedded path includes classification and the 2,000-result cap; the CLI baseline emits all matches without classification. These are diagnostic timings, not equivalent-workload performance claims. The benchmark is ignored in normal test runs.
+
 ## Source map
 
 - `src/app.rs`: desktop workspace and editor integration
