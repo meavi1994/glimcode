@@ -762,6 +762,8 @@ struct Review {
     split: Vec<SplitRow>,
     scroll_y: f32,
     hunk: usize,
+    changes: Vec<usize>,
+    jump_requested: bool,
     before_newline: bool,
     after_newline: bool,
 }
@@ -822,7 +824,75 @@ fn split_rows(rows: &[diff::Row], visible: &[ReviewRow]) -> Vec<SplitRow> {
     result
 }
 
+fn change_targets(rows: &[diff::Row]) -> Vec<usize> {
+    let mut targets = Vec::new();
+    let mut pending = false;
+    for row in review_rows(rows, false) {
+        match row {
+            ReviewRow::Hunk(_) => pending = true,
+            ReviewRow::Line(index) if pending && rows[index].changed => {
+                targets.push(index);
+                pending = false;
+            }
+            _ => {}
+        }
+    }
+    targets
+}
+
 impl Review {
+    /// Map stable changes to each layout, including expanded full context.
+    fn target_rows(&self, mode: DiffMode) -> Vec<usize> {
+        let mut positions = vec![None; self.changes.len()];
+        match mode {
+            DiffMode::Unified => {
+                let wanted: BTreeMap<_, _> = self
+                    .changes
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &row)| (row, slot))
+                    .collect();
+                for (position, row) in self.visible.iter().enumerate() {
+                    if let ReviewRow::Line(line) = row
+                        && let Some(&slot) = wanted.get(line)
+                    {
+                        positions[slot] = Some(position);
+                    }
+                }
+            }
+            DiffMode::Split => {
+                let mut before = BTreeMap::new();
+                let mut after = BTreeMap::new();
+                for (slot, &row) in self.changes.iter().enumerate() {
+                    if let Some(line) = self.rows[row].disk {
+                        before.insert(line, slot);
+                    } else if let Some(line) = self.rows[row].editor {
+                        after.insert(line, slot);
+                    }
+                }
+                for (position, row) in self.split.iter().enumerate() {
+                    if let SplitRow::Line {
+                        before: old,
+                        after: new,
+                        ..
+                    } = row
+                    {
+                        if let Some(&slot) = old.and_then(|line| before.get(&line)) {
+                            positions[slot] = Some(position);
+                        }
+                        if let Some(&slot) = new.and_then(|line| after.get(&line)) {
+                            positions[slot] = Some(position);
+                        }
+                    }
+                }
+            }
+        }
+        positions
+            .into_iter()
+            .map(|row| row.expect("each change must be represented in both layouts"))
+            .collect()
+    }
+
     fn new(
         repo: &Repository,
         path: PathBuf,
@@ -845,6 +915,8 @@ impl Review {
             base: repo.base.clone(),
             before,
             after,
+            changes: change_targets(&rows),
+            jump_requested: false,
             rows,
             visible,
             full: false,
@@ -900,42 +972,38 @@ impl Review {
             if ui.checkbox(&mut self.full, "Full context").changed() {
                 self.visible = review_rows(&self.rows, self.full);
                 self.split = split_rows(&self.rows, &self.visible);
-                self.scroll_y = 0.0;
-                self.hunk = 0;
+                self.jump_requested = true;
             }
-            let hunks: Vec<_> = match mode {
-                DiffMode::Unified => self
-                    .visible
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, r)| matches!(r, ReviewRow::Hunk(_)).then_some(i))
-                    .collect(),
-                DiffMode::Split => self
-                    .split
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, r)| matches!(r, SplitRow::Hunk(_)).then_some(i))
-                    .collect(),
-            };
-            if !hunks.is_empty() {
-                let current = self.hunk.min(hunks.len() - 1);
-                if ui.small_button("↑ Previous").clicked() {
-                    self.hunk = (current + hunks.len() - 1) % hunks.len();
-                    self.scroll_y = hunks[self.hunk] as f32 * height;
+            let count = self.changes.len();
+            if count > 0 {
+                self.hunk = self.hunk.min(count - 1);
+                if ui
+                    .add_enabled(self.hunk > 0, egui::Button::new("↑ Previous").small())
+                    .clicked()
+                {
+                    self.hunk -= 1;
+                    self.jump_requested = true;
                 }
-                if ui.small_button("↓ Next").clicked() {
-                    self.hunk = (current + 1) % hunks.len();
-                    self.scroll_y = hunks[self.hunk] as f32 * height;
+                if ui
+                    .add_enabled(self.hunk + 1 < count, egui::Button::new("↓ Next").small())
+                    .clicked()
+                {
+                    self.hunk += 1;
+                    self.jump_requested = true;
                 }
-                ui.weak(
-                    RichText::new(format!("{} / {} hunks", self.hunk + 1, hunks.len())).size(10.0),
-                );
+                ui.weak(RichText::new(format!("{} / {} hunks", self.hunk + 1, count)).size(10.0));
             }
         });
         if *mode != previous_mode {
-            self.scroll_y = 0.0;
-            self.hunk = 0;
+            self.jump_requested = true;
         }
+        let targets = self.target_rows(*mode);
+        let jumped = std::mem::take(&mut self.jump_requested);
+        if jumped && let Some(&row) = targets.get(self.hunk) {
+            // Leave a little context above the selected change.
+            self.scroll_y = (row as f32 * height - 2.0 * height).max(0.0);
+        }
+        let requested_y = self.scroll_y;
         if added + removed == 0 {
             ui.add_space(20.0);
             ui.colored_label(chrome::GREEN, "No changes relative to this base.");
@@ -952,50 +1020,61 @@ impl Review {
                     .id_salt(("unified-diff", &self.path))
                     .vertical_scroll_offset(self.scroll_y)
                     .auto_shrink([false, false])
-                    .show_rows(ui, height, self.visible.len(), |ui, range| {
-                        let width = ui.available_width().max(
-                            self.before.width.max(self.after.width) * scale
-                                + 100.0
-                                + if self.before_newline && self.after_newline {
-                                    0.0
-                                } else {
-                                    200.0
-                                },
-                        );
-                        ui.set_min_width(width);
-                        for index in range {
-                            match &self.visible[index] {
-                                ReviewRow::Hunk(header) => paint_hunk(ui, header, width, height),
-                                ReviewRow::Line(line) => {
-                                    let row = &self.rows[*line];
-                                    let (preview, number, newline) = if let Some(line) = row.editor
-                                    {
-                                        (&self.after, line, self.after_newline)
+                    .show_rows(
+                        ui,
+                        height,
+                        self.visible.len() + (ui.available_height() / height).ceil() as usize,
+                        |ui, range| {
+                            let width = ui.available_width().max(
+                                self.before.width.max(self.after.width) * scale
+                                    + 100.0
+                                    + if self.before_newline && self.after_newline {
+                                        0.0
                                     } else {
-                                        (&self.before, row.disk.unwrap_or(0), self.before_newline)
-                                    };
-                                    let mark = if !row.changed {
-                                        ' '
-                                    } else if row.editor.is_some() {
-                                        '+'
-                                    } else {
-                                        '-'
-                                    };
-                                    paint_diff_line(
-                                        ui,
-                                        preview,
-                                        Some(number),
-                                        &[row.disk, row.editor],
-                                        mark,
-                                        newline,
-                                        width,
-                                        height,
-                                        None,
-                                    );
+                                        200.0
+                                    },
+                            );
+                            ui.set_min_width(width);
+                            for index in range.take_while(|&index| index < self.visible.len()) {
+                                match &self.visible[index] {
+                                    ReviewRow::Hunk(header) => {
+                                        paint_hunk(ui, header, width, height)
+                                    }
+                                    ReviewRow::Line(line) => {
+                                        let row = &self.rows[*line];
+                                        let (preview, number, newline) =
+                                            if let Some(line) = row.editor {
+                                                (&self.after, line, self.after_newline)
+                                            } else {
+                                                (
+                                                    &self.before,
+                                                    row.disk.unwrap_or(0),
+                                                    self.before_newline,
+                                                )
+                                            };
+                                        let mark = if !row.changed {
+                                            ' '
+                                        } else if row.editor.is_some() {
+                                            '+'
+                                        } else {
+                                            '-'
+                                        };
+                                        paint_diff_line(
+                                            ui,
+                                            preview,
+                                            Some(number),
+                                            &[row.disk, row.editor],
+                                            mark,
+                                            newline,
+                                            width,
+                                            height,
+                                            None,
+                                        );
+                                    }
                                 }
                             }
-                        }
-                    });
+                        },
+                    );
                 self.scroll_y = output.state.offset.y;
             }
             DiffMode::Split => {
@@ -1031,56 +1110,62 @@ impl Review {
                             )
                             .vertical_scroll_offset(old_y)
                             .auto_shrink([false, false])
-                            .show_rows(ui, height, self.split.len(), |ui, range| {
-                                let width = ui.available_width().max(
-                                    preview.width * scale
-                                        + 36.0
-                                        + if newline { 0.0 } else { 200.0 },
-                                );
-                                ui.set_min_width(width);
-                                for index in range {
-                                    match &self.split[index] {
-                                        SplitRow::Hunk(header) => {
-                                            paint_hunk(ui, header, width, height)
-                                        }
-                                        SplitRow::Line {
-                                            before,
-                                            after,
-                                            changed,
-                                        } => {
-                                            let line = if side == 0 { *before } else { *after };
-                                            let mark = if !changed || line.is_none() {
-                                                ' '
-                                            } else if side == 0 {
-                                                '-'
-                                            } else {
-                                                '+'
-                                            };
-                                            let inline = before
-                                                .zip(*after)
-                                                .filter(|_| *changed)
-                                                .map(|(old, new)| {
-                                                    let ranges = changed_ranges(
-                                                        self.before.line_text(old),
-                                                        self.after.line_text(new),
-                                                    );
-                                                    if side == 0 { ranges.0 } else { ranges.1 }
-                                                });
-                                            paint_diff_line(
-                                                ui,
-                                                preview,
-                                                line,
-                                                &[line],
-                                                mark,
-                                                newline,
-                                                width,
-                                                height,
-                                                inline,
-                                            );
+                            .show_rows(
+                                ui,
+                                height,
+                                self.split.len() + (ui.available_height() / height).ceil() as usize,
+                                |ui, range| {
+                                    let width = ui.available_width().max(
+                                        preview.width * scale
+                                            + 36.0
+                                            + if newline { 0.0 } else { 200.0 },
+                                    );
+                                    ui.set_min_width(width);
+                                    for index in range.take_while(|&index| index < self.split.len())
+                                    {
+                                        match &self.split[index] {
+                                            SplitRow::Hunk(header) => {
+                                                paint_hunk(ui, header, width, height)
+                                            }
+                                            SplitRow::Line {
+                                                before,
+                                                after,
+                                                changed,
+                                            } => {
+                                                let line = if side == 0 { *before } else { *after };
+                                                let mark = if !changed || line.is_none() {
+                                                    ' '
+                                                } else if side == 0 {
+                                                    '-'
+                                                } else {
+                                                    '+'
+                                                };
+                                                let inline = before
+                                                    .zip(*after)
+                                                    .filter(|_| *changed)
+                                                    .map(|(old, new)| {
+                                                        let ranges = changed_ranges(
+                                                            self.before.line_text(old),
+                                                            self.after.line_text(new),
+                                                        );
+                                                        if side == 0 { ranges.0 } else { ranges.1 }
+                                                    });
+                                                paint_diff_line(
+                                                    ui,
+                                                    preview,
+                                                    line,
+                                                    &[line],
+                                                    mark,
+                                                    newline,
+                                                    width,
+                                                    height,
+                                                    inline,
+                                                );
+                                            }
                                         }
                                     }
-                                }
-                            });
+                                },
+                            );
                         if (output.state.offset.y - old_y).abs() > 0.5 {
                             next_y = output.state.offset.y;
                         }
@@ -1090,6 +1175,15 @@ impl Review {
                     ui.ctx().request_repaint();
                 }
                 self.scroll_y = next_y;
+            }
+        }
+        if !jumped && (self.scroll_y - requested_y).abs() > 0.5 && !targets.is_empty() {
+            let current = targets
+                .partition_point(|&row| row as f32 * height <= self.scroll_y + 2.0 * height + 1.0)
+                .saturating_sub(1);
+            if current != self.hunk {
+                self.hunk = current;
+                ui.ctx().request_repaint();
             }
         }
     }
@@ -1538,6 +1632,8 @@ mod tests {
             base: "main".into(),
             before: SourcePreview::build(path.clone(), source.clone(), true, &|| false).unwrap(),
             after: SourcePreview::build(path, after, true, &|| false).unwrap(),
+            changes: change_targets(&rows),
+            jump_requested: false,
             rows,
             visible,
             split,
@@ -1610,6 +1706,170 @@ mod tests {
                 "paired rows must stay vertically aligned"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn previous_next_navigate_real_changes_across_modes_context_and_manual_scroll()
+    -> anyhow::Result<()> {
+        let dir = crate::git::tests::setup()?;
+        let repo = git::repository(dir.path(), None)?;
+        let path = repo.root.join("src/code.rs");
+        let before = (0..80)
+            .map(|i| format!("const ITEM_{i}: usize = {i};\n"))
+            .collect::<String>();
+        let after = before
+            .replace("ITEM_5: usize = 5", "ITEM_5: usize = 500")
+            .replace("ITEM_35: usize = 35", "ITEM_35: usize = 3500")
+            .replace("ITEM_75: usize = 75", "ITEM_75: usize = 7500");
+        let rows = diff::compare(&before, &after);
+        let visible = review_rows(&rows, false);
+        let split = split_rows(&rows, &visible);
+        let mut review = Review {
+            path: path.clone(),
+            relative_path: path.clone(),
+            base: "main".into(),
+            before: SourcePreview::build(path.clone(), before, true, &|| false).unwrap(),
+            after: SourcePreview::build(path, after, true, &|| false).unwrap(),
+            changes: change_targets(&rows),
+            jump_requested: false,
+            rows,
+            visible,
+            split,
+            full: false,
+            scroll_y: 0.0,
+            hunk: 0,
+            before_newline: true,
+            after_newline: true,
+        };
+        assert_eq!(review.changes.len(), 3);
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let mut mode = DiffMode::Split;
+        let mut time = 0.0;
+        let mut frame = |events, review: &mut Review, mode: &mut DiffMode| {
+            time += 0.1;
+            ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 650.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| review.show(ui, mode));
+                },
+            )
+        };
+        let locate = |output: &egui::FullOutput, label: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text() == label
+                    {
+                        Some(text.pos + text.galley.size() / 2.0)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| panic!("Missing button {label}"))
+        };
+        let click = |position| {
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        frame(vec![], &mut review, &mut mode);
+        let mut output = frame(vec![], &mut review, &mut mode);
+        for target in [1, 2] {
+            output = frame(click(locate(&output, "↓ Next")), &mut review, &mut mode);
+            assert_eq!(review.hunk, target);
+            let expected = (review.target_rows(mode)[target] as f32 - 2.0)
+                * crate::preferences::line_height(&ctx).max(20.0);
+            assert!(
+                (review.scroll_y - expected).abs() < 1.0,
+                "even the last hunk must move to its target"
+            );
+        }
+        output = frame(click(locate(&output, "↓ Next")), &mut review, &mut mode);
+        assert_eq!(review.hunk, 2, "Next is disabled at the last change");
+        output = frame(click(locate(&output, "Unified")), &mut review, &mut mode);
+        assert!(mode == DiffMode::Unified);
+        assert_eq!(
+            review.hunk, 2,
+            "view switches must preserve the current change"
+        );
+        output = frame(
+            click(locate(&output, "Full context")),
+            &mut review,
+            &mut mode,
+        );
+        assert!(review.full);
+        assert_eq!(
+            review.changes.len(),
+            3,
+            "full context must not turn all navigation into one hunk"
+        );
+        assert_eq!(review.hunk, 2);
+        output = frame(click(locate(&output, "↑ Previous")), &mut review, &mut mode);
+        assert_eq!(review.hunk, 1);
+        let expected = (review.target_rows(mode)[1] as f32 - 2.0)
+            * crate::preferences::line_height(&ctx).max(20.0);
+        assert!((review.scroll_y - expected).abs() < 1.0);
+        // Manually scroll back to the top; navigation must follow the viewport.
+        let point = egui::pos2(700.0, 250.0);
+        frame(
+            vec![egui::Event::PointerMoved(point)],
+            &mut review,
+            &mut mode,
+        );
+        frame(
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 5000.0),
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut review,
+            &mut mode,
+        );
+        for _ in 0..25 {
+            output = frame(vec![], &mut review, &mut mode);
+        }
+        assert_eq!(review.hunk, 0);
+        output = frame(click(locate(&output, "↑ Previous")), &mut review, &mut mode);
+        assert_eq!(review.hunk, 0, "Previous is disabled at the first change");
+        frame(click(locate(&output, "↓ Next")), &mut review, &mut mode);
+        assert_eq!(
+            review.hunk, 1,
+            "Next must advance from the manually scrolled position"
+        );
+        output = frame(vec![], &mut review, &mut mode);
+        frame(click(locate(&output, "Split")), &mut review, &mut mode);
+        assert!(mode == DiffMode::Split);
+        assert_eq!(review.hunk, 1);
+        let expected = (review.target_rows(mode)[1] as f32 - 2.0)
+            * crate::preferences::line_height(&ctx).max(20.0);
+        assert!(
+            (review.scroll_y - expected).abs() < 1.0,
+            "expanded split mode must preserve the change target"
+        );
         Ok(())
     }
 
