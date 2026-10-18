@@ -840,6 +840,20 @@ fn change_targets(rows: &[diff::Row]) -> Vec<usize> {
     targets
 }
 
+// Navigate from the viewport, so scrolling away never strands the selected hunk.
+fn navigation_target(targets: &[usize], scroll_y: f32, height: f32, next: bool) -> usize {
+    let offset = |row: &usize| (*row as f32 * height - 2.0 * height).max(0.0);
+    if next {
+        targets
+            .partition_point(|row| offset(row) <= scroll_y + 1.0)
+            .min(targets.len().saturating_sub(1))
+    } else {
+        targets
+            .partition_point(|row| offset(row) < scroll_y - 1.0)
+            .saturating_sub(1)
+    }
+}
+
 impl Review {
     /// Map stable changes to each layout, including expanded full context.
     fn target_rows(&self, mode: DiffMode) -> Vec<usize> {
@@ -977,18 +991,14 @@ impl Review {
             let count = self.changes.len();
             if count > 0 {
                 self.hunk = self.hunk.min(count - 1);
-                if ui
-                    .add_enabled(self.hunk > 0, egui::Button::new("↑ Previous").small())
-                    .clicked()
-                {
-                    self.hunk -= 1;
+                if ui.add(egui::Button::new("↑ Previous").small()).clicked() {
+                    self.hunk =
+                        navigation_target(&self.target_rows(*mode), self.scroll_y, height, false);
                     self.jump_requested = true;
                 }
-                if ui
-                    .add_enabled(self.hunk + 1 < count, egui::Button::new("↓ Next").small())
-                    .clicked()
-                {
-                    self.hunk += 1;
+                if ui.add(egui::Button::new("↓ Next").small()).clicked() {
+                    self.hunk =
+                        navigation_target(&self.target_rows(*mode), self.scroll_y, height, true);
                     self.jump_requested = true;
                 }
                 ui.weak(RichText::new(format!("{} / {} hunks", self.hunk + 1, count)).size(10.0));
@@ -1710,6 +1720,151 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "read-only check against GLIMCODE_REVIEW_PROJECT and GLIMCODE_REVIEW_FILE"]
+    fn external_repository_change_navigation() -> anyhow::Result<()> {
+        let root = PathBuf::from(std::env::var("GLIMCODE_REVIEW_PROJECT")?);
+        let repo = git::repository(&root, None)?;
+        let path = root.join(std::env::var("GLIMCODE_REVIEW_FILE")?);
+        let review = Review::new(&repo, path, None, true)?;
+        assert_navigation_from_away(review);
+        Ok(())
+    }
+
+    #[test]
+    fn single_git_hunk_can_be_refocused_from_away_in_both_layouts() {
+        let path = PathBuf::from("code.rs");
+        let before = (0..80)
+            .map(|i| format!("const ITEM_{i}: usize = {i};\n"))
+            .collect::<String>();
+        let after = before
+            .replace("ITEM_35: usize = 35", "ITEM_35: usize = 3500")
+            .replace("ITEM_37: usize = 37", "ITEM_37: usize = 3700");
+        let rows = diff::compare(&before, &after);
+        let visible = review_rows(&rows, false);
+        let split = split_rows(&rows, &visible);
+        let changes = change_targets(&rows);
+        assert_eq!(changes.len(), 1, "nearby edits retain Git hunk grouping");
+        assert_navigation_from_away(Review {
+            path: path.clone(),
+            relative_path: path.clone(),
+            base: "main".into(),
+            before: SourcePreview::build(path.clone(), before, true, &|| false).unwrap(),
+            after: SourcePreview::build(path, after, true, &|| false).unwrap(),
+            rows,
+            visible,
+            split,
+            changes,
+            full: false,
+            scroll_y: 0.0,
+            hunk: 0,
+            jump_requested: false,
+            before_newline: true,
+            after_newline: true,
+        });
+    }
+
+    fn assert_navigation_from_away(mut review: Review) {
+        assert!(
+            !review.changes.is_empty(),
+            "fixture needs at least one Git hunk"
+        );
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let mut time = 0.0;
+        for full in [false, true] {
+            review.full = full;
+            review.visible = review_rows(&review.rows, full);
+            review.split = split_rows(&review.rows, &review.visible);
+            for mut mode in [DiffMode::Unified, DiffMode::Split] {
+                let layout = mode;
+                review.hunk = 0;
+                review.scroll_y = 0.0;
+                let mut frame = |events, review: &mut Review| {
+                    time += 0.1;
+                    ctx.run(
+                        egui::RawInput {
+                            time: Some(time),
+                            events,
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(1200.0, 650.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default()
+                                .show(ctx, |ui| review.show(ui, &mut mode));
+                        },
+                    )
+                };
+                frame(vec![], &mut review);
+                let last = review.changes.len() - 1;
+                // Refocus from above and below every hunk, including a single
+                // hunk and full context far away from the selected change.
+                for (label, target) in (0..=last)
+                    .map(|i| ("↓ Next", i))
+                    .chain((0..=last).rev().map(|i| ("↑ Previous", i)))
+                {
+                    let row = review.target_rows(layout)[target];
+                    let height = crate::preferences::line_height(&ctx).max(20.0);
+                    let offset = (row as f32 * height - 2.0 * height).max(0.0);
+                    review.scroll_y = if label == "↓ Next" {
+                        (offset - 5.0 * height).max(0.0)
+                    } else {
+                        offset + 5.0 * height
+                    };
+                    frame(vec![], &mut review);
+                    let output = frame(vec![], &mut review);
+                    let pos = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| {
+                            if let egui::Shape::Text(text) = &shape.shape
+                                && text.galley.text() == label
+                            {
+                                Some(text.pos + text.galley.size() / 2.0)
+                            } else {
+                                None
+                            }
+                        })
+                        .expect("navigation button should be visible");
+                    frame(
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed: false,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        &mut review,
+                    );
+                    assert_eq!(
+                        review.hunk,
+                        target,
+                        "full={full}, split={}, button={label}",
+                        layout == DiffMode::Split
+                    );
+                    let expected_row = review.target_rows(layout)[target];
+                    let expected = (expected_row as f32 - 2.0).max(0.0)
+                        * crate::preferences::line_height(&ctx).max(20.0);
+                    assert!(
+                        (review.scroll_y - expected).abs() < 1.0,
+                        "navigation must scroll to the requested change in the real file"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn previous_next_navigate_real_changes_across_modes_context_and_manual_scroll()
     -> anyhow::Result<()> {
         let dir = crate::git::tests::setup()?;
@@ -1732,7 +1887,7 @@ mod tests {
             before: SourcePreview::build(path.clone(), before, true, &|| false).unwrap(),
             after: SourcePreview::build(path, after, true, &|| false).unwrap(),
             changes: change_targets(&rows),
-            jump_requested: false,
+            jump_requested: true,
             rows,
             visible,
             split,
@@ -1809,7 +1964,7 @@ mod tests {
             );
         }
         output = frame(click(locate(&output, "↓ Next")), &mut review, &mut mode);
-        assert_eq!(review.hunk, 2, "Next is disabled at the last change");
+        assert_eq!(review.hunk, 2, "Next refocuses the last change");
         output = frame(click(locate(&output, "Unified")), &mut review, &mut mode);
         assert!(mode == DiffMode::Unified);
         assert_eq!(
@@ -1854,7 +2009,7 @@ mod tests {
         }
         assert_eq!(review.hunk, 0);
         output = frame(click(locate(&output, "↑ Previous")), &mut review, &mut mode);
-        assert_eq!(review.hunk, 0, "Previous is disabled at the first change");
+        assert_eq!(review.hunk, 0, "Previous refocuses the first change");
         frame(click(locate(&output, "↓ Next")), &mut review, &mut mode);
         assert_eq!(
             review.hunk, 1,
