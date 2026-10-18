@@ -51,6 +51,12 @@ Tree-sitter navigation supports **Java, Kotlin, Go, Rust, Python, JavaScript/JSX
 
 Definition jumps are syntax candidates and usages are text matches. Glimcode currently does **not** provide type-aware symbol resolution, code completion, semantic refactoring, debugging, or compiler diagnostics. Choose it for reading, navigating, editing, and reviewing code; use a full language IDE when you need those deeper capabilities.
 
+### GitHub-style branch review
+
+Review changes in **Split** or **Unified** mode. Split view aligns old and new lines, highlights the changed text within replacements, and synchronizes vertical scrolling while each side can scroll horizontally. Compact gutters, hunk navigation, and a full-context toggle keep the code at the center of the review.
+
+![Glimcode split diff with aligned old and new code](docs/images/branch-diff-split.png)
+
 ### CSV editing that fits the workflow
 
 Click anywhere in a column header to open its sort and value-selection menu. Choose multiple exact values, search the checklist, inspect occurrence counts, or return to the original row order. Switch to **Source** to edit raw CSV/TSV and back to **Data** to see the result.

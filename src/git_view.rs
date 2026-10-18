@@ -70,6 +70,7 @@ pub struct GitTool {
     desired: Option<(u64, Instant)>,
     failed_file: Option<u64>,
     review: Option<Review>,
+    review_mode: DiffMode,
     review_rx: Option<Job<Review>>,
     review_next: Option<(Repository, PathBuf, Option<String>, bool)>,
     review_open: bool,
@@ -426,27 +427,93 @@ impl GitTool {
     pub fn windows(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
         let mut opened = None;
         if self.review_open {
+            #[cfg(feature = "ui-capture")]
+            if let Ok(mode) = std::env::var("GLIMCODE_DIFF_MODE") {
+                self.review_mode = if mode == "unified" {
+                    DiffMode::Unified
+                } else {
+                    DiffMode::Split
+                };
+            }
             let mut close = false;
+            let size = ctx.content_rect().size();
             egui::Window::new("Branch changes · PR diff")
-                .id(egui::Id::new("branch-review")).title_bar(false).collapsible(false)
-                .frame(chrome::popup_frame()).default_size([1120.0, 700.0]).show(ctx, |ui| {
-                    chrome::dialog_style(ui, ui.available_width());
-                    close = chrome::dialog_header(ui, "±", "Branch changes", "Review your work against the base branch", chrome::BLUE);
-                    if let Some(review) = &mut self.review {
-                        ui.horizontal(|ui| {
-                            ui.strong(review.path.file_name().unwrap_or_default().to_string_lossy());
-                            ui.weak(format!("{} → current file", review.base));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.add_enabled_ui(review.path.exists(), |ui| chrome::dialog_button(ui, "Open in editor", None)).inner.clicked() { opened = Some(review.path.clone()); }
-                            });
+                .id(egui::Id::new("branch-review"))
+                .title_bar(false)
+                .collapsible(false)
+                .resizable(true)
+                .min_size([640.0, 300.0])
+                .default_size([(size.x - 80.0).min(1280.0), (size.y - 110.0).min(800.0)])
+                .default_pos(egui::pos2(40.0, 65.0))
+                .frame(
+                    egui::Frame::new()
+                        .fill(chrome::EDITOR)
+                        .corner_radius(9)
+                        .stroke(egui::Stroke::new(1.0_f32, chrome::BORDER))
+                        .inner_margin(12),
+                )
+                .show(ctx, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                    ui.spacing_mut().button_padding = egui::vec2(9.0, 4.0);
+                    ui.spacing_mut().interact_size.y = 26.0;
+                    ui.horizontal(|ui| {
+                        chrome::heading_icon(ui, chrome::Icon::Branch, chrome::BLUE);
+                        ui.label(RichText::new("Branch changes").size(15.0).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            close =
+                                chrome::icon_button(ui, chrome::Icon::Close, "Close diff (Esc)")
+                                    .clicked();
+                            if let Some(review) = &self.review {
+                                ui.weak(
+                                    RichText::new(format!("{} → working tree", review.base))
+                                        .size(11.0),
+                                );
+                            }
                         });
-                        ui.label(egui::RichText::new("Branch commits, staged and working-tree changes, and unsaved edits.").size(12.0).color(chrome::MUTED));
-                        chrome::dialog_divider(ui);
-                        review.show(ui);
+                    });
+                    if let Some(review) = &mut self.review {
+                        egui::Frame::new()
+                            .fill(chrome::PANEL)
+                            .corner_radius(5)
+                            .inner_margin(8)
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.label(chrome::file_icon(&review.path));
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(review.relative_path.to_string_lossy())
+                                                .strong(),
+                                        )
+                                        .truncate(),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    review.path.exists(),
+                                                    egui::Button::new("Open file").frame(false),
+                                                )
+                                                .clicked()
+                                            {
+                                                opened = Some(review.path.clone());
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                        review.show(ui, &mut self.review_mode);
                     } else if let Some(note) = &self.review_note {
-                        chrome::dialog_card(ui, |ui| { ui.label(note); });
-                    } else { ui.horizontal(|ui| { ui.spinner(); ui.label("Preparing diff…"); }); }
-                    close |= ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+                        ui.label(note);
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Preparing diff…");
+                        });
+                    }
+                    close |=
+                        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
                 });
             if close {
                 self.review_open = false;
@@ -676,21 +743,85 @@ impl ChangeTree {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum DiffMode {
+    Unified,
+    #[default]
+    Split,
+}
+
 struct Review {
     path: PathBuf,
+    relative_path: PathBuf,
     base: String,
     before: SourcePreview,
     after: SourcePreview,
     rows: Vec<diff::Row>,
     visible: Vec<ReviewRow>,
     full: bool,
+    split: Vec<SplitRow>,
+    scroll_y: f32,
+    hunk: usize,
     before_newline: bool,
     after_newline: bool,
 }
+#[derive(Clone, Debug)]
 enum ReviewRow {
     Hunk(String),
     Line(usize),
 }
+#[derive(Debug, PartialEq)]
+enum SplitRow {
+    Hunk(String),
+    Line {
+        before: Option<usize>,
+        after: Option<usize>,
+        changed: bool,
+    },
+}
+
+/// Pair whole replacement blocks, rather than putting every deletion above additions.
+fn split_rows(rows: &[diff::Row], visible: &[ReviewRow]) -> Vec<SplitRow> {
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < visible.len() {
+        match &visible[index] {
+            ReviewRow::Hunk(header) => {
+                result.push(SplitRow::Hunk(header.clone()));
+                index += 1;
+            }
+            ReviewRow::Line(line) if !rows[*line].changed => {
+                result.push(SplitRow::Line {
+                    before: rows[*line].disk,
+                    after: rows[*line].editor,
+                    changed: false,
+                });
+                index += 1;
+            }
+            ReviewRow::Line(_) => {
+                let (mut before, mut after) = (Vec::new(), Vec::new());
+                while let Some(ReviewRow::Line(line)) = visible.get(index) {
+                    let row = &rows[*line];
+                    if !row.changed {
+                        break;
+                    }
+                    before.extend(row.disk);
+                    after.extend(row.editor);
+                    index += 1;
+                }
+                for offset in 0..before.len().max(after.len()) {
+                    result.push(SplitRow::Line {
+                        before: before.get(offset).copied(),
+                        after: after.get(offset).copied(),
+                        changed: true,
+                    });
+                }
+            }
+        }
+    }
+    result
+}
+
 impl Review {
     fn new(
         repo: &Repository,
@@ -707,7 +838,9 @@ impl Review {
         let after = SourcePreview::build(path.clone(), data.text, dark, &|| false)
             .ok_or_else(|| anyhow::anyhow!("Could not highlight current file"))?;
         let visible = review_rows(&rows, false);
+        let split = split_rows(&rows, &visible);
         Ok(Self {
+            relative_path: path.strip_prefix(&repo.root).unwrap_or(&path).to_path_buf(),
             path,
             base: repo.base.clone(),
             before,
@@ -715,11 +848,14 @@ impl Review {
             rows,
             visible,
             full: false,
+            split,
+            scroll_y: 0.0,
+            hunk: 0,
             before_newline,
             after_newline,
         })
     }
-    fn show(&mut self, ui: &mut egui::Ui) {
+    fn show(&mut self, ui: &mut egui::Ui, mode: &mut DiffMode) {
         let added = self
             .rows
             .iter()
@@ -730,103 +866,390 @@ impl Review {
             .iter()
             .filter(|r| r.changed && r.disk.is_some())
             .count();
-        ui.horizontal(|ui| {
-            ui.colored_label(marker(git::Mark::Added), format!("+{added}"));
-            ui.colored_label(deleted(), format!("−{removed}"));
-            if ui.checkbox(&mut self.full, "Show all context").changed() {
+        let previous_mode = *mode;
+        let height = crate::preferences::line_height(ui.ctx()).max(20.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(
+                chrome::GREEN,
+                RichText::new(format!("+{added}")).strong().size(12.0),
+            );
+            ui.colored_label(
+                deleted(),
+                RichText::new(format!("−{removed}")).strong().size(12.0),
+            );
+            ui.separator();
+            for (label, value) in [("Unified", DiffMode::Unified), ("Split", DiffMode::Split)] {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(label).size(12.0))
+                            .selected(*mode == value)
+                            .fill(if *mode == value {
+                                chrome::SELECTED
+                            } else {
+                                chrome::PANEL
+                            })
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(4),
+                    )
+                    .clicked()
+                {
+                    *mode = value;
+                }
+            }
+            ui.separator();
+            if ui.checkbox(&mut self.full, "Full context").changed() {
                 self.visible = review_rows(&self.rows, self.full);
+                self.split = split_rows(&self.rows, &self.visible);
+                self.scroll_y = 0.0;
+                self.hunk = 0;
+            }
+            let hunks: Vec<_> = match mode {
+                DiffMode::Unified => self
+                    .visible
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| matches!(r, ReviewRow::Hunk(_)).then_some(i))
+                    .collect(),
+                DiffMode::Split => self
+                    .split
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| matches!(r, SplitRow::Hunk(_)).then_some(i))
+                    .collect(),
+            };
+            if !hunks.is_empty() {
+                let current = self.hunk.min(hunks.len() - 1);
+                if ui.small_button("↑ Previous").clicked() {
+                    self.hunk = (current + hunks.len() - 1) % hunks.len();
+                    self.scroll_y = hunks[self.hunk] as f32 * height;
+                }
+                if ui.small_button("↓ Next").clicked() {
+                    self.hunk = (current + 1) % hunks.len();
+                    self.scroll_y = hunks[self.hunk] as f32 * height;
+                }
+                ui.weak(
+                    RichText::new(format!("{} / {} hunks", self.hunk + 1, hunks.len())).size(10.0),
+                );
             }
         });
-        ui.separator();
+        if *mode != previous_mode {
+            self.scroll_y = 0.0;
+            self.hunk = 0;
+        }
         if added + removed == 0 {
-            ui.label("No changes relative to this base.");
+            ui.add_space(20.0);
+            ui.colored_label(chrome::GREEN, "No changes relative to this base.");
             return;
         }
-        egui::ScrollArea::both()
-            .id_salt(("pr-diff-scroll", &self.path))
-            .auto_shrink([false, false])
-            .show_rows(
-                ui,
-                crate::preferences::line_height(ui.ctx()),
-                self.visible.len(),
-                |ui, range| {
-                    ui.set_min_width(
-                        self.before.width.max(self.after.width)
-                            * crate::preferences::editor_font_size(ui.ctx())
-                            / 13.0
-                            + 120.0,
-                    );
-                    for index in range {
-                        match &self.visible[index] {
-                            ReviewRow::Hunk(header) => {
-                                egui::Frame::new().fill(chrome::HEADER).show(ui, |ui| {
-                                    ui.set_min_width(ui.available_width());
-                                    ui.monospace(header);
-                                });
-                            }
-                            ReviewRow::Line(index) => {
-                                let row = &self.rows[*index];
-                                let bg = if !row.changed {
-                                    Color32::TRANSPARENT
-                                } else if row.editor.is_some() {
-                                    Color32::from_rgb(30, 64, 43)
+        ui.separator();
+        // Diff rows are code, not dialog controls. Zero spacing keeps gutters and
+        // change backgrounds continuous and makes virtualized row heights exact.
+        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+        let scale = crate::preferences::editor_font_size(ui.ctx()) / 13.0;
+        match mode {
+            DiffMode::Unified => {
+                let output = egui::ScrollArea::both()
+                    .id_salt(("unified-diff", &self.path))
+                    .vertical_scroll_offset(self.scroll_y)
+                    .auto_shrink([false, false])
+                    .show_rows(ui, height, self.visible.len(), |ui, range| {
+                        let width = ui.available_width().max(
+                            self.before.width.max(self.after.width) * scale
+                                + 100.0
+                                + if self.before_newline && self.after_newline {
+                                    0.0
                                 } else {
-                                    Color32::from_rgb(72, 34, 40)
-                                };
-                                egui::Frame::new().fill(bg).show(ui, |ui| {
-                                    ui.set_min_width(ui.available_width());
-                                    ui.horizontal(|ui| {
-                                        for line in [row.disk, row.editor] {
-                                            ui.add_sized(
-                                                [
-                                                    42.0 * crate::preferences::editor_font_size(
-                                                        ui.ctx(),
-                                                    ) / 13.0,
-                                                    crate::preferences::line_height(ui.ctx()),
-                                                ],
-                                                egui::Label::new(
-                                                    RichText::new(
-                                                        line.map(|n| (n + 1).to_string())
-                                                            .unwrap_or_default(),
-                                                    )
-                                                    .monospace()
-                                                    .color(chrome::MUTED),
-                                                ),
-                                            );
-                                        }
-                                        ui.monospace(if !row.changed {
-                                            " "
-                                        } else if row.editor.is_some() {
-                                            "+"
-                                        } else {
-                                            "−"
-                                        });
-                                        let (preview, line, newline) =
-                                            if let Some(line) = row.editor {
-                                                (&self.after, line, self.after_newline)
-                                            } else {
-                                                (
-                                                    &self.before,
-                                                    row.disk.unwrap_or(0),
-                                                    self.before_newline,
-                                                )
-                                            };
-                                        ui.add(
-                                            egui::Label::new(preview.line_for_ui(ui, line, ""))
-                                                .extend(),
-                                        );
-                                        if !newline && line + 1 == preview.len() {
-                                            ui.weak("⏎ no newline at end of file");
-                                        }
-                                    });
-                                });
+                                    200.0
+                                },
+                        );
+                        ui.set_min_width(width);
+                        for index in range {
+                            match &self.visible[index] {
+                                ReviewRow::Hunk(header) => paint_hunk(ui, header, width, height),
+                                ReviewRow::Line(line) => {
+                                    let row = &self.rows[*line];
+                                    let (preview, number, newline) = if let Some(line) = row.editor
+                                    {
+                                        (&self.after, line, self.after_newline)
+                                    } else {
+                                        (&self.before, row.disk.unwrap_or(0), self.before_newline)
+                                    };
+                                    let mark = if !row.changed {
+                                        ' '
+                                    } else if row.editor.is_some() {
+                                        '+'
+                                    } else {
+                                        '-'
+                                    };
+                                    paint_diff_line(
+                                        ui,
+                                        preview,
+                                        Some(number),
+                                        &[row.disk, row.editor],
+                                        mark,
+                                        newline,
+                                        width,
+                                        height,
+                                        None,
+                                    );
+                                }
                             }
                         }
+                    });
+                self.scroll_y = output.state.offset.y;
+            }
+            DiffMode::Split => {
+                let old_y = self.scroll_y;
+                let mut next_y = old_y;
+                ui.columns(2, |columns| {
+                    for (side, ui) in columns.iter_mut().enumerate() {
+                        let (preview, newline, heading) = if side == 0 {
+                            (&self.before, self.before_newline, self.base.as_str())
+                        } else {
+                            (
+                                &self.after,
+                                self.after_newline,
+                                "Working tree + unsaved edits",
+                            )
+                        };
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 26.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(rect, 0, chrome::TABS);
+                        ui.painter().text(
+                            rect.left_center() + egui::vec2(10.0, 0.0),
+                            egui::Align2::LEFT_CENTER,
+                            heading,
+                            egui::FontId::proportional(11.0),
+                            chrome::MUTED,
+                        );
+                        let output = egui::ScrollArea::both()
+                            .id_salt(("split-diff", &self.path, side))
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                            )
+                            .vertical_scroll_offset(old_y)
+                            .auto_shrink([false, false])
+                            .show_rows(ui, height, self.split.len(), |ui, range| {
+                                let width = ui.available_width().max(
+                                    preview.width * scale
+                                        + 36.0
+                                        + if newline { 0.0 } else { 200.0 },
+                                );
+                                ui.set_min_width(width);
+                                for index in range {
+                                    match &self.split[index] {
+                                        SplitRow::Hunk(header) => {
+                                            paint_hunk(ui, header, width, height)
+                                        }
+                                        SplitRow::Line {
+                                            before,
+                                            after,
+                                            changed,
+                                        } => {
+                                            let line = if side == 0 { *before } else { *after };
+                                            let mark = if !changed || line.is_none() {
+                                                ' '
+                                            } else if side == 0 {
+                                                '-'
+                                            } else {
+                                                '+'
+                                            };
+                                            let inline = before
+                                                .zip(*after)
+                                                .filter(|_| *changed)
+                                                .map(|(old, new)| {
+                                                    let ranges = changed_ranges(
+                                                        self.before.line_text(old),
+                                                        self.after.line_text(new),
+                                                    );
+                                                    if side == 0 { ranges.0 } else { ranges.1 }
+                                                });
+                                            paint_diff_line(
+                                                ui,
+                                                preview,
+                                                line,
+                                                &[line],
+                                                mark,
+                                                newline,
+                                                width,
+                                                height,
+                                                inline,
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        if (output.state.offset.y - old_y).abs() > 0.5 {
+                            next_y = output.state.offset.y;
+                        }
                     }
-                },
-            );
+                });
+                if (next_y - self.scroll_y).abs() > 0.5 {
+                    ui.ctx().request_repaint();
+                }
+                self.scroll_y = next_y;
+            }
+        }
     }
 }
+
+fn changed_ranges(before: &str, after: &str) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+    let prefix = before
+        .chars()
+        .zip(after.chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(c, _)| c.len_utf8())
+        .sum::<usize>();
+    let suffix = before[prefix..]
+        .chars()
+        .rev()
+        .zip(after[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(c, _)| c.len_utf8())
+        .sum::<usize>();
+    (prefix..before.len() - suffix, prefix..after.len() - suffix)
+}
+
+fn paint_hunk(ui: &mut egui::Ui, header: &str, width: f32, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 0, Color32::from_rgb(28, 40, 56));
+    ui.painter().text(
+        rect.left_center() + egui::vec2(12.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        header,
+        egui::FontId::monospace(11.0),
+        Color32::from_rgb(130, 157, 190),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_diff_line(
+    ui: &mut egui::Ui,
+    preview: &SourcePreview,
+    line: Option<usize>,
+    gutters: &[Option<usize>],
+    mark: char,
+    newline: bool,
+    width: f32,
+    height: f32,
+    inline: Option<std::ops::Range<usize>>,
+) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let (background, gutter_bg, accent) = match mark {
+        '+' => (
+            Color32::from_rgb(25, 47, 36),
+            Color32::from_rgb(30, 63, 43),
+            chrome::GREEN,
+        ),
+        '-' => (
+            Color32::from_rgb(56, 31, 37),
+            Color32::from_rgb(75, 35, 43),
+            deleted(),
+        ),
+        _ if line.is_none() => (Color32::from_rgb(29, 32, 38), chrome::TABS, chrome::MUTED),
+        _ => (chrome::EDITOR, Color32::from_rgb(26, 29, 35), chrome::MUTED),
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0, background);
+    let gutter_width = 44.0 * gutters.len() as f32;
+    let gutter = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.left() + gutter_width, rect.bottom()),
+    );
+    painter.rect_filled(gutter, 0, gutter_bg);
+    for (index, number) in gutters.iter().enumerate() {
+        if let Some(number) = number {
+            painter.text(
+                egui::pos2(
+                    rect.left() + (index + 1) as f32 * 44.0 - 9.0,
+                    rect.center().y,
+                ),
+                egui::Align2::RIGHT_CENTER,
+                (number + 1).to_string(),
+                egui::FontId::monospace(11.0),
+                accent,
+            );
+        }
+    }
+    painter.vline(
+        gutter.right(),
+        rect.y_range(),
+        egui::Stroke::new(1.0_f32, chrome::BORDER.gamma_multiply(0.5)),
+    );
+    if line.is_none() {
+        return;
+    }
+    let line = line.unwrap();
+    painter.text(
+        egui::pos2(gutter.right() + 10.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        mark,
+        egui::FontId::monospace(12.0),
+        accent,
+    );
+    let mut job = preview.line_for_ui(ui, line, "");
+    if let Some(range) = inline.filter(|range| !range.is_empty()) {
+        let background = if mark == '+' {
+            Color32::from_rgb(37, 88, 54)
+        } else {
+            Color32::from_rgb(110, 43, 53)
+        };
+        let mut sections = Vec::new();
+        for section in job.sections {
+            let start = section.byte_range.start;
+            let end = section.byte_range.end;
+            let mut cuts = vec![start, end];
+            cuts.extend(
+                [range.start, range.end]
+                    .into_iter()
+                    .filter(|&cut| start < cut && cut < end),
+            );
+            cuts.sort_unstable();
+            cuts.dedup();
+            for pair in cuts.windows(2) {
+                let mut format = section.format.clone();
+                if pair[0] >= range.start && pair[1] <= range.end {
+                    format.background = background;
+                }
+                sections.push(egui::text::LayoutSection {
+                    leading_space: section.leading_space,
+                    byte_range: pair[0]..pair[1],
+                    format,
+                });
+            }
+        }
+        job.sections = sections;
+    }
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    let end = gutter.right() + 22.0 + galley.size().x;
+    painter.galley(
+        egui::pos2(
+            gutter.right() + 22.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        chrome::TEXT,
+    );
+    if !newline && line + 1 == preview.len() {
+        painter.text(
+            egui::pos2(end + 16.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            "No newline at end of file",
+            egui::FontId::proportional(10.0),
+            chrome::MUTED,
+        );
+    }
+    response.context_menu(|ui| {
+        if ui.button("Copy line").clicked() {
+            ui.ctx().copy_text(preview.line_text(line).to_owned());
+            ui.close();
+        }
+    });
+}
+
 fn review_rows(rows: &[diff::Row], full: bool) -> Vec<ReviewRow> {
     let mut ranges: Vec<std::ops::Range<usize>> = vec![];
     if full {
@@ -958,6 +1381,239 @@ mod tests {
 
     use super::*;
     #[test]
+    fn split_replacements_preserve_both_files_and_pad_uneven_blocks() {
+        let before = "same\nold one\nold two\nend\n";
+        let after = "same\nnew one\nnew two\nextra\nend\n";
+        let rows = diff::compare(before, after);
+        let aligned = split_rows(&rows, &review_rows(&rows, true));
+        let old: Vec<_> = aligned
+            .iter()
+            .filter_map(|row| match row {
+                SplitRow::Line { before, .. } => *before,
+                _ => None,
+            })
+            .collect();
+        let new: Vec<_> = aligned
+            .iter()
+            .filter_map(|row| match row {
+                SplitRow::Line { after, .. } => *after,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(old, [0, 1, 2, 3]);
+        assert_eq!(new, [0, 1, 2, 3, 4]);
+        assert!(aligned.contains(&SplitRow::Line {
+            before: Some(1),
+            after: Some(1),
+            changed: true
+        }));
+        assert!(aligned.contains(&SplitRow::Line {
+            before: None,
+            after: Some(3),
+            changed: true
+        }));
+        for (old, new) in [("", "new\n"), ("old\n", "")] {
+            let rows = diff::compare(old, new);
+            let split = split_rows(&rows, &review_rows(&rows, false));
+            assert!(
+                split
+                    .iter()
+                    .any(|row| matches!(row, SplitRow::Line { changed: true, .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn inline_ranges_are_unicode_safe_and_do_not_overlap() {
+        for (old, new, expected) in [
+            ("let café = 1;", "let café = 20;", ("1", "20")),
+            ("猫abc", "猫xyz", ("abc", "xyz")),
+            ("same", "same", ("", "")),
+            ("abc", "ab", ("c", "")),
+            ("", "new", ("", "new")),
+        ] {
+            let (a, b) = changed_ranges(old, new);
+            assert_eq!((&old[a], &new[b]), expected);
+        }
+    }
+
+    #[test]
+    fn unified_and_split_are_compact_and_keep_code_gutters_aligned() -> anyhow::Result<()> {
+        let dir = crate::git::tests::setup()?;
+        let repo = git::repository(dir.path(), None)?;
+        let mut review = Review::new(
+            &repo,
+            repo.root.join("src/code.rs"),
+            Some("fn main() {\n    first();\n    second();\n}\n".into()),
+            true,
+        )?;
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        for mut mode in [DiffMode::Unified, DiffMode::Split] {
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1000.0, 500.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            review.show(ui, &mut mode);
+                            assert!(
+                                ui.min_rect().bottom() <= 500.0,
+                                "diff must fit the available height"
+                            );
+                        });
+                    },
+                ));
+            }
+            let output = output.unwrap();
+            let labels: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        Some(text.galley.text())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert!(labels.contains(&"Unified") && labels.contains(&"Split"));
+            assert!(labels.iter().any(|label| label.contains("first()")));
+            assert!(labels.iter().any(|label| label.contains("second()")));
+            let positions: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text().contains("first()")
+                    {
+                        Some(text.pos.y)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert!(!positions.is_empty());
+            let second = output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text().contains("second()")
+                    {
+                        Some(text.pos.y)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let expected = crate::preferences::line_height(&ctx).max(20.0);
+            assert!(
+                (second - positions[0] - expected).abs() < 1.0,
+                "code lines must be contiguous, without dialog spacing"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn split_scroll_tracks_wheel_input_on_either_pane() -> anyhow::Result<()> {
+        let path = PathBuf::from("sample.rs");
+        let source = (0..200)
+            .map(|i| format!("const ITEM_{i}: usize = {i};\n"))
+            .collect::<String>();
+        let after = source.replace("ITEM_199: usize = 199", "ITEM_199: usize = 200");
+        let rows = diff::compare(&source, &after);
+        let visible = review_rows(&rows, true);
+        let split = split_rows(&rows, &visible);
+        let mut review = Review {
+            path: path.clone(),
+            relative_path: path.clone(),
+            base: "main".into(),
+            before: SourcePreview::build(path.clone(), source.clone(), true, &|| false).unwrap(),
+            after: SourcePreview::build(path, after, true, &|| false).unwrap(),
+            rows,
+            visible,
+            split,
+            full: true,
+            scroll_y: 0.0,
+            hunk: 0,
+            before_newline: true,
+            after_newline: true,
+        };
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let mut mode = DiffMode::Split;
+        let mut time = 0.0;
+        let mut frame = |events, review: &mut Review| {
+            time += 0.1;
+            ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 500.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| review.show(ui, &mut mode));
+                },
+            )
+        };
+        for _ in 0..3 {
+            frame(vec![], &mut review);
+        }
+        for x in [750.0, 250.0] {
+            let before = review.scroll_y;
+            let position = egui::pos2(x, 200.0);
+            frame(vec![egui::Event::PointerMoved(position)], &mut review);
+            frame(
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -160.0),
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                &mut review,
+            );
+            for _ in 0..20 {
+                frame(vec![], &mut review);
+            }
+            let output = frame(vec![], &mut review);
+            assert!(
+                review.scroll_y > before,
+                "scrolling either pane must move the shared vertical offset"
+            );
+            let mut first = [None, None];
+            for shape in &output.shapes {
+                if let egui::Shape::Text(text) = &shape.shape
+                    && text.galley.text().starts_with("const ITEM_")
+                {
+                    let side = usize::from(text.pos.x > 500.0);
+                    first[side].get_or_insert((text.galley.text(), text.pos.y));
+                }
+            }
+            let (left, right) = (first[0].unwrap(), first[1].unwrap());
+            assert_eq!(
+                left.0, right.0,
+                "both panes must show the same first virtual row"
+            );
+            assert!(
+                (left.1 - right.1).abs() < 1.0,
+                "paired rows must stay vertically aligned"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn pr_diff_hunks_keep_context_and_line_numbers() {
         let before = (0..30).map(|n| format!("line {n}\n")).collect::<String>();
         let after = before
@@ -1035,6 +1691,15 @@ mod tests {
                     |ctx| {
                         tool.panel(ctx, dir.path(), &[repo.root.join("src/code.rs")]);
                         tool.windows(ctx);
+                        if !detail
+                            && let Some(rect) =
+                                ctx.memory(|m| m.area_rect(egui::Id::new("branch-review")))
+                        {
+                            assert!(
+                                rect.width() <= 1400.0 && rect.height() <= 900.0,
+                                "review must fit the viewport: {rect:?}"
+                            );
+                        }
                     },
                 );
             }

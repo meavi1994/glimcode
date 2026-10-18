@@ -79,6 +79,12 @@ impl SourcePreview {
             + self.syntax.sections.len() * size_of::<eframe::egui::text::LayoutSection>()
     }
 
+    pub fn line_text(&self, index: usize) -> &str {
+        self.lines
+            .get(index)
+            .map_or("", |range| &self.source[range.clone()])
+    }
+
     pub fn len(&self) -> usize {
         self.lines.len()
     }
