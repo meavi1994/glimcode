@@ -1,0 +1,6 @@
+(parameters (identifier) @variable.parameter)
+(default_parameter name: (identifier) @variable.parameter)
+(typed_parameter (identifier) @variable.parameter)
+(decorator (identifier) @attribute)
+(import_statement name: (dotted_name (identifier) @namespace))
+(import_from_statement module_name: (dotted_name (identifier) @namespace))

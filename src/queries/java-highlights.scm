@@ -1,0 +1,5 @@
+(formal_parameter name: (identifier) @variable.parameter)
+(field_declaration declarator: (variable_declarator name: (identifier) @property))
+(field_access field: (identifier) @property)
+(record_declaration name: (identifier) @type)
+(annotation_type_declaration name: (identifier) @type)
