@@ -23,10 +23,12 @@ If an AI agent handles much of your typing, you still need to find the right fil
 ## Why Glimcode?
 
 - **Native Rust UI.** Uses egui/eframe, without an Electron runtime, embedded browser UI, or JVM.
-- **Navigation without language servers.** ripgrep handles project search; Tree-sitter supplies file structure and syntax-based definition candidates. No LSP setup or background language-server processes.
+- **Navigation without language servers.** Embedded ripgrep libraries handle project search; Tree-sitter supplies file structure and syntax-based definition candidates. No LSP setup, background language-server processes, or separate `rg` installation.
 - **Familiar shortcuts.** Double Shift for files, Cmd/Ctrl-click for symbol search, Find in Files, a structure panel, and navigation history.
 - **Highlighting built in.** Language-aware colors, folding, matching brackets, indentation guides, and a full-file search preview.
 - **The tools beside your code.** Git diffs and blame, a native terminal, editable CSV/TSV grids, and Markdown previews.
+
+Search uses the official `grep` library and `ignore` walker directly, with two background search workers, bounded result queues, and cancellation. It does not launch an external search process or parse command-line JSON output.
 
 The architecture is designed to keep memory overhead low. **We do not yet publish a measured RAM comparison with IntelliJ or a fixed memory-usage promise.** Usage depends on project size, open files, terminal sessions, and workload. Reproducible performance measurements and improvements are welcome.
 
@@ -59,12 +61,12 @@ Sorting and value selections change the view; hidden rows remain in saved files.
 
 ## Get started
 
-Glimcode is currently distributed as source. Install a current stable [Rust toolchain](https://www.rust-lang.org/tools/install), [ripgrep](https://github.com/BurntSushi/ripgrep), and Git. The current desktop build has been exercised on **macOS Apple Silicon**; Linux and Windows support needs broader testing.
+Glimcode is currently distributed as source. Install a current stable [Rust toolchain](https://www.rust-lang.org/tools/install). Git is needed for version-control features. The current desktop build has been exercised on **macOS Apple Silicon**; Linux and Windows support needs broader testing.
 
 On macOS:
 
 ```sh
-brew install rust ripgrep git
+brew install rust git
 git clone https://github.com/meavi1994/glimcode.git
 cd glimcode
 cargo run --release -- /path/to/project

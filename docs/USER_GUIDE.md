@@ -1,10 +1,10 @@
 # Glimcode user guide
 
-A native desktop IDE written in Rust. Code navigation uses **ripgrep and Tree-sitter**, with no LSP client or language-server process.
+A native desktop IDE written in Rust. Code navigation uses **embedded ripgrep libraries and Tree-sitter**, with no LSP client or language-server process.
 
 ## Run
 
-Install a current stable Rust toolchain and [ripgrep](https://github.com/BurntSushi/ripgrep). On macOS, `brew install rust ripgrep` installs both.
+Install a current stable Rust toolchain. On macOS, use `brew install rust`. Search is embedded using ripgrep’s official `grep` and `ignore` Rust libraries; no `rg` executable is required. Install Git for version-control features.
 
 ```sh
 cargo run --release -- /path/to/project
@@ -18,7 +18,7 @@ The optional argument can also be a file. Without an argument, Glimcode opens th
 - IntelliJ-inspired Darcula and light syntax colors, line numbers, current-line shading, standard text selection and undo/redo.
 - Double Shift opens a focused file search with no mode tabs. Recently chosen files appear first (up to 50 per session), followed by open files and project files. Enter `abcd.txt:23` or `abcd.txt:23:24` to jump directly to a line or line/column. Structure and text search remain available through their shortcuts and menus.
 - Tree-sitter outlines and definition candidates for Java, Kotlin (`.kt`/`.kts`), Go, Rust, Python, JavaScript/JSX, TypeScript/TSX.
-- Literal project search and whole-word reference matches through `rg --json`. Results open at the matching line and column, including Unicode text.
+- Literal project search and whole-word reference matches through ripgrep’s embedded Rust search engine. Results open at the matching line and column, including Unicode text.
 - Hold Cmd (Ctrl on Windows/Linux) to highlight and underline the word under the pointer with a link cursor; click to search. Cmd-click searches the token under the pointer, regardless of the previous caret position. Clicking whitespace does not search the previous word.
 - Search results use mutually exclusive All, Declarations, Usages, Strings, Comments, Imports, and Other toggles, with counts. Selecting one deselects the previous category. The extension dropdown lists only extensions present in the current results, including files without an extension. Category and extension filters combine locally without rerunning ripgrep.
 - IntelliJ-inspired workspace with a compact menu bar, tool rail, file-type icons, blue active-tab underline, breadcrumbs, and a darker editor. Find in Files floats above the workspace with highlighted matches, keyboard selection, and a syntax-colored code preview; Dock moves it into a resizable bottom tool window.
@@ -122,7 +122,7 @@ cargo fmt --check
 cargo build --release
 ```
 
-The tests cover CSV round trips, filtering, mixed numeric sorting, Unicode navigation, real ripgrep searches, Tree-sitter outlines, save-conflict protection, highlighting colors, and native-widget layout. The repository includes sample files under `examples/`.
+The tests cover CSV round trips, filtering, mixed numeric sorting, Unicode navigation, embedded ripgrep searches, Tree-sitter outlines, save-conflict protection, highlighting colors, and native-widget layout. The repository includes sample files under `examples/`.
 
 Rust UI: [eframe / egui](https://github.com/emilk/egui). Parsing: [Tree-sitter](https://tree-sitter.github.io/tree-sitter/). Highlighting: [Syntect](https://github.com/trishume/syntect). Library versions are locked in `Cargo.lock`.
 

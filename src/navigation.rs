@@ -1,9 +1,13 @@
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use grep::{
+    matcher::Matcher,
+    regex::{RegexMatcher, RegexMatcherBuilder},
+    searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch},
+};
+use ignore::{WalkBuilder, WalkState, overrides::OverrideBuilder};
 use std::{
-    io::{BufRead, BufReader, Read},
+    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -315,35 +319,27 @@ pub fn read_text(path: &Path) -> Result<String> {
     String::from_utf8(bytes).context("This file is not valid UTF-8")
 }
 
-pub fn files(root: &Path) -> Result<Vec<PathBuf>> {
-    let output = Command::new("rg")
-        .args([
-            "--files", "--null", "--hidden", "-g", "!.git", "-g", "!target",
-        ])
-        .current_dir(root)
-        .output()
-        .context("Install ripgrep (rg) and ensure it is on PATH")?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        bail!("ripgrep: {}", String::from_utf8_lossy(&output.stderr));
-    }
-    let mut files: Vec<_> = output
-        .stdout
-        .split(|&b| b == 0)
-        .filter(|b| !b.is_empty())
-        .map(|b| root.join(path_from_bytes(b)))
-        .collect();
-    files.sort();
-    Ok(files)
+/// Shared traversal rules for the explorer, file picker and project search.
+fn workspace_walk(root: &Path) -> Result<WalkBuilder> {
+    let mut overrides = OverrideBuilder::new(root);
+    overrides.add("!.git")?.add("!target")?;
+    let mut walk = WalkBuilder::new(root);
+    walk.hidden(false)
+        .add_custom_ignore_filename(".rgignore")
+        .overrides(overrides.build()?);
+    Ok(walk)
 }
 
-#[cfg(unix)]
-fn path_from_bytes(bytes: &[u8]) -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
-}
-#[cfg(not(unix))]
-fn path_from_bytes(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(bytes).as_ref())
+pub fn files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in workspace_walk(root)?.build() {
+        let entry = entry.context("Cannot list project files")?;
+        if entry.file_type().is_some_and(|kind| kind.is_file()) {
+            files.push(entry.into_path());
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 #[cfg(any(test, feature = "ui-capture"))]
@@ -509,6 +505,138 @@ pub fn search(root: &Path, query: &str, kind: SearchKind) -> Result<SearchResult
     })
 }
 
+#[derive(Clone, Copy)]
+struct SearchCancellation<'a> {
+    requested: &'a AtomicBool,
+    stopped: &'a AtomicBool,
+}
+impl SearchCancellation<'_> {
+    fn is_set(self) -> bool {
+        self.requested.load(Ordering::Relaxed) || self.stopped.load(Ordering::Relaxed)
+    }
+}
+
+/// Stop reading even a large file with no matches when a newer search supersedes it.
+struct SearchReader<'a> {
+    file: std::fs::File,
+    cancellation: SearchCancellation<'a>,
+}
+
+impl Read for SearchReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancellation.is_set() {
+            return Ok(0);
+        }
+        self.file.read(buffer)
+    }
+}
+
+struct MatchSink<F>(F);
+impl<F> Sink for MatchSink<F>
+where
+    F: FnMut(&SinkMatch<'_>) -> std::io::Result<bool>,
+{
+    type Error = std::io::Error;
+    fn matched(&mut self, _: &Searcher, matched: &SinkMatch<'_>) -> std::io::Result<bool> {
+        (self.0)(matched)
+    }
+}
+
+fn search_file(
+    path: &Path,
+    matcher: &RegexMatcher,
+    query: &str,
+    kind: SearchKind,
+    searcher: &mut Searcher,
+    cancellation: SearchCancellation<'_>,
+    mut emit: impl FnMut(Vec<Location>) -> bool,
+) -> Result<()> {
+    let mut batch = Vec::new();
+    let mut last_batch = Instant::now();
+    let mut first_batch = true;
+    // Keep at most one syntax tree per worker, and only parse files with matches.
+    let classifier = std::cell::OnceCell::new();
+    let reader = SearchReader {
+        file: std::fs::File::open(path)?,
+        cancellation,
+    };
+    searcher.search_reader(
+        matcher,
+        reader,
+        MatchSink(|matched: &SinkMatch<'_>| {
+            if cancellation.is_set() {
+                return Ok(false);
+            }
+            if kind == SearchKind::Definitions {
+                if let Ok(source) = read_text(path) {
+                    for symbol in symbols(path, &source)
+                        .into_iter()
+                        .filter(|s| s.name == query)
+                    {
+                        batch.push(Location {
+                            path: path.to_path_buf(),
+                            line: symbol.line,
+                            column: symbol.column,
+                            category: MatchCategory::Declaration,
+                            preview: source
+                                .lines()
+                                .nth(symbol.line - 1)
+                                .unwrap_or("")
+                                .trim()
+                                .to_owned(),
+                        });
+                        if batch.len() == 64 && !emit(std::mem::take(&mut batch)) {
+                            return Ok(false);
+                        }
+                    }
+                }
+                return Ok(false);
+            }
+            let Ok(text) = std::str::from_utf8(matched.bytes()) else {
+                return Ok(true);
+            };
+            let classifier = classifier.get_or_init(|| {
+                read_text(path)
+                    .ok()
+                    .and_then(|source| Classifier::new(path, &source))
+            });
+            let offset = matched.absolute_byte_offset() as usize;
+            let mut keep_searching = true;
+            matcher
+                .find_iter(matched.bytes(), |found| {
+                    if cancellation.is_set() {
+                        keep_searching = false;
+                        return false;
+                    }
+                    batch.push(Location {
+                        path: path.to_path_buf(),
+                        line: matched.line_number().unwrap_or(1) as usize,
+                        column: found.start() + 1,
+                        preview: text.trim_end().to_owned(),
+                        category: classifier.as_ref().map_or(MatchCategory::Other, |c| {
+                            c.category(offset + found.start(), offset + found.end())
+                        }),
+                    });
+                    if first_batch
+                        || batch.len() >= 64
+                        || last_batch.elapsed() >= Duration::from_millis(40)
+                    {
+                        keep_searching = emit(std::mem::take(&mut batch));
+                        first_batch = false;
+                        last_batch = Instant::now();
+                    }
+                    keep_searching
+                })
+                .map_err(std::io::Error::other)?;
+            Ok(keep_searching)
+        }),
+    )?;
+    if !batch.is_empty() && !cancellation.is_set() {
+        emit(batch);
+    }
+    Ok(())
+}
+
 fn search_stream(
     root: &Path,
     query: &str,
@@ -518,174 +646,103 @@ fn search_stream(
     cancelled: Arc<AtomicBool>,
     mut emit: impl FnMut(Vec<Location>),
 ) -> Result<bool> {
-    if query.is_empty() {
+    if query.is_empty() || cancelled.load(Ordering::Relaxed) {
         return Ok(false);
     }
-    let mut command = Command::new("rg");
-    command.args([
-        "--json",
-        "--fixed-strings",
-        "--hidden",
-        "-g",
-        "!.git",
-        "-g",
-        "!target",
-        "--max-filesize",
-        "20M",
-    ]);
-    if kind != SearchKind::Text {
-        command.arg("--word-regexp");
+    if limit == 0 {
+        return Ok(true);
     }
-    let mut child = command
-        .arg("--")
-        .arg(query)
-        .arg(".")
-        .current_dir(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Cannot start ripgrep. Install rg and ensure it is on PATH")?;
-    let stderr = child.stderr.take().unwrap();
-    // Drain stderr concurrently so an unread error pipe cannot stall the search.
-    let errors = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = BufReader::new(stderr).read_to_string(&mut text);
-        text
-    });
-    let mut locations = vec![];
-    let mut delivered = 0;
-    let mut last_batch = Instant::now();
-    let mut candidates = std::collections::HashSet::new();
-    let mut classifiers = std::collections::HashMap::new();
-    let mut truncated = false;
-    let stdout = child.stdout.take().unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_worker = stop.clone();
-    let cancel_worker = cancelled.clone();
-    let process = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
-        loop {
-            if stop_worker.load(Ordering::Relaxed) || cancel_worker.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                return child.wait();
-            }
-            if let Some(status) = child.try_wait()? {
-                return Ok(status);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    });
-    for line in BufReader::new(stdout).lines() {
-        if cancelled.load(Ordering::Relaxed) {
-            break;
-        }
-        let Ok(line) = line else {
-            break;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if value["type"] != "match" {
-            continue;
-        }
-        let data = &value["data"];
-        let Some(path) = data["path"]["text"].as_str() else {
-            continue;
-        };
-        let path: PathBuf = root.join(path).components().collect();
-        if excluded.contains(&path)
-            || (!excluded.is_empty()
-                && path
-                    .canonicalize()
-                    .is_ok_and(|path| excluded.contains(&path)))
-        {
-            continue;
-        }
-        if kind == SearchKind::Definitions {
-            if candidates.insert(path.clone())
-                && let Ok(source) = read_text(&path)
-            {
-                for symbol in symbols(&path, &source)
-                    .into_iter()
-                    .filter(|s| s.name == query)
-                {
-                    locations.push(Location {
-                        category: MatchCategory::Declaration,
-                        path: path.clone(),
-                        line: symbol.line,
-                        column: symbol.column,
-                        preview: source
-                            .lines()
-                            .nth(symbol.line - 1)
-                            .unwrap_or("")
-                            .trim()
-                            .to_owned(),
-                    });
-                }
-            }
-        } else if let Some(matches) = data["submatches"].as_array() {
-            // ripgrep emits each file's matches together. Retain just its syntax tree.
-            if !classifiers.contains_key(&path) {
-                classifiers.clear();
-            }
-            let classifier = classifiers.entry(path.clone()).or_insert_with(|| {
-                read_text(&path)
-                    .ok()
-                    .and_then(|source| Classifier::new(&path, &source))
+    let matcher = RegexMatcherBuilder::new()
+        .fixed_strings(true)
+        .word(kind != SearchKind::Text)
+        .line_terminator(Some(b'\n'))
+        .build(query)?;
+    // Two workers bound concurrent syntax trees and I/O buffers. The channel bounds
+    // queued results and provides backpressure when the consumer stops or hits its limit.
+    let walk = workspace_walk(root)?
+        .max_filesize(Some(MAX_FILE_BYTES))
+        .threads(2)
+        .build_parallel();
+    let stopped = AtomicBool::new(false);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Result<Vec<Location>>>(4);
+    std::thread::scope(|scope| {
+        let matcher = &matcher;
+        let stopped = &stopped;
+        let cancelled = &*cancelled;
+        scope.spawn(move || {
+            walk.run(|| {
+                let sender = sender.clone();
+                let mut searcher = SearcherBuilder::new()
+                    .line_number(true)
+                    .binary_detection(BinaryDetection::quit(b'\0'))
+                    .build();
+                Box::new(move |entry| {
+                    if cancelled.load(Ordering::Relaxed) || stopped.load(Ordering::Relaxed) {
+                        return WalkState::Quit;
+                    }
+                    let result = (|| -> Result<()> {
+                        let entry = entry.context("Cannot walk project files")?;
+                        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                            return Ok(());
+                        }
+                        let path = entry.path();
+                        if excluded.contains(path)
+                            || (!excluded.is_empty()
+                                && path.canonicalize().is_ok_and(|p| excluded.contains(&p)))
+                        {
+                            return Ok(());
+                        }
+                        search_file(
+                            path,
+                            matcher,
+                            query,
+                            kind,
+                            &mut searcher,
+                            SearchCancellation {
+                                requested: cancelled,
+                                stopped,
+                            },
+                            |batch| sender.send(Ok(batch)).is_ok(),
+                        )
+                        .with_context(|| format!("Cannot search {}", path.display()))
+                    })();
+                    if let Err(error) = result {
+                        let _ = sender.send(Err(error));
+                    }
+                    WalkState::Continue
+                })
             });
-            for entry in matches {
-                let start = data["absolute_offset"].as_u64().unwrap_or(0) as usize
-                    + entry["start"].as_u64().unwrap_or(0) as usize;
-                let end = data["absolute_offset"].as_u64().unwrap_or(0) as usize
-                    + entry["end"].as_u64().unwrap_or(0) as usize;
-                locations.push(Location {
-                    category: classifier
-                        .as_ref()
-                        .map_or(MatchCategory::Other, |c| c.category(start, end)),
-                    path: path.clone(),
-                    line: data["line_number"].as_u64().unwrap_or(1) as usize,
-                    column: entry["start"].as_u64().unwrap_or(0) as usize + 1,
-                    preview: data["lines"]["text"]
-                        .as_str()
-                        .unwrap_or("")
-                        .trim_end()
-                        .to_owned(),
-                });
+        });
+        let mut delivered = 0;
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                stopped.store(true, Ordering::Relaxed);
+                drop(receiver);
+                return Ok(false);
+            }
+            match receiver.recv_timeout(Duration::from_millis(20)) {
+                Ok(Ok(mut batch)) => {
+                    batch.truncate(limit - delivered);
+                    delivered += batch.len();
+                    if !batch.is_empty() {
+                        emit(batch);
+                    }
+                    if delivered == limit {
+                        stopped.store(true, Ordering::Relaxed);
+                        drop(receiver);
+                        return Ok(true);
+                    }
+                }
+                Ok(Err(error)) => {
+                    stopped.store(true, Ordering::Relaxed);
+                    drop(receiver);
+                    return Err(error);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(false),
             }
         }
-        if delivered + locations.len() >= limit {
-            locations.truncate(limit.saturating_sub(delivered));
-            truncated = true;
-            break;
-        }
-        if !locations.is_empty()
-            && (delivered == 0
-                || locations.len() >= 64
-                || last_batch.elapsed() >= Duration::from_millis(40))
-        {
-            delivered += locations.len();
-            emit(std::mem::take(&mut locations));
-            last_batch = Instant::now();
-        }
-    }
-    stop.store(
-        truncated || cancelled.load(Ordering::Relaxed),
-        Ordering::Relaxed,
-    );
-    let status = process
-        .join()
-        .map_err(|_| anyhow::anyhow!("Search process monitor stopped"))??;
-    let errors = errors.join().unwrap_or_default();
-    if !cancelled.load(Ordering::Relaxed)
-        && !truncated
-        && !status.success()
-        && status.code() != Some(1)
-    {
-        bail!("ripgrep: {errors}");
-    }
-    if !locations.is_empty() && !cancelled.load(Ordering::Relaxed) {
-        emit(locations);
-    }
-    Ok(truncated)
+    })
 }
 
 /// Convert a one-based line / UTF-8 byte column into egui's Unicode character offset.
@@ -826,6 +883,123 @@ mod tests {
         assert!(priority[0].preview.contains("unsaved"));
         assert_eq!(project.len(), 1);
         assert_eq!(project[0].path, rest);
+        Ok(())
+    }
+
+    #[test]
+    fn embedded_walk_and_search_share_ignore_rules_and_include_hidden_files() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(root.join("target/nested"))?;
+        std::fs::create_dir_all(root.join("nested/target"))?;
+        std::fs::write(root.join(".gitignore"), "git-ignored.txt\n")?;
+        std::fs::write(root.join(".ignore"), "ignored.txt\n")?;
+        std::fs::write(root.join(".rgignore"), "rg-ignored.txt\n")?;
+        for name in [
+            "visible.txt",
+            ".hidden.txt",
+            "git-ignored.txt",
+            "ignored.txt",
+            "rg-ignored.txt",
+            ".git/private.txt",
+            "target/nested/generated.txt",
+            "nested/target/generated.txt",
+        ] {
+            std::fs::write(root.join(name), "needle\n")?;
+        }
+        let paths = files(root)?;
+        assert!(paths.contains(&root.join("visible.txt")));
+        assert!(paths.contains(&root.join(".hidden.txt")));
+        for name in [
+            "git-ignored.txt",
+            "ignored.txt",
+            "rg-ignored.txt",
+            ".git/private.txt",
+            "target/nested/generated.txt",
+            "nested/target/generated.txt",
+        ] {
+            assert!(!paths.contains(&root.join(name)), "must ignore {name}");
+        }
+        let results = search(root, "needle", SearchKind::Text)?;
+        assert_eq!(results.locations.len(), 2);
+        assert!(results.locations.iter().all(|r| paths.contains(&r.path)));
+        Ok(())
+    }
+
+    #[test]
+    fn embedded_search_preserves_unicode_byte_columns_crlf_and_size_limits() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("unicode.txt"),
+            "猫 needle needle\r\nneedle\r\n",
+        )?;
+        std::fs::write(dir.path().join("binary.bin"), b"\0needle\n")?;
+        let large = std::fs::File::create(dir.path().join("large.txt"))?;
+        use std::io::Write;
+        (&large).write_all(b"needle\n")?;
+        large.set_len(MAX_FILE_BYTES + 1)?;
+        let results = search(dir.path(), "needle", SearchKind::References)?;
+        assert_eq!(
+            results
+                .locations
+                .iter()
+                .map(|r| (r.line, r.column))
+                .collect::<Vec<_>>(),
+            [(1, 5), (1, 12), (2, 1)]
+        );
+        assert_eq!(results.locations[0].preview, "猫 needle needle");
+        assert!(
+            results
+                .locations
+                .iter()
+                .all(|r| r.path.ends_with("unicode.txt"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancelling_during_streaming_unblocks_parallel_workers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        for index in 0..8 {
+            std::fs::write(
+                dir.path().join(format!("{index}.txt")),
+                "needle\n".repeat(10_000),
+            )?;
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut batches = 0;
+        let truncated = search_stream(
+            dir.path(),
+            "needle",
+            SearchKind::Text,
+            &Default::default(),
+            MAX_RESULTS,
+            cancelled.clone(),
+            |_| {
+                batches += 1;
+                cancelled.store(true, Ordering::Relaxed);
+            },
+        )?;
+        assert_eq!(batches, 1);
+        assert!(!truncated);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn embedded_search_supports_non_utf8_file_names() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir()?;
+        let path = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"file-\xff.txt".to_vec()));
+        std::fs::write(&path, "needle")?;
+        assert_eq!(files(dir.path())?, vec![path.clone()]);
+        assert_eq!(
+            search(dir.path(), "needle", SearchKind::Text)?.locations[0].path,
+            path
+        );
         Ok(())
     }
 

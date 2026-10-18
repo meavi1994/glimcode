@@ -4,7 +4,7 @@ Pull requests for extra features, bug fixes, usability, documentation, and perfo
 
 ## Get set up
 
-Install stable Rust, Git, and ripgrep, then fork and clone the repository.
+Install stable Rust and Git, then fork and clone the repository. Search libraries are compiled into the app; no `rg` installation is needed.
 
 ```sh
 cargo run --release -- /path/to/test/project

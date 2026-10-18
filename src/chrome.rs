@@ -815,7 +815,7 @@ pub fn paint_icon(painter: &egui::Painter, center: egui::Pos2, icon: Icon, color
             let d = if icon == Icon::HideLeft { 1.0 } else { -1.0 };
             line((-5.0 * d, -6.0), (-5.0 * d, 6.0));
             painter.add(egui::Shape::line(
-                vec![p(3.0 * d, -4.0), p(-1.0 * d, 0.0), p(3.0 * d, 4.0)],
+                vec![p(3.0 * d, -4.0), p(-d, 0.0), p(3.0 * d, 4.0)],
                 stroke,
             ));
         }
