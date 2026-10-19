@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/Built_with-Rust-dea584.svg)](https://www.rust-lang.org/)
 
-[Get started](#get-started) · [Features](#built-for-the-work-around-ai-generated-code) · [User guide](docs/USER_GUIDE.md) · [Contribute](#help-build-glimcode)
+[Download for macOS](#download-for-macos) · [Get started](#get-started) · [Features](#built-for-the-work-around-ai-generated-code) · [User guide](docs/USER_GUIDE.md) · [Contribute](#help-build-glimcode)
 
 </div>
 
@@ -67,25 +67,122 @@ Sorting and value selections change the view; hidden rows remain in saved files.
 
 ## Get started
 
-Glimcode is currently distributed as source. Install a current stable [Rust toolchain](https://www.rust-lang.org/tools/install). Git is needed for version-control features. The current desktop build has been exercised on **macOS Apple Silicon**; Linux and Windows support needs broader testing.
+### Download for macOS
 
-On macOS:
+Prebuilt command-line executables are available on the [latest release page](https://github.com/meavi1994/glimcode/releases/latest). **Rust is not required** to run a downloaded binary. These builds require **macOS 15 (Sequoia) or later**.
+
+| Your Mac | Download |
+| --- | --- |
+| Apple Silicon (M1 and later) | [glimcode-macos-arm64.tar.gz](https://github.com/meavi1994/glimcode/releases/latest/download/glimcode-macos-arm64.tar.gz) |
+| Intel | [glimcode-macos-x86_64.tar.gz](https://github.com/meavi1994/glimcode/releases/latest/download/glimcode-macos-x86_64.tar.gz) |
+
+Check **Apple menu → About This Mac** if you are unsure which processor you have. Download the matching archive and extract it, either by double-clicking it in Finder or from Terminal:
 
 ```sh
-brew install rust git
+cd ~/Downloads
+# Apple Silicon; for Intel, replace arm64 with x86_64 in both commands.
+tar -xzf glimcode-macos-arm64.tar.gz
+cd glimcode-macos-arm64
+./glimcode /path/to/project
+```
+
+The executable inside the extracted folder is named **`glimcode`**. Install it in a stable location before adding it to your PATH:
+
+```sh
+mkdir -p "$HOME/.local/bin"
+install -m 755 ./glimcode "$HOME/.local/bin/glimcode"
+```
+
+Follow [Add Glimcode to your PATH](#add-glimcode-to-your-path) below, then use `glimcode` from any directory.
+
+Downloads include an ad-hoc code signature, but are **not Apple Developer ID signed or notarized**. If macOS blocks the first launch, attempt to run the binary, then open **System Settings → Privacy & Security → Open Anyway** if you trust the download. See [Apple's instructions](https://support.apple.com/en-us/102445).
+
+The release also includes `SHA256SUMS`. To verify an Apple Silicon download, put that file beside the archive and run the following (substitute `x86_64` for Intel):
+
+```sh
+grep 'glimcode-macos-arm64.tar.gz$' SHA256SUMS | shasum -a 256 -c -
+```
+
+### Build from source
+
+Install a current stable [Rust toolchain](https://www.rust-lang.org/tools/install). On macOS, you can use `brew install rust git`. Git is needed for version-control features. Linux and Windows support needs broader testing.
+
+```sh
 git clone https://github.com/meavi1994/glimcode.git
 cd glimcode
-cargo run --release -- /path/to/project
+cargo build --release --locked
 ```
 
-The optional argument can be a project directory or a file. Without one, Glimcode opens the current directory. You can also use **Open folder** and **Open file** inside the app.
-
-To install the executable locally:
+**The compiled binary is `target/release/glimcode` inside the cloned repository** (`target/release/glimcode.exe` on Windows). Run it directly:
 
 ```sh
-cargo install --path . --locked
-glimcode /path/to/project
+./target/release/glimcode /path/to/project
 ```
+
+This is a standalone executable; you do not need `cargo run` or Rust to launch it afterward. If you set `CARGO_TARGET_DIR`, look in that directory's `release/` folder instead. An explicit `--target` build puts it in `target/<target-triple>/release/`.
+
+To install the compiled binary in a stable location on macOS or Linux:
+
+```sh
+mkdir -p "$HOME/.local/bin"
+install -m 755 target/release/glimcode "$HOME/.local/bin/glimcode"
+```
+
+Alternatively, `cargo install --path . --locked` builds and installs it into **`~/.cargo/bin/glimcode`** by default (`$CARGO_HOME/bin/glimcode` if customized). Rust installations usually add that directory to PATH already. Choose the PATH entry below that matches where you installed the binary.
+
+### Add Glimcode to your PATH
+
+For a downloaded or compiled binary installed in `~/.local/bin`, add this line **once** to your shell's configuration:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+For **zsh** (the default on modern macOS), edit `~/.zshrc`, save it, and reload it:
+
+```sh
+nano ~/.zshrc
+source ~/.zshrc
+```
+
+For **Bash**, edit `~/.bashrc`, save it, and reload it:
+
+```sh
+nano ~/.bashrc
+source ~/.bashrc
+```
+
+If you used `cargo install`, add `export PATH="$HOME/.cargo/bin:$PATH"` instead (or your custom Cargo bin directory). You can also add the absolute path of the repository's `target/release` directory to PATH, but moving the repository or running `cargo clean` will remove access to that binary.
+
+Bash login shells, including many macOS Terminal configurations, read `~/.bash_profile` instead of `~/.bashrc`. If your login shell does not already load `.bashrc`, add this line to `~/.bash_profile`:
+
+```sh
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+```
+
+Open a new terminal or reload the appropriate file, then confirm that your shell finds the command:
+
+```sh
+command -v glimcode
+# For the ~/.local/bin installation: /Users/your-name/.local/bin/glimcode
+```
+
+If you see `command not found`, check the installation location and reload the configuration for the shell you are actually using (`echo "$SHELL"`). Updating the binary later only requires running the `install` command again; the PATH entry stays the same.
+
+### Use the binary
+
+Glimcode opens a desktop window. Run it from Terminal with an optional project directory or file path:
+
+```sh
+glimcode                         # Open the current directory
+glimcode .                       # Open the current directory explicitly
+glimcode ~/projects/my-project   # Open a project folder
+glimcode ~/projects/my-project/src/main.rs  # Open a file and its parent folder
+glimcode "/path/with spaces/project"       # Quote paths containing spaces
+glimcode /path/to/project &      # Keep using the terminal while the editor runs
+```
+
+Pass one path per launch. You can also use **File → Open folder** and **File → Open file** inside the app. If you have not configured PATH yet, replace `glimcode` in these examples with the executable's path, such as `./target/release/glimcode` or `"$HOME/.local/bin/glimcode"`.
 
 GitHub pull-request links and commit-to-PR lookup optionally use an authenticated [GitHub CLI](https://cli.github.com/). Local Git review works without it.
 

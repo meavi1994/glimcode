@@ -4,13 +4,20 @@ A native desktop IDE written in Rust. Code navigation uses **embedded ripgrep li
 
 ## Run
 
-Install a current stable Rust toolchain. On macOS, use `brew install rust`. Search is embedded using ripgrep’s official `grep` and `ignore` Rust libraries; no `rg` executable is required. Install Git for version-control features.
+Download a prebuilt macOS executable or build from source using the [installation instructions](../README.md#get-started). They include binary locations, checksum verification, and PATH setup for `~/.zshrc` and `~/.bashrc`.
+
+After installing the command:
 
 ```sh
-cargo run --release -- /path/to/project
+glimcode                        # Open the current directory
+glimcode /path/to/project       # Open a project
+glimcode /path/to/project/file.rs  # Open a file and its parent folder
+glimcode "/path/with spaces"    # Quote paths containing spaces
 ```
 
-The optional argument can also be a file. Without an argument, Glimcode opens the current directory. Use **Open folder** or **Open file** inside the app.
+Without PATH setup, run the executable directly: `./target/release/glimcode /path/to/project` after a source build, or `./glimcode /path/to/project` from an extracted download. Source builds place the binary at `target/release/glimcode` by default. `cargo install --path . --locked` installs it at `~/.cargo/bin/glimcode` by default.
+
+The app opens a desktop window. Pass one optional directory or file path per launch; without an argument, it opens the current directory. Use **Open folder** or **Open file** inside the app to navigate elsewhere. Install Git for version-control features; search is embedded and does not require a separate `rg` executable.
 
 ## Code editor and navigation
 

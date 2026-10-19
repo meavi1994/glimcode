@@ -34,6 +34,28 @@ cargo build --release --locked
 
 Discuss larger features or architecture changes in an issue first. Keep small fixes easy to review, preserve existing user data, and avoid unrelated formatting changes.
 
+## Publishing macOS binaries
+
+The [macOS release workflow](.github/workflows/release.yml) builds and tests native Apple Silicon and Intel executables on GitHub-hosted macOS runners. Both downloads target macOS 15 or later. It packages the binary, README, user guide, images, and license into separate archives, generates `SHA256SUMS`, and publishes a GitHub release only after both builds succeed. Binaries use ad-hoc signatures; Developer ID signing and notarization are not configured.
+
+To publish a version, update the package version in `Cargo.toml` and its entry in `Cargo.lock` if needed, review `.github/RELEASE_NOTES.md`, and commit the changes. Tag that commit with the matching version, then push the commit and tag:
+
+```sh
+git tag v0.1.0
+git push origin main v0.1.0
+```
+
+Use a new version for each release. The tag must include `.github/workflows/release.yml`. Watch **Actions → macOS release** for build failures; downloads appear under **Releases** after publication. Failed builds do not publish a partial release. If publication fails after creating a draft, rerun the failed job; it reuses the draft and uploads the assets again.
+
+To check packaging locally on macOS after a release build:
+
+```sh
+bash scripts/package-macos.sh target/release/glimcode dist
+tar -tzf dist/glimcode-macos-arm64.tar.gz
+```
+
+Replace `arm64` with `x86_64` on an Intel Mac. The script reads the architecture from the executable, and generated files in `dist/` are ignored by Git.
+
 ## Reporting a bug
 
 Include your OS and architecture, the commit you built, reproduction steps, expected and actual behavior, and relevant logs or screenshots. Use a small synthetic example where possible; remove secrets and private project data before posting.
