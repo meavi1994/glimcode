@@ -45,12 +45,13 @@ enum Picker {
 pub struct Coder {
     root: PathBuf,
     files: Vec<PathBuf>,
+    folders: Vec<PathBuf>,
     tree: crate::explorer::FileTree,
     selected_category: Option<navigation::MatchCategory>,
     extension_filter: Option<String>,
     result_scope: crate::search_view::Scope,
     file_filter: String,
-    files_rx: Option<Receiver<anyhow::Result<Vec<PathBuf>>>>,
+    files_rx: Option<Receiver<anyhow::Result<navigation::WorkspacePaths>>>,
     documents: Vec<Document>,
     active: usize,
     query: String,
@@ -128,7 +129,9 @@ impl Coder {
         }
         #[cfg(feature = "ui-capture")]
         if let Ok(mode) = std::env::var("CODER_UI_PREVIEW") {
-            app.files = navigation::files(&app.root).unwrap_or_default();
+            let paths = navigation::workspace_paths(&app.root).unwrap_or_default();
+            app.files = paths.files;
+            app.folders = paths.folders;
             app.tree = crate::explorer::FileTree::build(&app.root, &app.files);
             app.files_rx = None;
             if mode == "workspace-search" {
@@ -314,6 +317,7 @@ impl Coder {
         Self {
             root,
             files: vec![],
+            folders: vec![],
             tree: Default::default(),
             selected_category: None,
             extension_filter: None,
@@ -392,6 +396,7 @@ impl Coder {
         self.documents.clear();
         self.active = 0;
         self.files.clear();
+        self.folders.clear();
         self.tree = Default::default();
         self.history.clear();
         self.recent_file_searches.clear();
@@ -424,7 +429,7 @@ impl Coder {
         let (tx, rx) = mpsc::channel();
         self.files_rx = Some(rx);
         std::thread::spawn(move || {
-            let _ = tx.send(navigation::files(&root));
+            let _ = tx.send(navigation::workspace_paths(&root));
         });
     }
 
@@ -635,9 +640,10 @@ impl Coder {
             && let Ok(result) = rx.try_recv()
         {
             match result {
-                Ok(files) => {
-                    self.tree = crate::explorer::FileTree::build(&self.root, &files);
-                    self.files = files;
+                Ok(paths) => {
+                    self.tree = crate::explorer::FileTree::build(&self.root, &paths.files);
+                    self.files = paths.files;
+                    self.folders = paths.folders;
                 }
                 Err(error) => self.error = Some(format!("{error:#}")),
             }
@@ -901,7 +907,7 @@ impl Coder {
 
     fn sidebar(&mut self, ctx: &egui::Context) {
         let mut open = None;
-        let mut force_root = false;
+        let mut force_root = self.tree.reveal_pending();
         let colors = self
             .git
             .repo
@@ -2562,7 +2568,7 @@ impl Coder {
                         } else if mode == Picker::Symbols {
                             "Filter symbols in this file"
                         } else {
-                            "File name, optionally :line or :line:column"
+                            "File or folder path, optionally :line or :line:column"
                         }),
                 );
                 if self.picker_focus {
@@ -2638,6 +2644,11 @@ impl Coder {
                             } else {
                                 &self.files
                             },
+                            if mode == Picker::Recent {
+                                &[]
+                            } else {
+                                &self.folders
+                            },
                             &self.root,
                             &query,
                         );
@@ -2654,6 +2665,7 @@ impl Coder {
                             ));
                         }
                     }
+                    let previous_selection = self.picker_selection;
                     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowDown)) {
                         self.picker_selection =
                             (self.picker_selection + 1).min(entries.len().saturating_sub(1));
@@ -2673,10 +2685,13 @@ impl Coder {
                                 let (rect, response) = ui.allocate_exact_size(
                                     egui::vec2(
                                         ui.available_width(),
-                                        (dialog_size + 16.0).max(32.0),
+                                        (dialog_size * 2.0 + 18.0).max(48.0),
                                     ),
                                     egui::Sense::click(),
                                 );
+                                if selected && self.picker_selection != previous_selection {
+                                    ui.scroll_to_rect(rect, None);
+                                }
                                 if selected || response.hovered() {
                                     ui.painter().rect_filled(
                                         rect,
@@ -2708,51 +2723,54 @@ impl Coder {
                                 });
                                 let filename_rect = egui::Rect::from_min_max(
                                     rect.min + egui::vec2(34.0, 0.0),
-                                    egui::pos2(rect.left() + rect.width() * 0.62, rect.bottom()),
+                                    rect.max - egui::vec2(12.0, 0.0),
                                 );
                                 ui.painter()
                                     .with_clip_rect(filename_rect.intersect(ui.clip_rect()))
-                                    .galley(
-                                        rect.left_center()
-                                            + egui::vec2(34.0, -galley.size().y / 2.0),
-                                        galley,
-                                        chrome::TEXT,
-                                    );
+                                    .galley(rect.min + egui::vec2(34.0, 5.0), galley, chrome::TEXT);
                                 ui.put(
                                     egui::Rect::from_min_size(
                                         rect.min + egui::vec2(6.0, 4.0),
                                         egui::vec2(24.0, 24.0),
                                     ),
-                                    egui::Label::new(chrome::file_icon(&location.path)),
+                                    egui::Label::new(
+                                        if self.folders.binary_search(&location.path).is_ok() {
+                                            egui::RichText::new("▸").color(chrome::WARNING)
+                                        } else {
+                                            chrome::file_icon(&location.path)
+                                        },
+                                    ),
                                 );
-                                let parent = relative(
-                                    location.path.parent().unwrap_or(Path::new("")),
-                                    &self.root,
-                                );
-                                ui.painter()
-                                    .with_clip_rect(
-                                        egui::Rect::from_min_max(
-                                            egui::pos2(filename_rect.right() + 16.0, rect.top()),
-                                            rect.max,
-                                        )
-                                        .intersect(ui.clip_rect()),
-                                    )
-                                    .text(
-                                        rect.right_center() - egui::vec2(12.0, 0.0),
-                                        egui::Align2::RIGHT_CENTER,
-                                        parent,
-                                        FontId::proportional(crate::preferences::dialog_font_size(
-                                            ui.ctx(),
-                                        )),
-                                        chrome::MUTED,
+                                if !matches!(mode, Picker::Symbols) {
+                                    let parent = relative(
+                                        location.path.parent().unwrap_or(Path::new("")),
+                                        &self.root,
                                     );
+                                    let parent = if parent.is_empty() { "." } else { &parent };
+                                    let galley = ui.fonts_mut(|f| {
+                                        f.layout_job(chrome::highlighted(
+                                            parent,
+                                            file_query,
+                                            dialog_size - 1.0,
+                                        ))
+                                    });
+                                    ui.painter()
+                                        .with_clip_rect(filename_rect.intersect(ui.clip_rect()))
+                                        .galley(
+                                            rect.min + egui::vec2(34.0, dialog_size + 9.0),
+                                            galley,
+                                            chrome::MUTED,
+                                        );
+                                }
+                                let response =
+                                    response.on_hover_text(location.path.display().to_string());
                                 if response.clicked() || (enter && index == self.picker_selection) {
                                     open = Some(location.clone());
                                 }
                             }
                         });
                     if entries.is_empty() {
-                        ui.weak("No matching files or symbols");
+                        ui.weak("No matching files, folders or symbols");
                     }
                 }
                 chrome::dialog_divider(ui);
@@ -2767,7 +2785,13 @@ impl Coder {
                 self.recent_file_searches.insert(0, location.path.clone());
                 self.recent_file_searches.truncate(50);
             }
-            self.navigate(location);
+            if location.path.is_dir() {
+                self.show_project = true;
+                self.file_filter.clear();
+                self.tree.reveal_path(&self.root, &location.path);
+            } else {
+                self.navigate(location);
+            }
             self.picker = None;
         } else if close {
             self.picker = None;
@@ -2986,6 +3010,7 @@ fn file_candidates(
     recent: &[PathBuf],
     open: &[PathBuf],
     files: &[PathBuf],
+    folders: &[PathBuf],
     root: &Path,
     query: &str,
 ) -> Vec<PathBuf> {
@@ -2993,6 +3018,7 @@ fn file_candidates(
     recent
         .iter()
         .chain(open)
+        .chain(folders)
         .chain(files)
         .filter(|path| path.starts_with(root))
         .filter(|path| relative(path, root).to_lowercase().contains(query))
@@ -5242,6 +5268,84 @@ mod tests {
         assert_eq!(split_file_location("file:word"), ("file:word", None));
     }
     #[test]
+    fn picker_lists_empty_folders_and_enter_reveals_them_without_opening_a_document()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let folder = root.join("src/nested/empty");
+        std::fs::create_dir_all(&folder)?;
+        std::fs::write(root.join("src/main.rs"), "fn main() {}")?;
+        let paths = navigation::workspace_paths(&root)?;
+        assert!(paths.folders.contains(&folder));
+        let mut app = Coder::empty(root.clone());
+        app.files = paths.files;
+        app.folders = paths.folders;
+        app.tree = crate::explorer::FileTree::build(&root, &app.files);
+        app.show_project = false;
+        app.show_picker(Picker::Files);
+        app.picker_query = "empty".into();
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let frame = |app: &mut Coder, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(700.0, 700.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            )
+        };
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        for label in ["empty", "src/nested"] {
+            assert!(
+                output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == label)),
+                "missing {label}"
+            );
+        }
+        frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.picker.is_none());
+        assert!(app.show_project);
+        assert!(app.documents.is_empty());
+        assert!(app.tree.reveal_pending());
+        frame(&mut app, vec![]);
+        assert!(!app.tree.reveal_pending());
+        assert!(app.error.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn matching_folders_are_not_capped_out_by_their_contents() {
+        let root = Path::new("/project");
+        let folder = root.join("sources");
+        let files: Vec<_> = (0..150).map(|i| folder.join(format!("{i}.rs"))).collect();
+        let found = file_candidates(
+            &[],
+            &[],
+            &files,
+            std::slice::from_ref(&folder),
+            root,
+            "sources",
+        );
+        assert_eq!(found.len(), 100);
+        assert_eq!(found[0], folder);
+    }
+
+    #[test]
     fn file_search_prioritizes_recent_choices_without_duplicates() {
         let root = Path::new("/project");
         let a = root.join("a.rs");
@@ -5252,6 +5356,7 @@ mod tests {
                 std::slice::from_ref(&b),
                 std::slice::from_ref(&a),
                 &[a.clone(), b.clone(), c.clone()],
+                &[],
                 root,
                 ""
             ),

@@ -352,16 +352,30 @@ fn workspace_walk(root: &Path) -> Result<WalkBuilder> {
     Ok(walk)
 }
 
-pub fn files(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
+#[derive(Default)]
+pub struct WorkspacePaths {
+    pub files: Vec<PathBuf>,
+    pub folders: Vec<PathBuf>,
+}
+
+pub fn workspace_paths(root: &Path) -> Result<WorkspacePaths> {
+    let mut paths = WorkspacePaths::default();
     for entry in workspace_walk(root)?.build() {
         let entry = entry.context("Cannot list project files")?;
         if entry.file_type().is_some_and(|kind| kind.is_file()) {
-            files.push(entry.into_path());
+            paths.files.push(entry.into_path());
+        } else if entry.depth() > 0 && entry.file_type().is_some_and(|kind| kind.is_dir()) {
+            paths.folders.push(entry.into_path());
         }
     }
-    files.sort();
-    Ok(files)
+    paths.files.sort();
+    paths.folders.sort();
+    Ok(paths)
+}
+
+#[cfg(any(test, feature = "ui-capture"))]
+pub fn files(root: &Path) -> Result<Vec<PathBuf>> {
+    Ok(workspace_paths(root)?.files)
 }
 
 #[cfg(any(test, feature = "ui-capture"))]
@@ -1095,7 +1109,18 @@ mod tests {
         std::fs::create_dir_all(root.join(".git"))?;
         std::fs::create_dir_all(root.join("target/nested"))?;
         std::fs::create_dir_all(root.join("nested/target"))?;
-        std::fs::write(root.join(".gitignore"), "git-ignored.txt\n")?;
+        std::fs::write(
+            root.join(".gitignore"),
+            "git-ignored.txt\nignored-folder/\n",
+        )?;
+        for folder in ["empty", ".hidden-folder", "ignored-folder", "target/empty"] {
+            std::fs::create_dir_all(root.join(folder))?;
+        }
+        let indexed = workspace_paths(root)?;
+        assert!(indexed.folders.contains(&root.join("empty")));
+        assert!(indexed.folders.contains(&root.join(".hidden-folder")));
+        assert!(!indexed.folders.contains(&root.join("ignored-folder")));
+        assert!(!indexed.folders.contains(&root.join("target/empty")));
         std::fs::write(root.join(".ignore"), "ignored.txt\n")?;
         std::fs::write(root.join(".rgignore"), "rg-ignored.txt\n")?;
         for name in [

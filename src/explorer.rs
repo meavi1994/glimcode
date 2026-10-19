@@ -66,6 +66,7 @@ pub struct FileTree {
     last_active: Option<PathBuf>,
     open_override: Option<bool>,
     reveal_requested: bool,
+    reveal_target: Option<PathBuf>,
 }
 
 impl FileTree {
@@ -76,6 +77,25 @@ impl FileTree {
         }
     }
     pub fn reveal_active(&mut self) {
+        self.reveal_requested = true;
+    }
+
+    pub fn reveal_pending(&self) -> bool {
+        self.reveal_requested
+    }
+
+    pub fn reveal_path(&mut self, root: &Path, path: &Path) {
+        let Ok(relative) = path.strip_prefix(root) else {
+            return;
+        };
+        let mut node = &mut *self;
+        for component in relative.components() {
+            node = node
+                .children
+                .entry(component.as_os_str().to_owned())
+                .or_default();
+        }
+        self.reveal_target = Some(path.to_path_buf());
         self.reveal_requested = true;
     }
 
@@ -118,6 +138,8 @@ impl FileTree {
         filter: &str,
         colors: &BTreeMap<PathBuf, egui::Color32>,
     ) -> Option<PathBuf> {
+        let target = self.reveal_target.take();
+        let active = target.as_deref().or(active);
         let reveal =
             std::mem::take(&mut self.reveal_requested) || self.last_active.as_deref() != active;
         self.last_active = active.map(Path::to_path_buf);
@@ -232,6 +254,9 @@ impl FileTree {
                     );
                     if let Some(action) = child.action.take() {
                         self.action = Some(action);
+                    }
+                    if reveal && active == Some(path.as_path()) {
+                        ui.scroll_to_rect(header_response.rect, Some(egui::Align::Center));
                     }
                     header_response.context_menu(|ui| {
                         if let Some(action) = context_menu(ui, root, &path, true) {

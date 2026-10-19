@@ -34,6 +34,23 @@ impl Settings {
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         command.env("TERM_PROGRAM", "Glimcode");
+        // The parent terminal's identity does not describe this emulator.
+        for name in [
+            "TERM_PROGRAM_VERSION",
+            "TERM_SESSION_ID",
+            "ITERM_SESSION_ID",
+            "ITERM_PROFILE",
+            "LC_TERMINAL",
+            "LC_TERMINAL_VERSION",
+            "KITTY_WINDOW_ID",
+            "WT_SESSION",
+            "VTE_VERSION",
+            "TMUX",
+            "TMUX_PANE",
+            "STY",
+        ] {
+            command.env_remove(name);
+        }
         Ok(command)
     }
 }
@@ -119,12 +136,34 @@ struct Callbacks {
     title: String,
     directory: Option<PathBuf>,
     replies: Vec<u8>,
+    focus_reporting: bool,
+    last_focus: Option<bool>,
 }
 impl vt100::Callbacks for Callbacks {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = clean_title(&String::from_utf8_lossy(title));
     }
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if params.get(1) == Some(&b"?".as_slice()) {
+            let color = match params.first().copied() {
+                Some(b"10") => Some(chrome::TEXT),
+                Some(b"11") => Some(chrome::EDITOR),
+                Some(b"12") => Some(chrome::TEXT),
+                _ => None,
+            };
+            if let Some(color) = color {
+                self.replies.extend_from_slice(
+                    format!(
+                        "\x1b]{};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+                        String::from_utf8_lossy(params[0]),
+                        u16::from(color.r()) * 257,
+                        u16::from(color.g()) * 257,
+                        u16::from(color.b()) * 257,
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
         if params.first() == Some(&b"7".as_slice())
             && let Some(path) = params.get(1)
             && let Ok(url) = url::Url::parse(&String::from_utf8_lossy(path))
@@ -133,26 +172,61 @@ impl vt100::Callbacks for Callbacks {
             self.directory = Some(path);
         }
     }
+    fn unhandled_escape(&mut self, _: &mut vt100::Screen, i1: Option<u8>, _: Option<u8>, c: u8) {
+        if i1.is_none() && c == b'Z' {
+            self.replies.extend_from_slice(b"\x1b[?1;2c");
+        }
+    }
     fn unhandled_csi(
         &mut self,
         screen: &mut vt100::Screen,
         i1: Option<u8>,
-        _: Option<u8>,
+        i2: Option<u8>,
         params: &[&[u16]],
         c: char,
     ) {
-        if i1.is_some() {
-            return;
-        }
         let first = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
-        match (c, first) {
-            ('n', 6) => {
+        match (i1, i2, c, first) {
+            (None, None, 'n', 6) | (Some(b'?'), None, 'n', 6) => {
                 let (row, col) = screen.cursor_position();
-                self.replies
-                    .extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+                self.replies.extend_from_slice(
+                    format!(
+                        "\x1b[{}{};{}R",
+                        if i1.is_some() { "?" } else { "" },
+                        row + 1,
+                        col + 1
+                    )
+                    .as_bytes(),
+                );
             }
-            ('n', 5) => self.replies.extend_from_slice(b"\x1b[0n"),
-            ('c', 0) => self.replies.extend_from_slice(b"\x1b[?1;2c"),
+            (None, None, 'n', 5) => self.replies.extend_from_slice(b"\x1b[0n"),
+            (None, None, 'c', 0) => self.replies.extend_from_slice(b"\x1b[?1;2c"),
+            (Some(b'>'), None, 'c', 0) => self.replies.extend_from_slice(b"\x1b[>0;0;0c"),
+            (None, None, 't', 18) => {
+                let (rows, cols) = screen.size();
+                self.replies
+                    .extend_from_slice(format!("\x1b[8;{rows};{cols}t").as_bytes());
+            }
+            (Some(b'?'), None, 'h' | 'l', _) => {
+                if params.iter().any(|p| p.first() == Some(&1004)) {
+                    self.focus_reporting = c == 'h';
+                    self.last_focus = None;
+                }
+            }
+            (Some(b'?'), Some(b'$'), 'p', mode) => {
+                // Report only capabilities we implement. Unknown extensions stay unsupported.
+                let enabled = match mode {
+                    1 => Some(screen.application_cursor()),
+                    25 => Some(!screen.hide_cursor()),
+                    1004 => Some(self.focus_reporting),
+                    1049 => Some(screen.alternate_screen()),
+                    2004 => Some(screen.bracketed_paste()),
+                    _ => None,
+                };
+                let status = enabled.map_or(0, |enabled| if enabled { 1 } else { 2 });
+                self.replies
+                    .extend_from_slice(format!("\x1b[?{mode};{status}$y").as_bytes());
+            }
             _ => {}
         }
     }
@@ -213,7 +287,6 @@ impl Session {
         let cwd = root.clone();
         let shell = settings.shell.clone();
         let default_name = settings.tab_name.clone();
-        let writer_tx = tx.clone();
         std::thread::spawn(move || {
             let result = (|| -> Result<()> {
                 let pair = portable_pty::native_pty_system().openpty(PtySize {
@@ -237,14 +310,7 @@ impl Session {
                             Ok(0) | Err(_) => break,
                             Ok(count) => count,
                         };
-                        let replies = {
-                            let mut state = output.lock().unwrap();
-                            state.parser.process(&buffer[..count]);
-                            std::mem::take(&mut state.parser.callbacks_mut().replies)
-                        };
-                        if !replies.is_empty() {
-                            let _ = writer_tx.try_send(Command::Input(replies));
-                        }
+                        output.lock().unwrap().parser.process(&buffer[..count]);
                         repaint.request_repaint();
                     }
                 });
@@ -258,19 +324,23 @@ impl Session {
                         shared.lock().unwrap().status = format!("Exited · {status}");
                         break;
                     }
-                    match rx.recv_timeout(Duration::from_millis(30)) {
+                    // Replies have their own buffer so a busy input queue cannot drop them.
+                    let replies =
+                        std::mem::take(&mut shared.lock().unwrap().parser.callbacks_mut().replies);
+                    if !replies.is_empty() {
+                        writer.write_all(&replies)?;
+                        writer.flush()?;
+                    }
+                    match rx.recv_timeout(Duration::from_millis(10)) {
                         Ok(Command::Input(bytes)) => {
                             writer.write_all(&bytes)?;
                             writer.flush()?;
                         }
                         Ok(Command::Resize(size)) => {
+                            // Keep output from being parsed with the old geometry after SIGWINCH.
+                            let mut state = shared.lock().unwrap();
                             pair.master.resize(size)?;
-                            shared
-                                .lock()
-                                .unwrap()
-                                .parser
-                                .screen_mut()
-                                .set_size(size.rows, size.cols);
+                            state.parser.screen_mut().set_size(size.rows, size.cols);
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
                             let _ = child.0.kill();
@@ -725,7 +795,11 @@ fn key_bytes(key: Key, m: Modifiers, application: bool) -> Option<Vec<u8>> {
             _ => 255,
         };
         if letter != 255 {
-            return Some(vec![letter]);
+            return Some(if m.alt {
+                vec![27, letter]
+            } else {
+                vec![letter]
+            });
         }
     }
     let arrow = match key {
@@ -746,7 +820,13 @@ fn key_bytes(key: Key, m: Modifiers, application: bool) -> Option<Vec<u8>> {
         });
     }
     let plain = match key {
-        Key::Enter => "\r",
+        Key::Enter => {
+            if m.alt {
+                "\x1b\r"
+            } else {
+                "\r"
+            }
+        }
         Key::Tab => {
             if m.shift {
                 "\x1b[Z"
@@ -755,7 +835,9 @@ fn key_bytes(key: Key, m: Modifiers, application: bool) -> Option<Vec<u8>> {
             }
         }
         Key::Backspace => {
-            if m.alt {
+            if m.ctrl {
+                "\x08"
+            } else if m.alt {
                 "\x1b\x7f"
             } else {
                 "\x7f"
@@ -780,6 +862,29 @@ fn key_bytes(key: Key, m: Modifiers, application: bool) -> Option<Vec<u8>> {
         Key::F12 => "\x1b[24~",
         _ => return None,
     };
+    let modifier = 1 + u8::from(m.shift) + 2 * u8::from(m.alt) + 4 * u8::from(m.ctrl);
+    if modifier > 1
+        && matches!(
+            key,
+            Key::Insert
+                | Key::Delete
+                | Key::PageUp
+                | Key::PageDown
+                | Key::F5
+                | Key::F6
+                | Key::F7
+                | Key::F8
+                | Key::F9
+                | Key::F10
+                | Key::F11
+                | Key::F12
+        )
+    {
+        return Some(format!("{};{modifier}~", plain.trim_end_matches('~')).into_bytes());
+    }
+    if modifier > 1 && matches!(key, Key::F1 | Key::F2 | Key::F3 | Key::F4) {
+        return Some(format!("\x1b[1;{modifier}{}", plain.chars().last().unwrap()).into_bytes());
+    }
     Some(plain.as_bytes().to_vec())
 }
 fn color(color: vt100::Color, default: Color32) -> Color32 {
@@ -865,6 +970,41 @@ fn terminal_word(screen: &vt100::Screen, point: (u16, u16)) -> Option<((u16, u16
     Some((start, end))
 }
 
+fn mouse_bytes(screen: &vt100::Screen, code: u8, point: (u16, u16), released: bool) -> Vec<u8> {
+    let (row, col) = (point.0 + 1, point.1 + 1);
+    match screen.mouse_protocol_encoding() {
+        vt100::MouseProtocolEncoding::Sgr => format!(
+            "\x1b[<{code};{col};{row}{}",
+            if released { 'm' } else { 'M' }
+        )
+        .into_bytes(),
+        encoding => {
+            let code = if released { (code & 28) | 3 } else { code };
+            let mut bytes = b"\x1b[M".to_vec();
+            for value in [
+                u32::from(code) + 32,
+                u32::from(col) + 32,
+                u32::from(row) + 32,
+            ] {
+                if encoding == vt100::MouseProtocolEncoding::Utf8 {
+                    let mut buf = [0; 4];
+                    bytes.extend_from_slice(
+                        char::from_u32(value)
+                            .unwrap()
+                            .encode_utf8(&mut buf)
+                            .as_bytes(),
+                    );
+                } else if value <= 255 {
+                    bytes.push(value as u8);
+                } else {
+                    return vec![];
+                }
+            }
+            bytes
+        }
+    }
+}
+
 fn render(ui: &mut egui::Ui, tab: &mut Session, enabled: bool, focus: &mut bool, font_size: f32) {
     let id = egui::Id::new(("terminal-input", tab.id));
     let font = FontId::monospace(font_size);
@@ -917,13 +1057,27 @@ fn render(ui: &mut egui::Ui, tab: &mut Session, enabled: bool, focus: &mut bool,
                 .clamp(0.0, f32::from(size.1 - 1)) as u16,
         )
     };
-    if response.drag_started()
+    let mouse_mode = tab
+        .screen
+        .lock()
+        .unwrap()
+        .parser
+        .screen()
+        .mouse_protocol_mode();
+    let report_mouse = enabled
+        && ui.input(|i| i.focused)
+        && !tab.screen.lock().unwrap().exited
+        && !ui.input(|i| i.modifiers.shift)
+        && mouse_mode != vt100::MouseProtocolMode::None;
+    if !report_mouse
+        && response.drag_started()
         && let Some(pos) = ui.input(|i| i.pointer.press_origin())
     {
         let p = point(pos);
         tab.selection = Some((p, p));
     }
-    if response.dragged()
+    if !report_mouse
+        && response.dragged()
         && let Some(pos) = response.interact_pointer_pos()
         && let Some((_, end)) = &mut tab.selection
     {
@@ -933,27 +1087,119 @@ fn render(ui: &mut egui::Ui, tab: &mut Session, enabled: bool, focus: &mut bool,
         tab.selection = None;
     }
     let mut state = tab.screen.lock().unwrap();
-    if response.hovered() {
+    let mut outgoing = vec![];
+    let terminal_focused = focused && ui.input(|i| i.focused);
+    if !state.exited
+        && state.parser.callbacks().focus_reporting
+        && state.parser.callbacks().last_focus != Some(terminal_focused)
+    {
+        outgoing.extend_from_slice(if terminal_focused {
+            b"\x1b[I"
+        } else {
+            b"\x1b[O"
+        });
+        state.parser.callbacks_mut().last_focus = Some(terminal_focused);
+    }
+    if report_mouse {
+        for event in ui.input(|i| i.events.clone()) {
+            let (pos, code, released) = match event {
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers,
+                } if rect.contains(pos) => {
+                    if !pressed && mouse_mode == vt100::MouseProtocolMode::Press {
+                        continue;
+                    }
+                    let code = match button {
+                        egui::PointerButton::Primary => 0,
+                        egui::PointerButton::Middle => 1,
+                        egui::PointerButton::Secondary => 2,
+                        _ => continue,
+                    } + 8 * u8::from(modifiers.alt)
+                        + 16 * u8::from(modifiers.ctrl);
+                    (pos, code, !pressed)
+                }
+                egui::Event::PointerMoved(pos) if rect.contains(pos) => {
+                    let button = ui.input(|i| {
+                        if i.pointer.primary_down() {
+                            Some(0)
+                        } else if i.pointer.middle_down() {
+                            Some(1)
+                        } else if i.pointer.secondary_down() {
+                            Some(2)
+                        } else {
+                            None
+                        }
+                    });
+                    if mouse_mode != vt100::MouseProtocolMode::AnyMotion
+                        && !(mouse_mode == vt100::MouseProtocolMode::ButtonMotion
+                            && button.is_some())
+                    {
+                        continue;
+                    }
+                    (pos, 32 + button.unwrap_or(3), false)
+                }
+                _ => continue,
+            };
+            outgoing.extend(mouse_bytes(
+                state.parser.screen(),
+                code,
+                point(pos),
+                released,
+            ));
+        }
+    }
+    if enabled && ui.input(|i| i.focused) && !state.exited && response.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         tab.scroll_remainder += scroll / cell.y;
         let lines = tab.scroll_remainder.trunc() as i64;
         if lines != 0 {
             tab.scroll_remainder -= lines as f32;
-            let offset = state.parser.screen().scrollback() as i64 + lines;
-            state
-                .parser
-                .screen_mut()
-                .set_scrollback(offset.max(0) as usize);
+            if report_mouse {
+                if let Some(pos) = response.hover_pos() {
+                    for _ in 0..lines.unsigned_abs().min(100) {
+                        outgoing.extend(mouse_bytes(
+                            state.parser.screen(),
+                            if lines > 0 { 64 } else { 65 },
+                            point(pos),
+                            false,
+                        ));
+                    }
+                }
+            } else if state.parser.screen().alternate_screen() && !ui.input(|i| i.modifiers.shift) {
+                for _ in 0..lines.unsigned_abs().min(100) {
+                    outgoing.extend(
+                        key_bytes(
+                            if lines > 0 {
+                                Key::ArrowUp
+                            } else {
+                                Key::ArrowDown
+                            },
+                            Modifiers::NONE,
+                            state.parser.screen().application_cursor(),
+                        )
+                        .unwrap(),
+                    );
+                }
+            } else {
+                let offset = state.parser.screen().scrollback() as i64 + lines;
+                state
+                    .parser
+                    .screen_mut()
+                    .set_scrollback(offset.max(0) as usize);
+            }
             tab.selection = None;
         }
     }
     if enabled
+        && !report_mouse
         && response.double_clicked()
         && let Some(pos) = response.interact_pointer_pos()
     {
         tab.selection = terminal_word(state.parser.screen(), point(pos));
     }
-    let mut outgoing = vec![];
     let mut copy = false;
     if focused && !state.exited {
         let events = ui.input_mut(|i| {
@@ -1003,6 +1249,13 @@ fn render(ui: &mut egui::Ui, tab: &mut Session, enabled: bool, focus: &mut bool,
                         outgoing.extend_from_slice(text.replace('\n', "\r").as_bytes());
                     }
                 }
+                egui::Event::Cut => {
+                    if cfg!(target_os = "macos") || ui.input(|i| i.modifiers.shift) {
+                        copy = true;
+                    } else {
+                        outgoing.push(24);
+                    }
+                }
                 egui::Event::Copy => {
                     if cfg!(target_os = "macos") || ui.input(|i| i.modifiers.shift) {
                         copy = true;
@@ -1038,29 +1291,31 @@ fn render(ui: &mut egui::Ui, tab: &mut Session, enabled: bool, focus: &mut bool,
     let mut selection = tab
         .selection
         .map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
-    response.context_menu(|ui| {
-        if ui
-            .add_enabled(selection.is_some(), egui::Button::new("Copy selection"))
-            .clicked()
-        {
-            copy = true;
-            ui.close();
-        }
-        if ui.button("Copy visible output").clicked() {
-            ui.ctx().copy_text(state.parser.screen().contents());
-            ui.close();
-        }
-        if ui.button("Paste").clicked() {
-            ui.memory_mut(|m| m.request_focus(id));
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
-            ui.close();
-        }
-        if ui.button("Scroll to bottom").clicked() {
-            state.parser.screen_mut().set_scrollback(0);
-            ui.close();
-        }
-    });
+    if !report_mouse {
+        response.context_menu(|ui| {
+            if ui
+                .add_enabled(selection.is_some(), egui::Button::new("Copy selection"))
+                .clicked()
+            {
+                copy = true;
+                ui.close();
+            }
+            if ui.button("Copy visible output").clicked() {
+                ui.ctx().copy_text(state.parser.screen().contents());
+                ui.close();
+            }
+            if ui.button("Paste").clicked() {
+                ui.memory_mut(|m| m.request_focus(id));
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                ui.close();
+            }
+            if ui.button("Scroll to bottom").clicked() {
+                state.parser.screen_mut().set_scrollback(0);
+                ui.close();
+            }
+        });
+    }
     if copy && let Some((start, end)) = selection {
         ui.ctx().copy_text(state.parser.screen().contents_between(
             start.0,
@@ -1545,6 +1800,247 @@ mod tests {
         parser.process(b"\x1b[?1049l");
         assert_eq!(parser.screen().contents(), "red");
     }
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "manual CLI startup smoke test; set GLIMCODE_TEST_CLI to an interactive command"]
+    fn installed_cli_starts_in_embedded_terminal() -> Result<()> {
+        let command = std::env::var("GLIMCODE_TEST_CLI").context("Set GLIMCODE_TEST_CLI")?;
+        let dir = tempfile::tempdir()?;
+        let tab = Session::spawn(
+            1,
+            dir.path().canonicalize()?,
+            Settings {
+                shell: command,
+                ..Default::default()
+            },
+            egui::Context::default(),
+        );
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+            let state = tab.screen.lock().unwrap();
+            assert!(
+                !state.exited,
+                "CLI exited: {} {:?} {}",
+                state.status,
+                state.error,
+                state.parser.screen().contents()
+            );
+        }
+        let state = tab.screen.lock().unwrap();
+        assert!(state.error.is_none());
+        assert!(!state.parser.screen().contents().trim().is_empty());
+        println!("CLI startup screen: {}", state.parser.screen().contents());
+        drop(state);
+        if let Ok(input) = std::env::var("GLIMCODE_TEST_INPUT") {
+            assert!(tab.send(Command::Input(input.as_bytes().to_vec())));
+            wait_for(&tab.screen, |s| {
+                s.parser.screen().contents().contains(&input)
+            });
+            assert!(tab.send(Command::Input(vec![21]))); // Clear the unsubmitted input.
+        }
+        drop(tab);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_queries_reply_to_fragmented_cli_probes_without_claiming_unknown_modes() {
+        let mut parser = vt100::Parser::new_with_callbacks(30, 100, 100, Callbacks::default());
+        let queries = b"\x1b]11;?\x07\x1b[>c\x1b[18t\x1b[?2004$p\x1b[?2026$p\x1b[?2004h\x1b[?2004$p\x1b[?1004h\x1b[?1004$p";
+        for byte in queries {
+            parser.process(&[*byte]);
+        }
+        assert_eq!(parser.callbacks().replies,
+            b"\x1b]11;rgb:1c1c/1e1e/2323\x1b\\\x1b[>0;0;0c\x1b[8;30;100t\x1b[?2004;2$y\x1b[?2026;0$y\x1b[?2004;1$y\x1b[?1004;1$y");
+        assert!(parser.callbacks().focus_reporting);
+        parser.process(b"\x1b[?1004l");
+        assert!(!parser.callbacks().focus_reporting);
+    }
+
+    #[test]
+    fn modified_editing_and_function_keys_preserve_modifiers() {
+        assert_eq!(
+            key_bytes(Key::Backspace, Modifiers::CTRL, false),
+            Some(vec![8])
+        );
+        assert_eq!(
+            key_bytes(Key::Enter, Modifiers::ALT, false),
+            Some(b"\x1b\r".to_vec())
+        );
+        assert_eq!(
+            key_bytes(Key::C, Modifiers::CTRL | Modifiers::ALT, false),
+            Some(vec![27, 3])
+        );
+        assert_eq!(
+            key_bytes(Key::Delete, Modifiers::CTRL, false),
+            Some(b"\x1b[3;5~".to_vec())
+        );
+        assert_eq!(
+            key_bytes(Key::F1, Modifiers::SHIFT, false),
+            Some(b"\x1b[1;2P".to_vec())
+        );
+        assert_eq!(
+            key_bytes(Key::F5, Modifiers::ALT, false),
+            Some(b"\x1b[15;3~".to_vec())
+        );
+    }
+
+    #[test]
+    fn terminal_routes_mouse_wheel_focus_and_alternate_screen_scroll_to_the_app() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::sync_channel(128);
+        let screen = Arc::new(Mutex::new(ScreenState::default()));
+        screen
+            .lock()
+            .unwrap()
+            .parser
+            .process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?1004h");
+        let mut tab = Session {
+            id: 1,
+            root: "/tmp".into(),
+            shell: "test".into(),
+            default_name: String::new(),
+            screen: screen.clone(),
+            tx,
+            stopped: Arc::new(AtomicBool::new(false)),
+            killer: Arc::new(Mutex::new(None)),
+            size: (24, 80),
+            selection: None,
+            scroll_remainder: 0.0,
+        };
+        let mut focus = true;
+        let mut frame = |events, focused| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    focused,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| render(ui, &mut tab, true, &mut focus, 14.0));
+                },
+            );
+            rx.try_iter()
+                .filter_map(|command| match command {
+                    Command::Input(bytes) => Some(bytes),
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<u8>>()
+        };
+        frame(vec![], true);
+        let pos = egui::pos2(100.0, 100.0);
+        let bytes = frame(
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            true,
+        );
+        assert!(String::from_utf8_lossy(&bytes).contains("\x1b[<0;"));
+        frame(
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+            true,
+        );
+        let bytes = frame(
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 120.0),
+                modifiers: Modifiers::NONE,
+            }],
+            true,
+        );
+        assert!(String::from_utf8_lossy(&bytes).contains("\x1b[<64;"));
+        assert_eq!(frame(vec![], false), b"\x1b[O");
+        assert!(frame(vec![], true).starts_with(b"\x1b[I"));
+        screen
+            .lock()
+            .unwrap()
+            .parser
+            .process(b"\x1b[?1000l\x1b[?1h");
+        let bytes = frame(
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -120.0),
+                modifiers: Modifiers::NONE,
+            }],
+            true,
+        );
+        assert!(String::from_utf8_lossy(&bytes).contains("\x1bOB"));
+    }
+
+    #[test]
+    fn mouse_reports_use_requested_encoding_and_release_semantics() {
+        let mut parser = vt100::Parser::new(30, 100, 0);
+        parser.process(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            mouse_bytes(parser.screen(), 0, (4, 9), false),
+            b"\x1b[<0;10;5M"
+        );
+        assert_eq!(
+            mouse_bytes(parser.screen(), 0, (4, 9), true),
+            b"\x1b[<0;10;5m"
+        );
+        assert_eq!(
+            mouse_bytes(parser.screen(), 64, (4, 9), false),
+            b"\x1b[<64;10;5M"
+        );
+        parser.process(b"\x1b[?1006l");
+        assert_eq!(mouse_bytes(parser.screen(), 0, (4, 9), true), b"\x1b[M#*%");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_pty_answers_interactive_startup_queries() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let expected = b"\x1b]11;rgb:1c1c/1e1e/2323\x1b\\\x1b[>0;0;0c\x1b[?2004;2$y";
+        let script = format!(
+            r#"stty raw -echo; printf '\033]11;?\007\033[>c\033[?2004$p'; reply=$(dd bs=1 count={} 2>/dev/null | od -An -tx1); stty sane; printf 'PROBE:%s:DONE\n' "$reply""#,
+            expected.len()
+        );
+        let settings = Settings {
+            shell: format!("/bin/sh -c {}", shell_words::quote(&script)),
+            ..Default::default()
+        };
+        let tab = Session::spawn(
+            1,
+            dir.path().to_path_buf(),
+            settings,
+            egui::Context::default(),
+        );
+        wait_for(&tab.screen, |s| {
+            s.parser.screen().contents().contains(":DONE")
+        });
+        let output = tab.screen.lock().unwrap().parser.screen().contents();
+        let actual: String = output
+            .split("PROBE:")
+            .nth(1)
+            .unwrap()
+            .split(":DONE")
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        let expected: String = expected.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
     #[test]
     fn keyboard_maps_control_and_application_sequences() {
         assert_eq!(key_bytes(Key::C, Modifiers::CTRL, false), Some(vec![3]));
@@ -1658,6 +2154,7 @@ mod tests {
         assert!(ctx.memory(|m| m.has_focus(egui::Id::new(("terminal-input", 1u64)))));
         frame(vec![egui::Event::Text("echo 猫".into())], 13.0);
         frame(vec![egui::Event::Paste("first\r\nsecond".into())], 13.0);
+        frame(vec![egui::Event::Cut], 13.0);
         frame(vec![], 26.0);
         let commands: Vec<_> = rx.try_iter().collect();
         let sizes: Vec<_> = commands
@@ -1678,5 +2175,8 @@ mod tests {
             .collect();
         assert_eq!(bytes[0], "echo 猫".as_bytes());
         assert_eq!(bytes[1], b"\x1b[200~first\nsecond\x1b[201~");
+        if !cfg!(target_os = "macos") {
+            assert_eq!(bytes[2], [24]);
+        }
     }
 }
