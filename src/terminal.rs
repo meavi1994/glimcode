@@ -1205,7 +1205,7 @@ mod tests {
     #[test]
     fn terminal_double_click_selects_path_copies_it_and_shows_text_cursor() {
         let ctx = egui::Context::default();
-        let (tx, _rx) = mpsc::sync_channel(128);
+        let (tx, rx) = mpsc::sync_channel(128);
         let screen = Arc::new(Mutex::new(ScreenState::default()));
         let path = "hack/apidiff-changelog/main.go";
         screen
@@ -1279,10 +1279,44 @@ mod tests {
             tab.selection,
             Some(((0, 11), (0, 11 + path.len() as u16 - 1)))
         );
+        // Ctrl+Shift+C copies on every platform; a bare Copy event is Ctrl+C
+        // on Linux/Windows and must remain a shell interrupt there.
+        let (output, _) = frame(
+            &mut tab,
+            vec![egui::Event::Key {
+                key: Key::C,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+            }],
+        );
+        let copied_path = |output: &egui::FullOutput| {
+            output.platform_output.commands.iter().any(
+                |command| matches!(command, egui::OutputCommand::CopyText(text) if text == path),
+            )
+        };
+        assert!(copied_path(&output));
+        assert!(
+            !rx.try_iter()
+                .any(|command| matches!(command, Command::Input(_))),
+            "copying must not send characters to the shell"
+        );
         let (output, _) = frame(&mut tab, vec![egui::Event::Copy]);
-        assert!(output.platform_output.commands.iter().any(|command| {
-            matches!(command, egui::OutputCommand::CopyText(text) if text == path)
-        }));
+        if cfg!(target_os = "macos") {
+            assert!(copied_path(&output));
+        } else {
+            assert!(!copied_path(&output));
+            let input: Vec<_> = rx
+                .try_iter()
+                .filter_map(|command| match command {
+                    Command::Input(bytes) => Some(bytes),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            assert_eq!(input, [3], "Ctrl+C must remain a shell interrupt");
+        }
         // An ordinary click still clears selection.
         for pressed in [true, false] {
             frame(

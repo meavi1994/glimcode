@@ -1,3 +1,13 @@
+## Changes in v0.1.1
+
+- Improved responsiveness for large source files with background syntax and outline analysis, cached text layouts, and deferred Git annotations.
+- Fixed stack overflows when collecting symbols from deeply nested TypeScript syntax.
+- Unified Git status colors in Project and Changes: committed changes are green, uncommitted changes amber, and deletions red.
+- Added independent Editor, Dialogs, Terminal, Search results, and Search filters font controls, all defaulting to 14 pt. Search rows and dialog controls adapt to larger fonts.
+- Fixed the Linux CI clipboard test to use the terminal copy shortcut and verify Ctrl+C remains a shell interrupt.
+
+## Installation
+
 Download Glimcode for macOS 15 (Sequoia) or later. Rust is not required to run these binaries.
 
 | Mac | Download |
