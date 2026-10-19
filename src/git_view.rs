@@ -486,12 +486,17 @@ impl GitTool {
                         .inner_margin(12),
                 )
                 .show(ctx, |ui| {
+                    chrome::dialog_typography(ui);
                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
                     ui.spacing_mut().button_padding = egui::vec2(9.0, 4.0);
                     ui.spacing_mut().interact_size.y = 26.0;
                     ui.horizontal(|ui| {
                         chrome::heading_icon(ui, chrome::Icon::Branch, chrome::BLUE);
-                        ui.label(RichText::new("Branch changes").size(15.0).strong());
+                        ui.label(
+                            RichText::new("Branch changes")
+                                .size(crate::preferences::dialog_font_size(ui.ctx()) + 1.0)
+                                .strong(),
+                        );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             close =
                                 chrome::icon_button(ui, chrome::Icon::Close, "Close diff (Esc)")
@@ -499,7 +504,7 @@ impl GitTool {
                             if let Some(review) = &self.review {
                                 ui.weak(
                                     RichText::new(format!("{} → working tree", review.base))
-                                        .size(11.0),
+                                        .size(crate::preferences::dialog_font_size(ui.ctx())),
                                 );
                             }
                         });
@@ -570,7 +575,11 @@ impl GitTool {
                         chrome::BLUE,
                     );
                     if let Some(detail) = &self.detail {
-                        ui.label(RichText::new(&detail.subject).size(18.0).strong());
+                        ui.label(
+                            RichText::new(&detail.subject)
+                                .size(crate::preferences::dialog_font_size(ui.ctx()) + 4.0)
+                                .strong(),
+                        );
                         ui.label(format!("{}  {}", detail.author, detail.date));
                         if !detail.email.is_empty() {
                             ui.weak(&detail.email);
@@ -1004,25 +1013,32 @@ impl Review {
         ui.horizontal_wrapped(|ui| {
             ui.colored_label(
                 chrome::GREEN,
-                RichText::new(format!("+{added}")).strong().size(12.0),
+                RichText::new(format!("+{added}"))
+                    .strong()
+                    .size(crate::preferences::dialog_font_size(ui.ctx())),
             );
             ui.colored_label(
                 deleted(),
-                RichText::new(format!("−{removed}")).strong().size(12.0),
+                RichText::new(format!("−{removed}"))
+                    .strong()
+                    .size(crate::preferences::dialog_font_size(ui.ctx())),
             );
             ui.separator();
             for (label, value) in [("Unified", DiffMode::Unified), ("Split", DiffMode::Split)] {
                 if ui
                     .add(
-                        egui::Button::new(RichText::new(label).size(12.0))
-                            .selected(*mode == value)
-                            .fill(if *mode == value {
-                                chrome::SELECTED
-                            } else {
-                                chrome::PANEL
-                            })
-                            .stroke(egui::Stroke::NONE)
-                            .corner_radius(4),
+                        egui::Button::new(
+                            RichText::new(label)
+                                .size(crate::preferences::dialog_font_size(ui.ctx())),
+                        )
+                        .selected(*mode == value)
+                        .fill(if *mode == value {
+                            chrome::SELECTED
+                        } else {
+                            chrome::PANEL
+                        })
+                        .stroke(egui::Stroke::NONE)
+                        .corner_radius(4),
                     )
                     .clicked()
                 {
@@ -1048,7 +1064,10 @@ impl Review {
                         navigation_target(&self.target_rows(*mode), self.scroll_y, height, true);
                     self.jump_requested = true;
                 }
-                ui.weak(RichText::new(format!("{} / {} hunks", self.hunk + 1, count)).size(10.0));
+                ui.weak(
+                    RichText::new(format!("{} / {} hunks", self.hunk + 1, count))
+                        .size(crate::preferences::dialog_font_size(ui.ctx())),
+                );
             }
         });
         if *mode != previous_mode {

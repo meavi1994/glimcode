@@ -536,29 +536,34 @@ impl Terminal {
             let mut cancel = false;
             egui::Modal::new(egui::Id::new("preferences-dialog"))
                 .frame(chrome::popup_frame()).show(ctx, |ui| {
-                    chrome::dialog_style(ui, 560.0);
+                    chrome::modal_style(ui, 560.0);
                     cancel |= chrome::dialog_header(ui, "⚙", "Preferences", "Make this workspace feel like yours", chrome::BLUE);
                     egui::ScrollArea::vertical().id_salt("preferences-body")
                         .max_height((ctx.content_rect().height() - 250.0).max(180.0))
                         .show(ui, |ui| {
-                            chrome::dialog_section(ui, "Typography", "Comfortable sizes for your code and terminal.");
+                            chrome::dialog_section(ui, "Typography", "Set independent sizes for your editor, terminal, and search.");
                             chrome::dialog_card(ui, |ui| {
                                 for (label, detail, size) in [
                                     ("Editor", "Code, previews, and diffs", &mut self.draft.editor_font_size),
+                                    ("Dialogs", "Window text, labels, fields, and buttons", &mut self.draft.dialog_font_size),
                                     ("Terminal", "Shell input and output", &mut self.draft.terminal_font_size),
+                                    ("Search results", "Matching text, file names, and line numbers", &mut self.draft.search_results_font_size),
+                                    ("Search filters", "All, Declarations, Usages, and scope menus", &mut self.draft.search_filters_font_size),
                                 ] {
                                     ui.horizontal(|ui| {
-                                        let label_width = (ui.available_width() - 100.0).max(140.0);
+                                        let control_width = (crate::preferences::dialog_font_size(ui.ctx()) * 5.5).max(84.0);
+                                        let control_height = (crate::preferences::dialog_font_size(ui.ctx()) + 20.0).max(34.0);
+                                        let label_width = (ui.available_width() - control_width - 16.0).max(140.0);
                                         ui.vertical(|ui| {
                                             ui.set_width(label_width);
                                             ui.label(egui::RichText::new(label).strong());
-                                            ui.label(egui::RichText::new(detail).size(12.0).color(chrome::MUTED));
+                                            ui.label(egui::RichText::new(detail).size(crate::preferences::dialog_font_size(ui.ctx())).color(chrome::MUTED));
                                         });
-                                        ui.add_sized([84.0, 34.0], egui::DragValue::new(size).range(8.0..=40.0).speed(0.5).suffix(" pt"));
+                                        ui.add_sized([control_width, control_height], egui::DragValue::new(size).range(8.0..=40.0).speed(0.5).suffix(" pt"));
                                     });
                                 }
                                 ui.add_space(4.0);
-                                ui.label(egui::RichText::new("Font changes apply to your open editors and sessions when saved.").size(12.0).color(chrome::MUTED));
+                                ui.label(egui::RichText::new("Font changes apply to open editors, dialogs, search, and terminal sessions when saved.").size(crate::preferences::dialog_font_size(ui.ctx())).color(chrome::MUTED));
                             });
                             ui.add_space(10.0);
                             chrome::dialog_section(ui, "Shell & sessions", "Choose how new terminal sessions start.");
@@ -588,9 +593,9 @@ impl Terminal {
                                 ui.label(egui::RichText::new("Default tab name").strong());
                                 ui.add(egui::TextEdit::singleline(&mut self.draft.tab_name).desired_width(f32::INFINITY)
                                     .margin(egui::vec2(10.0, 9.0)).hint_text("Automatic · project and shell title"));
-                                ui.label(egui::RichText::new("Leave empty for automatic names. Duplicates get (2), (3), …").size(12.0).color(chrome::MUTED));
+                                ui.label(egui::RichText::new("Leave empty for automatic names. Duplicates get (2), (3), …").size(crate::preferences::dialog_font_size(ui.ctx())).color(chrome::MUTED));
                             });
-                            ui.label(egui::RichText::new("New sessions start in the project directory. Existing sessions keep their shell and working directory.").size(12.0).color(chrome::MUTED));
+                            ui.label(egui::RichText::new("New sessions start in the project directory. Existing sessions keep their shell and working directory.").size(crate::preferences::dialog_font_size(ui.ctx())).color(chrome::MUTED));
                             if let Some(error) = &self.settings_error {
                                 ui.add_space(4.0);
                                 chrome::dialog_card(ui, |ui| { ui.colored_label(chrome::DANGER, error); });
@@ -626,7 +631,7 @@ impl Terminal {
             egui::Modal::new(egui::Id::new("close-terminal"))
                 .frame(chrome::popup_frame())
                 .show(ctx, |ui| {
-                    chrome::dialog_style(ui, 460.0);
+                    chrome::modal_style(ui, 460.0);
                     let mut cancel = chrome::dialog_header(
                         ui,
                         ">_",
@@ -647,7 +652,7 @@ impl Terminal {
                                     egui::RichText::new(
                                         self.tabs[index].root.display().to_string(),
                                     )
-                                    .size(12.0)
+                                    .size(crate::preferences::dialog_font_size(ui.ctx()))
                                     .color(chrome::MUTED),
                                 )
                                 .wrap(),

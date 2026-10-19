@@ -106,9 +106,9 @@ This edits CSV/TSV data, with no XLSX workbook or formula-calculation support.
 
 ## Preferences
 
-Open **Settings → Preferences**. Set separate **Editor font size** and **Terminal font size** values (8–40 pt; both default to 14 pt). Save applies font changes immediately to open editors, code previews, diffs and existing terminal sessions.
+Open **Settings → Preferences** to set independent **Editor**, **Dialogs**, **Terminal**, **Search results**, and **Search filters** font sizes (8–40 pt; all default to 14 pt). Search results controls matching text, file names, and line numbers. Search filters controls All / Declarations / Usages and the other category, scope, and file-type controls. Dialogs controls window labels, text fields, buttons, and headings; headings retain a larger size. Save applies changes immediately to open views and existing terminal sessions. Search result row heights adapt to their font size, including keyboard scrolling. Code previews and diffs keep using the Editor size. Existing saved sizes are preserved, and older settings files use 14 pt for the newly added controls.
 
-Font and terminal preferences are stored in `~/.coder/settings.json`, including `editor_font_size`, `terminal_font_size`, `shell` and `tab_name`. The file is created with defaults on first launch. Previous terminal preferences are migrated automatically when this file does not yet exist; the old file is retained. Additional JSON keys are preserved when saving. Manual changes are loaded on restart.
+Font and terminal preferences are stored in `~/.coder/settings.json`, including `editor_font_size`, `dialog_font_size`, `terminal_font_size`, `search_results_font_size`, `search_filters_font_size`, `shell` and `tab_name`. The file is created with defaults on first launch. Previous terminal preferences are migrated automatically when this file does not yet exist; the old file is retained. Additional JSON keys are preserved when saving. Manual changes are loaded on restart.
 
 ## Terminal
 

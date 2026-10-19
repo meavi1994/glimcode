@@ -1287,6 +1287,11 @@ impl Coder {
 
     fn search_contents(&mut self, ui: &mut egui::Ui, docked: bool) {
         use crate::search_view::Scope;
+        chrome::dialog_typography(ui);
+        let result_size = crate::preferences::search_results_font_size(ui.ctx());
+        let filter_size = crate::preferences::search_filters_font_size(ui.ctx());
+        let row_height =
+            ui.fonts_mut(|fonts| fonts.row_height(&FontId::proportional(result_size))) + 14.0;
         ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
         ui.spacing_mut().button_padding = egui::vec2(10.0, 4.0);
         ui.spacing_mut().interact_size.y = 26.0;
@@ -1305,7 +1310,11 @@ impl Coder {
         }
         ui.horizontal(|ui| {
             chrome::heading_icon(ui, chrome::Icon::Search, chrome::BLUE);
-            ui.label(RichText::new("Find in Files").size(16.0).strong());
+            ui.label(
+                RichText::new("Find in Files")
+                    .size(crate::preferences::dialog_font_size(ui.ctx()) + 2.0)
+                    .strong(),
+            );
             ui.label(RichText::new(&self.search_note).color(chrome::MUTED));
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 if chrome::icon_button(
@@ -1346,11 +1355,11 @@ impl Coder {
         });
         ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Find").size(16.0).color(chrome::MUTED));
+            ui.label(RichText::new("Find").size(crate::preferences::dialog_font_size(ui.ctx()) + 2.0).color(chrome::MUTED));
             let field = ui.add(
                 egui::TextEdit::singleline(&mut self.query)
                     .frame(false)
-                    .font(FontId::proportional(16.0))
+                    .font(FontId::proportional(crate::preferences::dialog_font_size(ui.ctx()) + 2.0))
                     .hint_text("Search in project…")
                     .desired_width((ui.available_width() - 420.0).max(100.0)),
             );
@@ -1360,9 +1369,9 @@ impl Coder {
             }
             let run = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             let mut words = self.search_kind != SearchKind::Text;
-            let words_changed = ui.checkbox(&mut words, "Whole words")
+            let words_changed = ui.checkbox(&mut words, RichText::new("Whole words").size(filter_size))
                 .on_hover_text("Match complete words: generate matches generate() and build-generate, but excludes generated and generate_keys.").changed();
-            let tests_changed = ui.checkbox(&mut self.exclude_test_files, "Exclude test files")
+            let tests_changed = ui.checkbox(&mut self.exclude_test_files, RichText::new("Exclude test files").size(filter_size))
                 .on_hover_text("Skip common test filenames and folders in project search and Cmd/Ctrl-click navigation. Turn off to include tests.")
                 .changed();
             let kind = if words { SearchKind::References } else { SearchKind::Text };
@@ -1376,6 +1385,7 @@ impl Coder {
         });
         ui.separator();
         ui.horizontal_wrapped(|ui| {
+            crate::preferences::search_filter_style(ui);
             ui.label(RichText::new(" In Project ").background_color(chrome::HEADER));
             ui.label(
                 RichText::new(self.root.file_name().unwrap_or_default().to_string_lossy())
@@ -1435,6 +1445,7 @@ impl Coder {
             self.extension_filter.as_deref(),
         );
         ui.horizontal_wrapped(|ui| {
+            crate::preferences::search_filter_style(ui);
             category_toggle(
                 ui,
                 &mut self.selected_category,
@@ -1491,17 +1502,17 @@ impl Coder {
                 .unwrap_or_default()
                 .offset
                 .y;
-            let row_top = self.result_selection as f32 * (30.0 + ui.spacing().item_spacing.y);
+            let row_top = self.result_selection as f32 * (row_height + ui.spacing().item_spacing.y);
             let offset = if row_top < offset {
                 row_top
-            } else if row_top + 30.0 > offset + list_height {
-                row_top + 30.0 - list_height
+            } else if row_top + row_height > offset + list_height {
+                row_top + row_height - list_height
             } else {
                 offset
             };
             matches = matches.vertical_scroll_offset(offset);
         }
-        matches.show_rows(ui, 30.0, visible.len(), |ui, range| {
+        matches.show_rows(ui, row_height, visible.len(), |ui, range| {
             if visible.is_empty() {
                 ui.weak(if self.search_rx.is_some() {
                     "Searching…"
@@ -1513,7 +1524,7 @@ impl Coder {
                 let location = &self.results[visible[index]];
                 let selected = index == self.result_selection;
                 let (rect, response) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 30.0),
+                    egui::vec2(ui.available_width(), row_height),
                     egui::Sense::click(),
                 );
                 if selected || response.hovered() {
@@ -1541,17 +1552,19 @@ impl Coder {
                         .to_string_lossy(),
                     location.line
                 );
-                let galley = ui.fonts_mut(|fonts| {
-                    fonts.layout_no_wrap(
-                        suffix,
-                        FontId::proportional(13.0),
-                        if selected {
-                            chrome::TEXT
-                        } else {
-                            chrome::MUTED
-                        },
-                    )
-                });
+                let mut metadata = egui::text::LayoutJob::simple_singleline(
+                    suffix,
+                    FontId::proportional(result_size),
+                    if selected {
+                        chrome::TEXT
+                    } else {
+                        chrome::MUTED
+                    },
+                );
+                metadata.wrap.max_width = (rect.width() * 0.42).max(60.0);
+                metadata.wrap.max_rows = 1;
+                metadata.wrap.break_anywhere = true;
+                let galley = ui.fonts_mut(|fonts| fonts.layout_job(metadata));
                 let right_width = galley.size().x;
                 ui.painter().galley(
                     egui::pos2(
@@ -1574,7 +1587,7 @@ impl Coder {
                     fonts.layout_job(chrome::highlighted(
                         location.preview.trim_start(),
                         &self.query,
-                        14.0,
+                        result_size,
                     ))
                 });
                 painter.galley(
@@ -2148,7 +2161,7 @@ impl Coder {
             egui::Modal::new(egui::Id::new("action-error"))
                 .frame(chrome::popup_frame())
                 .show(ctx, |ui| {
-                    chrome::dialog_style(ui, 470.0);
+                    chrome::modal_style(ui, 470.0);
                     let close = chrome::dialog_header(
                         ui,
                         "!",
@@ -2181,7 +2194,7 @@ impl Coder {
             let mut cancel = false;
             egui::Modal::new(egui::Id::new("file-action"))
                 .frame(chrome::popup_frame()).show(ctx, |ui| {
-                    chrome::dialog_style(ui, 460.0);
+                    chrome::modal_style(ui, 460.0);
                     let deleting = matches!(action, FileAction::Delete(_));
                     let creating = matches!(action, FileAction::NewFile(_));
                     cancel = chrome::dialog_header(ui,
@@ -2227,7 +2240,7 @@ impl Coder {
             egui::Modal::new(egui::Id::new("unsaved"))
                 .frame(chrome::popup_frame())
                 .show(ctx, |ui| {
-                    chrome::dialog_style(ui, 500.0);
+                    chrome::modal_style(ui, 500.0);
                     let reload = matches!(self.pending, Some(Pending::Reload(_)));
                     if chrome::dialog_header(
                         ui,
@@ -2517,6 +2530,7 @@ impl Coder {
     }
 
     fn picker_ui(&mut self, ctx: &egui::Context) {
+        let dialog_size = crate::preferences::dialog_font_size(ctx);
         let Some(mode) = self.picker else {
             return;
         };
@@ -2525,7 +2539,7 @@ impl Coder {
         egui::Modal::new(egui::Id::new("navigation-picker"))
             .frame(chrome::popup_frame())
             .show(ctx, |ui| {
-                chrome::dialog_style(ui, (ctx.content_rect().width() - 120.0).clamp(450.0, 820.0));
+                chrome::modal_style(ui, (ctx.content_rect().width() - 120.0).clamp(450.0, 820.0));
                 close |= chrome::dialog_header(
                     ui,
                     "⌕",
@@ -2541,7 +2555,7 @@ impl Coder {
                 let field = ui.add(
                     egui::TextEdit::singleline(&mut self.picker_query)
                         .frame(false)
-                        .font(FontId::proportional(21.0))
+                        .font(FontId::proportional(dialog_size + 8.0))
                         .desired_width(f32::INFINITY)
                         .hint_text(if mode == Picker::Line {
                             "Line number, optionally :column"
@@ -2657,7 +2671,10 @@ impl Coder {
                             for (index, (label, location)) in entries.iter().enumerate() {
                                 let selected = index == self.picker_selection;
                                 let (rect, response) = ui.allocate_exact_size(
-                                    egui::vec2(ui.available_width(), 32.0),
+                                    egui::vec2(
+                                        ui.available_width(),
+                                        (dialog_size + 16.0).max(32.0),
+                                    ),
                                     egui::Sense::click(),
                                 );
                                 if selected || response.hovered() {
@@ -2683,7 +2700,11 @@ impl Coder {
                                             .to_string()
                                     };
                                 let galley = ui.fonts_mut(|f| {
-                                    f.layout_job(chrome::highlighted(&display, file_query, 16.0))
+                                    f.layout_job(chrome::highlighted(
+                                        &display,
+                                        file_query,
+                                        dialog_size,
+                                    ))
                                 });
                                 let filename_rect = egui::Rect::from_min_max(
                                     rect.min + egui::vec2(34.0, 0.0),
@@ -2720,7 +2741,9 @@ impl Coder {
                                         rect.right_center() - egui::vec2(12.0, 0.0),
                                         egui::Align2::RIGHT_CENTER,
                                         parent,
-                                        FontId::proportional(13.0),
+                                        FontId::proportional(crate::preferences::dialog_font_size(
+                                            ui.ctx(),
+                                        )),
                                         chrome::MUTED,
                                     );
                                 if response.clicked() || (enter && index == self.picker_selection) {
@@ -4183,6 +4206,68 @@ mod tests {
     use super::*;
     use crate::search_view::{extension, result_visible};
     #[test]
+    fn search_results_and_filter_fonts_update_independently_in_both_layouts() {
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let mut app = Coder::empty(PathBuf::from("/project"));
+        app.query = "needle".into();
+        app.results = vec![Location {
+            path: "/project/sample.ts".into(),
+            line: 7,
+            column: 1,
+            preview: "needle value".into(),
+            category: navigation::MatchCategory::Declaration,
+        }];
+        app.results_revision = 1;
+        for (docked, results, filters) in [(false, 23.0, 11.0), (true, 12.0, 22.0)] {
+            crate::preferences::Settings {
+                editor_font_size: 16.0,
+                dialog_font_size: 19.0,
+                search_results_font_size: results,
+                search_filters_font_size: filters,
+                ..Default::default()
+            }
+            .apply(&ctx);
+            let mut frame = || {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1800.0, 1200.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .show(ctx, |ui| app.search_contents(ui, docked));
+                    },
+                )
+            };
+            frame();
+            let output = frame();
+            let size = |label: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == label => {
+                            Some(text.galley.job.sections[0].format.font_id.size)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("missing label: {label}"))
+            };
+            assert_eq!(size("needle value"), results);
+            assert_eq!(size("sample.ts :7"), results);
+            assert_eq!(size("All 1"), filters);
+            assert_eq!(size("Declarations 1"), filters);
+            assert_eq!(size("Opened"), filters);
+            assert_eq!(size("Search"), 19.0);
+            assert_eq!(crate::preferences::editor_font_size(&ctx), 16.0);
+        }
+    }
+
+    #[test]
     #[ignore = "large-file performance check; run with --release --ignored --nocapture"]
     fn large_typescript_editor_benchmark() {
         let ctx = egui::Context::default();
@@ -5261,6 +5346,11 @@ mod tests {
             .collect();
         let ctx = egui::Context::default();
         chrome::install(&ctx);
+        crate::preferences::Settings {
+            search_results_font_size: 30.0,
+            ..Default::default()
+        }
+        .apply(&ctx);
         let mut time = 0.0;
         let mut frame = |app: &mut Coder, key: Option<Key>| {
             time += 0.1;

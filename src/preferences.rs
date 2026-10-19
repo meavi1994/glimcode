@@ -14,6 +14,9 @@ pub struct Settings {
     pub tab_name: String,
     pub editor_font_size: f32,
     pub terminal_font_size: f32,
+    pub dialog_font_size: f32,
+    pub search_results_font_size: f32,
+    pub search_filters_font_size: f32,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -34,6 +37,9 @@ impl Default for Settings {
             tab_name: String::new(),
             editor_font_size: DEFAULT_FONT_SIZE,
             terminal_font_size: DEFAULT_FONT_SIZE,
+            dialog_font_size: DEFAULT_FONT_SIZE,
+            search_results_font_size: DEFAULT_FONT_SIZE,
+            search_filters_font_size: DEFAULT_FONT_SIZE,
         }
     }
 }
@@ -83,6 +89,9 @@ impl Settings {
             tab_name: value["tab_name"].as_str().unwrap_or("").into(),
             editor_font_size: size("editor_font_size"),
             terminal_font_size: size("terminal_font_size"),
+            dialog_font_size: size("dialog_font_size"),
+            search_results_font_size: size("search_results_font_size"),
+            search_filters_font_size: size("search_filters_font_size"),
         })
     }
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -98,6 +107,9 @@ impl Settings {
         value["tab_name"] = self.tab_name.clone().into();
         value["editor_font_size"] = self.editor_font_size.into();
         value["terminal_font_size"] = self.terminal_font_size.into();
+        value["dialog_font_size"] = self.dialog_font_size.into();
+        value["search_results_font_size"] = self.search_results_font_size.into();
+        value["search_filters_font_size"] = self.search_filters_font_size.into();
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
         serde_json::to_writer_pretty(&mut temp, &value)?;
         temp.flush()?;
@@ -124,7 +136,16 @@ impl Settings {
     }
     pub fn apply(&self, ctx: &egui::Context) {
         ctx.data_mut(|data| {
-            data.insert_temp(egui::Id::new("editor-font-size"), self.editor_font_size)
+            data.insert_temp(egui::Id::new("editor-font-size"), self.editor_font_size);
+            data.insert_temp(egui::Id::new("dialog-font-size"), self.dialog_font_size);
+            data.insert_temp(
+                egui::Id::new("search-results-font-size"),
+                self.search_results_font_size,
+            );
+            data.insert_temp(
+                egui::Id::new("search-filters-font-size"),
+                self.search_filters_font_size,
+            );
         });
         ctx.all_styles_mut(|style| {
             style.text_styles.insert(
@@ -139,6 +160,31 @@ pub fn editor_font_size(ctx: &egui::Context) -> f32 {
     ctx.data(|data| data.get_temp(egui::Id::new("editor-font-size")))
         .unwrap_or(DEFAULT_FONT_SIZE)
 }
+pub fn dialog_font_size(ctx: &egui::Context) -> f32 {
+    ctx.data(|data| data.get_temp(egui::Id::new("dialog-font-size")))
+        .unwrap_or(DEFAULT_FONT_SIZE)
+}
+pub fn search_results_font_size(ctx: &egui::Context) -> f32 {
+    ctx.data(|data| data.get_temp(egui::Id::new("search-results-font-size")))
+        .unwrap_or(DEFAULT_FONT_SIZE)
+}
+pub fn search_filters_font_size(ctx: &egui::Context) -> f32 {
+    ctx.data(|data| data.get_temp(egui::Id::new("search-filters-font-size")))
+        .unwrap_or(DEFAULT_FONT_SIZE)
+}
+pub fn search_filter_style(ui: &mut egui::Ui) {
+    let size = search_filters_font_size(ui.ctx());
+    for style in [
+        egui::TextStyle::Body,
+        egui::TextStyle::Button,
+        egui::TextStyle::Small,
+    ] {
+        ui.style_mut()
+            .text_styles
+            .insert(style, egui::FontId::proportional(size));
+    }
+}
+
 pub fn line_height(ctx: &egui::Context) -> f32 {
     20.0 * editor_font_size(ctx) / 13.0
 }
@@ -146,6 +192,41 @@ pub fn line_height(ctx: &egui::Context) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dialogs_use_their_own_font_for_fields_labels_and_buttons() {
+        let ctx = egui::Context::default();
+        let mut settings = Settings {
+            editor_font_size: 24.0,
+            dialog_font_size: 18.0,
+            ..Default::default()
+        };
+        for size in [18.0, 28.0] {
+            settings.dialog_font_size = size;
+            settings.apply(&ctx);
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    crate::chrome::dialog_style(ui, 500.0);
+                    assert_eq!(egui::TextStyle::Body.resolve(ui.style()).size, size);
+                    assert_eq!(egui::TextStyle::Monospace.resolve(ui.style()).size, size);
+                    ui.label("Dialog body");
+                    crate::chrome::dialog_button(ui, "Confirm", None);
+                });
+            });
+            for label in ["Dialog body", "Confirm"] {
+                let text = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == label => Some(text),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(text.galley.job.sections[0].format.font_id.size, size);
+            }
+            assert_eq!(editor_font_size(&ctx), 24.0);
+        }
+    }
+
     #[test]
     fn preferences_round_trip_preserve_other_keys_and_validate_font_sizes() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -159,10 +240,16 @@ mod tests {
         assert_eq!(settings.terminal_font_size, 8.0);
         settings.editor_font_size = 17.5;
         settings.terminal_font_size = 16.0;
+        settings.dialog_font_size = 19.0;
+        settings.search_results_font_size = 22.0;
+        settings.search_filters_font_size = 11.0;
         settings.save(&path)?;
         let loaded = Settings::load(&path)?;
         assert_eq!(loaded.editor_font_size, 17.5);
         assert_eq!(loaded.terminal_font_size, 16.0);
+        assert_eq!(loaded.dialog_font_size, 19.0);
+        assert_eq!(loaded.search_results_font_size, 22.0);
+        assert_eq!(loaded.search_filters_font_size, 11.0);
         assert_eq!(json(&path)?["future_preference"], true);
         std::fs::write(&path, "broken json")?;
         assert!(settings.save(&path).is_err());
@@ -179,6 +266,9 @@ mod tests {
         assert_eq!(settings.shell, "/bin/sh");
         assert_eq!(settings.tab_name, "Local");
         assert_eq!(settings.editor_font_size, 14.0);
+        assert_eq!(settings.dialog_font_size, 14.0);
+        assert_eq!(settings.search_results_font_size, 14.0);
+        assert_eq!(settings.search_filters_font_size, 14.0);
         assert!(path.is_file());
         assert!(old.is_file());
         settings.editor_font_size = 19.0;

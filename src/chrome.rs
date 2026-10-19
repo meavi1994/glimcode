@@ -704,16 +704,42 @@ pub fn is_resize_cursor(cursor: egui::CursorIcon) -> bool {
 pub const DANGER: Color32 = Color32::from_rgb(220, 100, 112);
 pub const WARNING: Color32 = Color32::from_rgb(225, 178, 103);
 
+pub fn dialog_typography(ui: &mut egui::Ui) {
+    let size = crate::preferences::dialog_font_size(ui.ctx());
+    for style in [
+        egui::TextStyle::Body,
+        egui::TextStyle::Button,
+        egui::TextStyle::Small,
+    ] {
+        ui.style_mut()
+            .text_styles
+            .insert(style, FontId::proportional(size));
+    }
+    ui.style_mut()
+        .text_styles
+        .insert(egui::TextStyle::Monospace, FontId::monospace(size));
+    ui.style_mut()
+        .text_styles
+        .insert(egui::TextStyle::Heading, FontId::proportional(size + 8.0));
+}
+
 pub fn dialog_style(ui: &mut egui::Ui, width: f32) {
+    dialog_typography(ui);
     ui.set_width(width.min((ui.ctx().content_rect().width() - 80.0).max(260.0)));
     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
     ui.spacing_mut().button_padding = egui::vec2(14.0, 8.0);
-    ui.spacing_mut().interact_size.y = 34.0;
+    ui.spacing_mut().interact_size.y =
+        (crate::preferences::dialog_font_size(ui.ctx()) + 20.0).max(34.0);
     ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     ui.visuals_mut().widgets.inactive.corner_radius = egui::CornerRadius::same(7);
     ui.visuals_mut().widgets.hovered.corner_radius = egui::CornerRadius::same(7);
     ui.visuals_mut().widgets.active.corner_radius = egui::CornerRadius::same(7);
     ui.visuals_mut().selection.bg_fill = SELECTED;
+}
+
+pub fn modal_style(ui: &mut egui::Ui, width: f32) {
+    let scale = (crate::preferences::dialog_font_size(ui.ctx()) / 14.0).max(1.0);
+    dialog_style(ui, width * scale);
 }
 
 pub fn dialog_header(
@@ -767,14 +793,19 @@ pub fn dialog_header(
         }
         ui.add_space(4.0);
         ui.vertical(|ui| {
+            ui.set_max_width((ui.available_width() - 44.0).max(100.0));
             ui.label(
                 RichText::new(title)
-                    .size(21.0)
+                    .size(crate::preferences::dialog_font_size(ui.ctx()) + 8.0)
                     .strong()
                     .color(Color32::from_rgb(235, 237, 243)),
             );
             if !subtitle.is_empty() {
-                ui.label(RichText::new(subtitle).size(12.0).color(MUTED));
+                ui.label(
+                    RichText::new(subtitle)
+                        .size(crate::preferences::dialog_font_size(ui.ctx()))
+                        .color(MUTED),
+                );
             }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -787,9 +818,18 @@ pub fn dialog_header(
 }
 
 pub fn dialog_section(ui: &mut egui::Ui, title: &str, description: &str) {
-    ui.label(RichText::new(title).size(14.0).strong().color(TEXT));
+    ui.label(
+        RichText::new(title)
+            .size(crate::preferences::dialog_font_size(ui.ctx()) + 1.0)
+            .strong()
+            .color(TEXT),
+    );
     if !description.is_empty() {
-        ui.label(RichText::new(description).size(12.0).color(MUTED));
+        ui.label(
+            RichText::new(description)
+                .size(crate::preferences::dialog_font_size(ui.ctx()))
+                .color(MUTED),
+        );
     }
 }
 
@@ -825,7 +865,7 @@ pub fn dialog_path(ui: &mut egui::Ui, path: &Path) {
         ui.add(
             egui::Label::new(
                 RichText::new(path.display().to_string())
-                    .size(12.0)
+                    .size(crate::preferences::dialog_font_size(ui.ctx()))
                     .color(MUTED),
             )
             .wrap(),
@@ -840,14 +880,17 @@ pub fn dialog_divider(ui: &mut egui::Ui) {
 }
 
 pub fn dialog_button(ui: &mut egui::Ui, label: &str, accent: Option<Color32>) -> egui::Response {
-    let mut button =
-        egui::Button::new(RichText::new(label).size(13.0).color(if accent.is_some() {
-            Color32::WHITE
-        } else {
-            TEXT
-        }))
-        .corner_radius(7)
-        .min_size(egui::vec2(94.0, 35.0));
+    let mut button = egui::Button::new(
+        RichText::new(label)
+            .size(crate::preferences::dialog_font_size(ui.ctx()))
+            .color(if accent.is_some() {
+                Color32::WHITE
+            } else {
+                TEXT
+            }),
+    )
+    .corner_radius(7)
+    .min_size(egui::vec2(94.0, 35.0));
     if let Some(accent) = accent {
         button = button.fill(accent).stroke(Stroke::NONE);
     }
