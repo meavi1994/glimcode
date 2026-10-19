@@ -2,6 +2,7 @@ mod app;
 mod chrome;
 mod diff;
 mod document;
+mod editor_analysis;
 mod editor_structure;
 mod explorer;
 mod file_find;

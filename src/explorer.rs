@@ -116,11 +116,20 @@ impl FileTree {
         root: &Path,
         active: Option<&Path>,
         filter: &str,
+        colors: &BTreeMap<PathBuf, egui::Color32>,
     ) -> Option<PathBuf> {
         let reveal =
             std::mem::take(&mut self.reveal_requested) || self.last_active.as_deref() != active;
         self.last_active = active.map(Path::to_path_buf);
-        self.show_children(ui, root, root, active, &filter.to_lowercase(), reveal)
+        self.show_children(
+            ui,
+            root,
+            root,
+            active,
+            &filter.to_lowercase(),
+            reveal,
+            colors,
+        )
     }
 
     fn show_children(
@@ -131,6 +140,7 @@ impl FileTree {
         active: Option<&Path>,
         filter: &str,
         reveal: bool,
+        colors: &BTreeMap<PathBuf, egui::Color32>,
     ) -> Option<PathBuf> {
         let mut opened = None;
         // Include empty folders so they can receive a new file.
@@ -181,11 +191,11 @@ impl FileTree {
                         egui::Align2::LEFT_CENTER,
                         name.to_string_lossy(),
                         egui::FontId::proportional(13.0),
-                        if selected {
+                        colors.get(file).copied().unwrap_or(if selected {
                             egui::Color32::from_rgb(223, 225, 229)
                         } else {
                             crate::chrome::TEXT
-                        },
+                        }),
                     );
                     if reveal && active == Some(file.as_path()) {
                         ui.scroll_to_rect(rect, Some(egui::Align::Center));
@@ -214,7 +224,7 @@ impl FileTree {
                         },
                         |ui| {
                             if let Some(file) =
-                                child.show_children(ui, root, &path, active, filter, reveal)
+                                child.show_children(ui, root, &path, active, filter, reveal, colors)
                             {
                                 opened = Some(file);
                             }

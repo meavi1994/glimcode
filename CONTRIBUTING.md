@@ -72,6 +72,16 @@ GLIMCODE_BENCH_ROOT=/path/to/project GLIMCODE_BENCH_QUERY=main cargo test --rele
 
 The output reports CLI completion, embedded completion, first embedded result, hit count, and summed syntax-parser time across workers. The embedded path includes classification and the 2,000-result cap; the CLI baseline emits all matches without classification. These are diagnostic timings, not equivalent-workload performance claims. The benchmark is ignored in normal test runs.
 
+## Large-file performance check
+
+Run the synthetic 70,000-line TypeScript editing check (about 3 million characters):
+
+```sh
+cargo test --release --locked large_typescript_editor_benchmark -- --ignored --nocapture
+```
+
+It reports first-frame layout, idle frames, typing, completed syntax layout, and jumping to the end of the file. It also checks that editing preserves the full buffer and that navigation uses the correct Unicode character offsets. Timings vary by machine; this is a regression check, not a performance guarantee for every source file.
+
 ## Source map
 
 - `src/app.rs`: desktop workspace and editor integration

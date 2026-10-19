@@ -6,6 +6,7 @@ use anyhow::{Result, bail};
 use std::{
     io::Write,
     path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
 
@@ -36,6 +37,7 @@ pub struct Document {
     pub csv_error: Option<String>,
     pub outline: Vec<Symbol>,
     pub outline_refresh: Option<Instant>,
+    outline_worker: Option<(u64, Receiver<Vec<Symbol>>)>,
     pub markdown: MarkdownMode,
     pub cursor: usize,
     pub jump: Option<(usize, usize)>,
@@ -74,7 +76,12 @@ impl Document {
         } else {
             None
         };
-        let outline = navigation::symbols(&path, &source);
+        let large = crate::editor_analysis::is_large(&source);
+        let outline = if large {
+            Vec::new()
+        } else {
+            navigation::symbols(&path, &source)
+        };
         Ok(Self {
             path,
             content,
@@ -82,7 +89,8 @@ impl Document {
             csv,
             csv_error: None,
             outline,
-            outline_refresh: None,
+            outline_refresh: large.then(Instant::now),
+            outline_worker: None,
             markdown: MarkdownMode::Split,
             cursor: 0,
             jump: None,
@@ -91,6 +99,46 @@ impl Document {
             disk_checked: Instant::now(),
             original: source,
         })
+    }
+
+    /// Keep full-file symbol parsing out of the render loop, including after edits.
+    pub fn poll_outline(&mut self, ctx: &eframe::egui::Context) {
+        if let Some((key, rx)) = &self.outline_worker {
+            match rx.try_recv() {
+                Ok(outline) => {
+                    if let Content::Text(text) = &self.content
+                        && eframe::egui::util::hash((&self.path, text.as_str())) == *key
+                    {
+                        self.outline = outline;
+                    }
+                    self.outline_worker = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.outline_worker = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.outline_worker.is_none()
+            && self
+                .outline_refresh
+                .is_some_and(|time| time.elapsed() >= Duration::from_millis(300))
+        {
+            self.outline_refresh = None;
+            if let Content::Text(text) = &self.content {
+                let key = eframe::egui::util::hash((&self.path, text.as_str()));
+                let text = text.clone();
+                let path = self.path.clone();
+                let ctx = ctx.clone();
+                let (tx, rx) = mpsc::channel();
+                self.outline_worker = Some((key, rx));
+                std::thread::spawn(move || {
+                    let _ = tx.send(navigation::symbols(&path, &text));
+                    ctx.request_repaint();
+                });
+            }
+        }
+        if self.outline_refresh.is_some() || self.outline_worker.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 
     pub fn can_reload(&mut self) -> bool {
@@ -202,6 +250,30 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn large_file_open_defers_outline_and_discards_results_for_edited_buffers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("large.ts");
+        std::fs::write(&path, "export const value = 1;\n".repeat(10_001))?;
+        let mut doc = Document::open(path, true)?;
+        assert!(doc.outline.is_empty());
+        assert!(doc.outline_refresh.is_some());
+        let old_key = match &doc.content {
+            Content::Text(text) => eframe::egui::util::hash((&doc.path, text.as_str())),
+            _ => unreachable!(),
+        };
+        let (tx, rx) = mpsc::channel();
+        tx.send(navigation::symbols(&doc.path, "export const obsolete = 1;"))?;
+        doc.outline_worker = Some((old_key, rx));
+        doc.content = Content::Text("export const current = 2;".into());
+        doc.poll_outline(&eframe::egui::Context::default());
+        assert!(
+            doc.outline.is_empty(),
+            "the old buffer's symbols must not be shown"
+        );
+        Ok(())
+    }
+
     #[test]
     fn csv_modes_preserve_exact_source_and_sync_edits_in_both_directions() -> Result<()> {
         let dir = tempfile::tempdir()?;

@@ -217,6 +217,22 @@ impl GitTool {
             ctx.request_repaint_after(Duration::from_secs(2));
         }
     }
+    pub fn cached_file(&self, path: &Path, source: &str) -> Option<Arc<FileData>> {
+        let repo = self.repo.as_ref()?;
+        if self
+            .selected_base
+            .as_deref()
+            .is_some_and(|base| base != repo.base)
+        {
+            return None;
+        }
+        self.file
+            .as_ref()
+            .map(|(_, data)| data)
+            .filter(|data| data.path == path && data.text == source)
+            .cloned()
+    }
+
     pub fn ensure_file(
         &mut self,
         path: &Path,
@@ -244,12 +260,11 @@ impl GitTool {
             .filter(|(stored, _)| *stored == key)
             .map(|(_, data)| data.clone());
         if matching.is_none() && self.file_rx.is_none() && self.failed_file != Some(key) {
-            let wait = self.file.is_some()
-                && self
-                    .desired
-                    .is_some_and(|(_, time)| time.elapsed() < Duration::from_millis(250));
+            let wait = self
+                .desired
+                .is_some_and(|(_, time)| time.elapsed() < Duration::from_millis(500));
             if wait {
-                ctx.request_repaint_after(Duration::from_millis(250));
+                ctx.request_repaint_after(Duration::from_millis(500));
             } else {
                 let repo = repo.clone();
                 let path = path.to_path_buf();
@@ -395,20 +410,7 @@ impl GitTool {
                             ).on_hover_text("Hide files with common test folder or filename conventions. Includes test helpers and fixtures in test folders; mixed source files stay visible.");
                         });
                     self.include_tests = !hide_tests;
-                    let mut files = repo.files.clone();
-                    for path in dirty {
-                        if let Ok(path) = path.strip_prefix(&repo.root) {
-                            if let Some(file) = files.iter_mut().find(|file| file.path == path) {
-                                file.uncommitted = true;
-                            } else {
-                                files.push(git::ChangedFile {
-                                    path: path.to_path_buf(),
-                                    uncommitted: true,
-                                    ..Default::default()
-                                });
-                            }
-                        }
-                    }
+                    let files = tree_files(repo, dirty);
                     let total = files.len();
                     let hidden_tests = if hide_tests {
                         files.iter().filter(|file| crate::test_files::is_test_file(&file.path)).count()
@@ -631,8 +633,37 @@ impl GitTool {
         opened
     }
 }
+/// Use the same status precedence in Project and Changes, including unsaved buffers.
+pub fn tree_files(repo: &Repository, dirty: &[PathBuf]) -> Vec<git::ChangedFile> {
+    let mut files = repo.files.clone();
+    for path in dirty {
+        if let Ok(path) = path.strip_prefix(&repo.root) {
+            if let Some(file) = files.iter_mut().find(|file| file.path == path) {
+                file.uncommitted = true;
+            } else {
+                files.push(git::ChangedFile {
+                    path: path.to_path_buf(),
+                    uncommitted: true,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    files
+}
+
+pub fn file_color(file: &git::ChangedFile) -> Color32 {
+    if file.deleted {
+        deleted()
+    } else if file.uncommitted {
+        working()
+    } else {
+        committed()
+    }
+}
+
 pub fn committed() -> Color32 {
-    Color32::from_rgb(100, 165, 245)
+    Color32::from_rgb(82, 168, 104)
 }
 pub fn working() -> Color32 {
     Color32::from_rgb(224, 180, 95)
@@ -643,7 +674,7 @@ pub fn deleted() -> Color32 {
 pub fn marker(mark: git::Mark) -> Color32 {
     match mark {
         git::Mark::Added => Color32::from_rgb(82, 168, 104),
-        git::Mark::Modified => committed(),
+        git::Mark::Modified => Color32::from_rgb(100, 165, 245),
         git::Mark::Deleted => deleted(),
     }
 }
@@ -693,13 +724,7 @@ impl ChangeTree {
                 let path = directory.join(name);
                 if let Some(index) = node.file {
                     let file = &files[index];
-                    let color = if file.deleted {
-                        deleted()
-                    } else if file.uncommitted {
-                        working()
-                    } else {
-                        committed()
-                    };
+                    let color = file_color(file);
                     let badge = if file.conflict {
                         "!"
                     } else if file.deleted {
@@ -1425,6 +1450,140 @@ fn review_rows(rows: &[diff::Row], full: bool) -> Vec<ReviewRow> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    #[test]
+    fn both_trees_render_matching_status_colors_and_unsaved_overrides() {
+        let root = Path::new("/project");
+        let repo = Repository {
+            root: root.into(),
+            branch: "main".into(),
+            head: String::new(),
+            base: "main".into(),
+            merge_base: None,
+            branches: vec![],
+            remote: None,
+            files: vec![
+                git::ChangedFile {
+                    path: "committed.ts".into(),
+                    committed: true,
+                    ..Default::default()
+                },
+                git::ChangedFile {
+                    path: "working.ts".into(),
+                    uncommitted: true,
+                    ..Default::default()
+                },
+                git::ChangedFile {
+                    path: "deleted.ts".into(),
+                    committed: true,
+                    deleted: true,
+                    ..Default::default()
+                },
+            ],
+        };
+        let paths: Vec<_> = ["committed.ts", "working.ts", "deleted.ts", "clean.ts"]
+            .iter()
+            .map(|name| root.join(name))
+            .collect();
+        let mut project = crate::explorer::FileTree::build(root, &paths);
+        let ctx = egui::Context::default();
+        for unsaved in [true, false] {
+            let dirty = if unsaved {
+                vec![root.join("committed.ts")]
+            } else {
+                vec![]
+            };
+            let files = tree_files(&repo, &dirty);
+            let colors = files
+                .iter()
+                .map(|file| (root.join(&file.path), file_color(file)))
+                .collect();
+            let changes = ChangeTree::build(&files, "", false);
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.columns(2, |columns| {
+                        project.show(
+                            &mut columns[0],
+                            root,
+                            Some(&root.join("committed.ts")),
+                            "",
+                            &colors,
+                        );
+                        changes.show(&mut columns[1], &files, Path::new(""));
+                    });
+                });
+            });
+            let rendered = |label: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == label => {
+                            Some(text.galley.job.sections[0].format.color)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("missing label: {label}"))
+            };
+            let green = Color32::from_rgb(82, 168, 104);
+            let expected = if unsaved { working() } else { green };
+            assert_eq!(
+                rendered("committed.ts"),
+                expected,
+                "selection keeps the Git status color"
+            );
+            assert_eq!(
+                rendered(if unsaved {
+                    "C+W  committed.ts"
+                } else {
+                    "C  committed.ts"
+                }),
+                expected
+            );
+            assert_eq!(rendered("working.ts"), working());
+            assert_eq!(rendered("W  working.ts"), working());
+            assert_eq!(rendered("deleted.ts"), deleted());
+            assert_eq!(rendered("D  deleted.ts"), deleted());
+            assert_eq!(rendered("clean.ts"), chrome::TEXT);
+        }
+        assert_eq!(
+            marker(git::Mark::Modified),
+            Color32::from_rgb(100, 165, 245)
+        );
+    }
+
+    #[test]
+    fn editor_git_work_waits_for_idle_even_without_a_previous_file() {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large.ts");
+        let mut tool = GitTool::default();
+        tool.repo = Some(git::Repository {
+            root: root.path().to_owned(),
+            branch: "main".into(),
+            head: String::new(),
+            base: "main".into(),
+            merge_base: None,
+            branches: vec![],
+            files: vec![],
+            remote: None,
+        });
+        assert!(tool.ensure_file(&path, "first", &ctx).is_none());
+        assert!(
+            tool.file_rx.is_none(),
+            "opening must not start Git work before the editor appears"
+        );
+        tool.desired.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(1);
+        tool.ensure_file(&path, "edited", &ctx);
+        assert!(tool.file_rx.is_none(), "typing resets the idle delay");
+        tool.desired.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(1);
+        tool.ensure_file(&path, "edited", &ctx);
+        assert!(
+            tool.file_rx.is_some(),
+            "Git work starts once the buffer settles"
+        );
+    }
+
     #[test]
     fn hide_tests_filters_tree_without_changing_file_indices() {
         use super::*;
@@ -1636,7 +1795,6 @@ mod tests {
         );
     }
 
-    use super::*;
     #[test]
     fn split_replacements_preserve_both_files_and_pad_uneven_blocks() {
         let before = "same\nold one\nold two\nend\n";

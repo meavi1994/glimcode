@@ -699,16 +699,7 @@ impl Coder {
         }
         self.preview.poll();
         for doc in &mut self.documents {
-            if let Some(time) = doc.outline_refresh {
-                if time.elapsed() >= Duration::from_millis(300) {
-                    if let Content::Text(text) = &doc.content {
-                        doc.outline = navigation::symbols(&doc.path, text);
-                    }
-                    doc.outline_refresh = None;
-                } else {
-                    ctx.request_repaint_after(Duration::from_millis(100));
-                }
-            }
+            doc.poll_outline(ctx);
         }
         if self.files_rx.is_some() || self.search_rx.is_some() || self.preview.loading() {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -911,6 +902,28 @@ impl Coder {
     fn sidebar(&mut self, ctx: &egui::Context) {
         let mut open = None;
         let mut force_root = false;
+        let colors = self
+            .git
+            .repo
+            .as_ref()
+            .map(|repo| {
+                let dirty: Vec<_> = self
+                    .documents
+                    .iter()
+                    .filter(|doc| doc.dirty)
+                    .map(|doc| doc.path.clone())
+                    .collect();
+                crate::git_view::tree_files(repo, &dirty)
+                    .iter()
+                    .map(|file| {
+                        (
+                            repo.root.join(&file.path),
+                            crate::git_view::file_color(file),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         egui::SidePanel::left("explorer")
             .default_width(285.0)
             .width_range(160.0..=500.0)
@@ -990,6 +1003,7 @@ impl Coder {
                                     } else {
                                         ""
                                     },
+                                    &colors,
                                 );
                             })
                             .header_response
@@ -1146,14 +1160,16 @@ impl Coder {
                         })
                         .collect();
                     let syntax = match &doc.content {
-                        Content::Text(text) => Some(crate::highlighting::highlight(
-                            ui,
-                            text,
-                            doc.path
-                                .extension()
-                                .and_then(|ext| ext.to_str())
-                                .unwrap_or(""),
-                        )),
+                        Content::Text(text) if !crate::editor_analysis::is_large(text) => {
+                            Some(crate::highlighting::highlight(
+                                ui,
+                                text,
+                                doc.path
+                                    .extension()
+                                    .and_then(|ext| ext.to_str())
+                                    .unwrap_or(""),
+                            ))
+                        }
                         _ => None,
                     };
                     let colors = syntax
@@ -1919,7 +1935,7 @@ impl Coder {
                     .documents
                     .get(self.active)
                     .and_then(|doc| match &doc.content {
-                        Content::Text(text) => self.git.ensure_file(&doc.path, text, ctx),
+                        Content::Text(text) => self.git.cached_file(&doc.path, text),
                         Content::Csv(_) => None,
                     });
                 let Some(doc) = self.documents.get_mut(self.active) else {
@@ -2106,6 +2122,9 @@ impl Coder {
                         }
                     }
                 });
+                if let Content::Text(text) = &doc.content {
+                    self.git.ensure_file(&doc.path, text, ctx);
+                }
                 if let Some(source) = csv_mode {
                     if let Err(error) = doc.set_csv_source(source) {
                         doc.csv_error = Some(format!("{error:#}"));
@@ -2365,10 +2384,8 @@ impl Coder {
                             } else {
                                 target.join(suffix)
                             };
-                            doc.outline = match &doc.content {
-                                Content::Text(text) => navigation::symbols(&doc.path, text),
-                                _ => vec![],
-                            };
+                            doc.outline.clear();
+                            doc.outline_refresh = Some(Instant::now());
                         }
                     }
                     self.history.clear();
@@ -3447,13 +3464,24 @@ fn text_editor(
         .data_mut(|data| data.get_temp::<crate::folding::State>(fold_id))
         .unwrap_or_default();
     folds.sync(text);
-    let job = crate::highlighting::highlight(ui, text, extension);
-    let fold_regions = ui.ctx().memory_mut(|memory| {
-        memory.caches.cache::<egui::cache::FrameCache<Vec<crate::folding::Region>, crate::folding::Computer>>()
-            .get((&job, extension))
-    });
+    let large = crate::editor_analysis::is_large(text);
+    let analysis = large
+        .then(|| crate::editor_analysis::get(ui, text, path))
+        .flatten();
+    let small_regions = if large {
+        Vec::new()
+    } else {
+        let job = crate::highlighting::highlight(ui, text, extension);
+        ui.ctx().memory_mut(|memory| {
+            memory.caches.cache::<egui::cache::FrameCache<Vec<crate::folding::Region>, crate::folding::Computer>>()
+                .get((&job, extension))
+        })
+    };
+    let fold_regions = analysis
+        .as_ref()
+        .map_or(small_regions.as_slice(), |a| a.folds.as_slice());
     if let Some(offset) = jump_offset.or(find_offset) {
-        folds.reveal(&fold_regions, offset..=offset);
+        folds.reveal(fold_regions, offset..=offset);
     }
     #[cfg(feature = "ui-capture")]
     if std::env::var("CODER_UI_PREVIEW").as_deref() == Ok("folding")
@@ -3471,10 +3499,53 @@ fn text_editor(
         ui.ctx()
             .data_mut(|data| data.insert_temp(fold_id.with("capture-seeded"), true));
     }
-    let active_folds = folds.active(&fold_regions);
+    let active_folds = folds.active(fold_regions);
     let source_hash = egui::util::hash(text.as_str());
+    let large_layout = large.then(|| crate::editor_analysis::layout_cache(ui, id));
+    let folded = egui::util::hash(&folds.collapsed);
     let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, _wrap_width: f32| {
-        let mut job = crate::highlighting::highlight(ui, buffer.as_str(), extension);
+        let buffer_hash = egui::util::hash(buffer.as_str());
+        let syntax = analysis
+            .as_ref()
+            .filter(|a| a.syntax.text == buffer.as_str());
+        let layout_key = egui::util::hash((
+            buffer_hash,
+            syntax.map(|a| a.key),
+            font_size.to_bits(),
+            ui.visuals().dark_mode,
+            ui.ctx().pixels_per_point().to_bits(),
+            occurrence,
+            &find.active,
+            folded,
+        ));
+        if let Some(cache) = &large_layout
+            && let Some(cached) = cache.lock().unwrap().as_ref()
+            && cached.key == layout_key
+        {
+            return cached.galley.clone();
+        }
+        let mut job = if large {
+            syntax.map_or_else(
+                || {
+                    egui::text::LayoutJob::simple(
+                        buffer.as_str().to_owned(),
+                        FontId::monospace(font_size),
+                        if ui.visuals().dark_mode {
+                            chrome::TEXT
+                        } else {
+                            Color32::BLACK
+                        },
+                        f32::INFINITY,
+                    )
+                },
+                |a| a.syntax.clone(),
+            )
+        } else {
+            crate::highlighting::highlight(ui, buffer.as_str(), extension)
+        };
+        for section in &mut job.sections {
+            section.format.font_id.size = font_size;
+        }
         chrome::mark_matches(&mut job, occurrence);
         if !find.query.is_empty()
             && let Some(active) = &find.active
@@ -3490,11 +3561,18 @@ fn text_editor(
 
         let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
         // Edits always lay out the full new buffer; anchors are rebuilt next frame.
-        if egui::util::hash(buffer.as_str()) == source_hash {
+        let galley = if buffer_hash == source_hash {
             crate::folding::layout(galley, &active_folds)
         } else {
             galley
+        };
+        if let Some(cache) = &large_layout {
+            *cache.lock().unwrap() = Some(crate::editor_analysis::CachedLayout {
+                key: layout_key,
+                galley: galley.clone(),
+            });
         }
+        galley
     };
     let mut changed = false;
     let mut clicked_token = None;
@@ -3590,15 +3668,20 @@ fn text_editor(
                 } else {
                     Color32::from_gray(212)
                 };
-                let structure = ui.ctx().memory_mut(|memory| {
-                    memory
-                        .caches
-                        .cache::<egui::cache::FrameCache<
-                            crate::editor_structure::Structure,
-                            crate::editor_structure::Computer,
-                        >>()
-                        .get(output.galley.job.as_ref())
-                });
+                let small_structure = if large {
+                    crate::editor_structure::Structure::default()
+                } else {
+                    ui.ctx().memory_mut(|memory| {
+                        memory
+                            .caches
+                            .cache::<egui::cache::FrameCache<
+                                crate::editor_structure::Structure,
+                                crate::editor_structure::Computer,
+                            >>()
+                            .get(output.galley.job.as_ref())
+                    })
+                };
+                let structure = analysis.as_ref().map_or(&small_structure, |a| &a.structure);
                 let active_pair = structure.matching(*cursor);
                 for guide in &structure.guides {
                     if let (Some(start), Some(end)) = (
@@ -3608,15 +3691,15 @@ fn text_editor(
                         if start.size.y <= 0.0 {
                             continue;
                         }
-                        let x = output
-                            .galley
-                            .pos_from_cursor(egui::text::CCursor::new(guide.anchor))
-                            .left()
-                            + output.galley_pos.x;
                         let top = (output.galley_pos.y + start.pos.y + start.size.y)
                             .max(ui.clip_rect().top());
                         let bottom = (output.galley_pos.y + end.pos.y).min(ui.clip_rect().bottom());
                         if top < bottom {
+                            let x = output
+                                .galley
+                                .pos_from_cursor(egui::text::CCursor::new(guide.anchor))
+                                .left()
+                                + output.galley_pos.x;
                             guides.push(egui::Shape::line_segment(
                                 [egui::pos2(x, top), egui::pos2(x, bottom)],
                                 egui::Stroke::new(1.0_f32, guide_color),
@@ -3652,7 +3735,7 @@ fn text_editor(
                 }
                 // Folding controls occupy a separate gutter column so they never select text.
                 let mut toggle_fold = None;
-                for region in &fold_regions {
+                for region in fold_regions {
                     let Some(row) = output.galley.rows.get(region.first) else {
                         continue;
                     };
@@ -3740,7 +3823,7 @@ fn text_editor(
                     ui.ctx().request_repaint();
                 } else if let Some(range) = output.cursor_range {
                     let range = range.as_sorted_char_range();
-                    if folds.reveal(&fold_regions, range.start..=range.end) {
+                    if folds.reveal(fold_regions, range.start..=range.end) {
                         ui.ctx().request_repaint();
                     }
                 }
@@ -3751,7 +3834,19 @@ fn text_editor(
                 let mut marks = data.map(|data| data.marks.iter().peekable());
                 let mut previous_blame: Option<&crate::git::BlameLine> = None;
                 let mut group_row = 0;
-                for (index, row) in output.galley.rows.iter().enumerate() {
+                let first_row = output.galley.rows.partition_point(|row| {
+                    output.galley_pos.y + row.pos.y + row.size.y < ui.clip_rect().top()
+                });
+                for (index, row) in output
+                    .galley
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .skip(first_row)
+                    .take_while(|(_, row)| {
+                        output.galley_pos.y + row.pos.y <= ui.clip_rect().bottom()
+                    })
+                {
                     let y = output.galley_pos.y + row.pos.y;
                     if row.size.y <= 0.0 {
                         continue;
@@ -4087,6 +4182,94 @@ fn edit_line(text: &mut String, cursor: usize, path: &Path, duplicate: bool) {
 mod tests {
     use super::*;
     use crate::search_view::{extension, result_visible};
+    #[test]
+    #[ignore = "large-file performance check; run with --release --ignored --nocapture"]
+    fn large_typescript_editor_benchmark() {
+        let ctx = egui::Context::default();
+        let mut source = (0..17_500).map(|i| format!(
+            "export function item{i}(input: string): string {{\n    const value = input.trim(); // sample content with some text and additional context\n    return value + \"item{i}\";\n}}\n"
+        )).collect::<String>();
+        let mut cursor = 0;
+        let mut jump = Some((1, 1));
+        let mut editor_id = None;
+        let mut time = 0.0;
+        let mut frame = |source: &mut String, events, target: Option<(usize, usize)>| {
+            if let Some(target) = target {
+                jump = Some(target);
+            }
+            time += 0.05;
+            let start = Instant::now();
+            let mut ready = false;
+            let output = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        text_editor(
+                            ui,
+                            source,
+                            Path::new("large.ts"),
+                            &mut cursor,
+                            &mut jump,
+                            &mut editor_id,
+                            EditorFind::default(),
+                        );
+                        ready = crate::editor_analysis::get(ui, source, Path::new("large.ts"))
+                            .is_some();
+                    });
+                },
+            );
+            (start.elapsed(), output, ready)
+        };
+        eprintln!(
+            "Source: {} bytes / {} lines",
+            source.len(),
+            source.lines().count()
+        );
+        let (initial, _, _) = frame(&mut source, vec![], None);
+        let (steady, _, _) = frame(&mut source, vec![], None);
+        // Editing must preserve the full buffer, including the final lines.
+        let before = source.clone();
+        let id = ctx
+            .memory(|memory| memory.focused())
+            .unwrap_or_else(|| egui::Id::new("source-editor"));
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        let (typing, _, _) = frame(&mut source, vec![egui::Event::Text("猫".into())], None);
+        assert_eq!(source, format!("猫{before}"));
+        eprintln!("Initial: {initial:?}; steady: {steady:?}; typing: {typing:?}");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (_, _, ready) = frame(&mut source, vec![], None);
+            if ready {
+                break;
+            }
+            assert!(Instant::now() < deadline, "syntax analysis did not finish");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (highlighted, _, _) = frame(&mut source, vec![], None);
+        let (highlighted_steady, _, _) = frame(&mut source, vec![], None);
+        eprintln!("Highlighted: {highlighted:?}; highlighted steady: {highlighted_steady:?}");
+        let (jump_time, _, _) = frame(&mut source, vec![], Some((70_000, 1)));
+        let (bottom_frame, _, _) = frame(&mut source, vec![], None);
+        eprintln!("Jump to EOF: {jump_time:?}; bottom frame: {bottom_frame:?}");
+        assert!(bottom_frame < Duration::from_millis(200));
+        drop(frame);
+        assert_eq!(cursor, navigation::char_offset(&source, 70_000, 1));
+        assert!(highlighted_steady < Duration::from_millis(200));
+        assert!(
+            steady < Duration::from_millis(200),
+            "steady frame: {steady:?}"
+        );
+        assert!(typing < Duration::from_secs(1), "typing frame: {typing:?}");
+    }
+
     #[test]
     fn editor_diff_buttons_navigate_from_the_caret_and_clamp_at_boundaries() {
         let targets = [2, 20, 45];
