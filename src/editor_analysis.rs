@@ -104,28 +104,30 @@ pub fn get(ui: &egui::Ui, text: &str, path: &Path) -> Option<Arc<Analysis>> {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         state.pending = Some((key, rx, cancel.clone()));
-        std::thread::spawn(move || {
-            let cancelled = || cancel.load(Ordering::Relaxed);
-            let result =
-                highlighting::background(&text, &extension, dark, &cancelled).and_then(|syntax| {
-                    if cancelled() {
-                        return None;
-                    }
-                    let structure = Structure::build(&syntax);
-                    if cancelled() {
-                        return None;
-                    }
-                    let folds = folding::regions(&text, &structure, &extension);
-                    (!cancelled()).then_some(Analysis {
-                        key,
-                        syntax,
-                        structure,
-                        folds,
-                    })
-                });
-            let _ = tx.send(result);
-            ctx.request_repaint();
-        });
+        let _ = std::thread::Builder::new()
+            .name("editor-analysis".into())
+            .spawn(move || {
+                let cancelled = || cancel.load(Ordering::Relaxed);
+                let result = highlighting::background(&text, &extension, dark, &cancelled)
+                    .and_then(|syntax| {
+                        if cancelled() {
+                            return None;
+                        }
+                        let structure = Structure::build(&syntax);
+                        if cancelled() {
+                            return None;
+                        }
+                        let folds = folding::regions(&text, &structure, &extension);
+                        (!cancelled()).then_some(Analysis {
+                            key,
+                            syntax,
+                            structure,
+                            folds,
+                        })
+                    });
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            });
     }
     ui.ctx().request_repaint_after(Duration::from_millis(100));
     None

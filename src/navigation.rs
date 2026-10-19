@@ -244,6 +244,26 @@ pub fn symbols(path: &Path, source: &str) -> Vec<Symbol> {
 }
 
 fn collect(node: Node<'_>, source: &[u8], result: &mut Vec<Symbol>) {
+    // Generated expressions can create tens of thousands of AST levels. Walk
+    // with TreeCursor's heap-backed path rather than one Rust frame per node.
+    let mut cursor = node.walk();
+    loop {
+        let current = cursor.node();
+        if current.is_named() {
+            collect_symbol(current, source, result);
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
+    }
+}
+
+fn collect_symbol(node: Node<'_>, source: &[u8], result: &mut Vec<Symbol>) {
     let kind = node.kind();
     if matches!(
         kind,
@@ -304,10 +324,6 @@ fn collect(node: Node<'_>, source: &[u8], result: &mut Vec<Symbol>) {
                 });
             }
         }
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect(child, source, result);
     }
 }
 
@@ -826,6 +842,50 @@ pub fn token_at(text: &str, position: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deeply_nested_typescript_outline_uses_bounded_call_stack() {
+        const CHILD: &str = "GLIMCODE_DEEP_OUTLINE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // Long generated expressions produce a deep AST even with few braces.
+            let source = format!(
+                "export const huge = {}value;\nexport function after() {{}}\n",
+                "value +\n".repeat(12_000)
+            );
+            std::thread::Builder::new()
+                .name("outline-regression".into())
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    let outline = symbols(Path::new("generated.ts"), &source);
+                    assert!(outline.iter().any(|symbol| symbol.name == "huge"));
+                    assert!(outline.iter().any(|symbol| symbol.name == "after"));
+                    let syntax =
+                        crate::highlighting::background(&source, "ts", true, &|| false).unwrap();
+                    assert_eq!(syntax.text, source);
+                    let structure = crate::editor_structure::Structure::build(&syntax);
+                    let _ = crate::folding::regions(&source, &structure, "ts");
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            return;
+        }
+        // A stack overflow aborts the process, so isolate this regression check.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "navigation::tests::deeply_nested_typescript_outline_uses_bounded_call_stack",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "outline worker crashed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn test_exclusion_covers_buffers_changed_files_and_project_for_all_search_kinds() -> Result<()>
     {

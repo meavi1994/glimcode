@@ -130,10 +130,12 @@ impl Document {
                 let ctx = ctx.clone();
                 let (tx, rx) = mpsc::channel();
                 self.outline_worker = Some((key, rx));
-                std::thread::spawn(move || {
-                    let _ = tx.send(navigation::symbols(&path, &text));
-                    ctx.request_repaint();
-                });
+                let _ = std::thread::Builder::new()
+                    .name("file-outline".into())
+                    .spawn(move || {
+                        let _ = tx.send(navigation::symbols(&path, &text));
+                        ctx.request_repaint();
+                    });
             }
         }
         if self.outline_refresh.is_some() || self.outline_worker.is_some() {
