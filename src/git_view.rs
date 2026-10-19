@@ -81,6 +81,7 @@ pub struct GitTool {
     detail_note: Option<String>,
     description_cache: egui_commonmark::CommonMarkCache,
     filter: String,
+    include_tests: bool,
 }
 impl GitTool {
     pub fn resize_windows(&self) -> Vec<egui::Id> {
@@ -378,6 +379,22 @@ impl GitTool {
                             .hint_text("Filter changed files…")
                             .desired_width(f32::INFINITY),
                     );
+                    let mut hide_tests = !self.include_tests;
+                    egui::Frame::new()
+                        .fill(if hide_tests { chrome::SELECTED } else { chrome::HEADER })
+                        .stroke(egui::Stroke::new(1.0_f32, if hide_tests { chrome::BLUE } else { chrome::BORDER }))
+                        .corner_radius(5)
+                        .inner_margin(egui::Margin::symmetric(8, 4))
+                        .show(ui, |ui| {
+                            let visuals = &mut ui.visuals_mut().widgets.inactive;
+                            visuals.bg_fill = if hide_tests { chrome::BLUE } else { chrome::PANEL };
+                            visuals.fg_stroke = egui::Stroke::new(1.5_f32, Color32::WHITE);
+                            ui.add_sized(
+                                [ui.available_width(), 24.0],
+                                egui::Checkbox::new(&mut hide_tests, RichText::new("Hide test files").strong().color(chrome::TEXT)),
+                            ).on_hover_text("Hide files with common test folder or filename conventions. Includes test helpers and fixtures in test folders; mixed source files stay visible.");
+                        });
+                    self.include_tests = !hide_tests;
                     let mut files = repo.files.clone();
                     for path in dirty {
                         if let Ok(path) = path.strip_prefix(&repo.root) {
@@ -392,9 +409,21 @@ impl GitTool {
                             }
                         }
                     }
-                    ui.weak(format!("{} changed files · click to open", files.len()));
+                    let total = files.len();
+                    let hidden_tests = if hide_tests {
+                        files.iter().filter(|file| crate::test_files::is_test_file(&file.path)).count()
+                    } else {
+                        0
+                    };
+                    let tree = ChangeTree::build(&files, &self.filter, hide_tests);
+                    let shown = tree.file_count();
+                    if hide_tests || !self.filter.is_empty() {
+                        let noun = if hidden_tests == 1 { "file" } else { "files" };
+                        ui.weak(format!("{shown} of {total} changed files · {hidden_tests} test {noun} hidden"));
+                    } else {
+                        ui.weak(format!("{total} changed files · click to open"));
+                    }
                     ui.separator();
-                    let tree = ChangeTree::build(&files, &self.filter);
                     egui::ScrollArea::both()
                         .id_salt("changed-file-tree")
                         .auto_shrink([false, false])
@@ -405,6 +434,8 @@ impl GitTool {
                         });
                     if files.is_empty() {
                         ui.weak("No changes relative to the selected base.");
+                    } else if shown == 0 {
+                        ui.weak("No changed files match the current filters.");
                     }
                 } else if self.repo_rx.is_some() {
                     ui.horizontal(|ui| {
@@ -623,11 +654,13 @@ struct ChangeTree {
     file: Option<usize>,
 }
 impl ChangeTree {
-    fn build(files: &[git::ChangedFile], filter: &str) -> Self {
+    fn build(files: &[git::ChangedFile], filter: &str, hide_tests: bool) -> Self {
         let mut tree = Self::default();
         let filter = filter.to_lowercase();
         for (index, file) in files.iter().enumerate() {
-            if !file.path.to_string_lossy().to_lowercase().contains(&filter) {
+            if !file.path.to_string_lossy().to_lowercase().contains(&filter)
+                || (hide_tests && crate::test_files::is_test_file(&file.path))
+            {
                 continue;
             }
             let mut node = &mut tree;
@@ -640,6 +673,10 @@ impl ChangeTree {
             node.file = Some(index);
         }
         tree
+    }
+    fn file_count(&self) -> usize {
+        usize::from(self.file.is_some())
+            + self.children.values().map(Self::file_count).sum::<usize>()
     }
     fn show(
         &self,
@@ -1404,6 +1441,137 @@ fn review_rows(rows: &[diff::Row], full: bool) -> Vec<ReviewRow> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn hide_tests_filters_tree_without_changing_file_indices() {
+        use super::*;
+        let files: Vec<_> = [
+            "src/main.go",
+            "src/main_test.go",
+            "tests/input.json",
+            "src/Contest.java",
+        ]
+        .into_iter()
+        .map(|path| git::ChangedFile {
+            path: path.into(),
+            ..Default::default()
+        })
+        .collect();
+        assert_eq!(ChangeTree::build(&files, "", false).file_count(), 4);
+        let tree = ChangeTree::build(&files, "", true);
+        assert_eq!(tree.file_count(), 2);
+        assert!(!tree.children.contains_key("tests"));
+        let src = &tree.children["src"];
+        assert_eq!(src.children["main.go"].file, Some(0));
+        assert_eq!(src.children["Contest.java"].file, Some(3));
+        assert_eq!(ChangeTree::build(&files, "MAIN", true).file_count(), 1);
+        assert_eq!(ChangeTree::build(&files, "test", true).file_count(), 1); // Contest.java
+        assert_eq!(ChangeTree::build(&files, "tests/", true).file_count(), 0);
+        assert_eq!(ChangeTree::build(&files, "", false).file_count(), 4);
+    }
+
+    #[test]
+    fn hide_tests_checkbox_filters_unsaved_files_and_can_restore_them() {
+        use super::*;
+        let root = PathBuf::from("/example");
+        let mut tool = GitTool {
+            visible: true,
+            last_refresh: Some(Instant::now()),
+            repo: Some(Repository {
+                root: root.clone(),
+                branch: "feature".into(),
+                head: "abc".into(),
+                base: "main".into(),
+                merge_base: None,
+                branches: vec!["main".into()],
+                remote: None,
+                files: vec![git::ChangedFile {
+                    path: "main.go".into(),
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        let dirty = [root.join("main_test.go")];
+        let ctx = egui::Context::default();
+        let mut time = 0.0;
+        let mut frame = |tool: &mut GitTool, events| {
+            time += 0.1;
+            ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    tool.panel(ctx, &root, &dirty);
+                },
+            )
+        };
+        frame(&mut tool, vec![]);
+        let output = frame(&mut tool, vec![]);
+        let text = |output: &egui::FullOutput| -> Vec<String> {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(!tool.include_tests);
+        assert!(!text(&output).iter().any(|s| s.contains("main_test.go")));
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(t) if t.galley.text() == "Hide test files" => {
+                    Some(t.pos + t.galley.size() / 2.0)
+                }
+                _ => None,
+            })
+            .unwrap();
+        for hidden in [false, true] {
+            frame(
+                &mut tool,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            let output = frame(
+                &mut tool,
+                vec![egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert_eq!(!tool.include_tests, hidden);
+            let labels = text(&output);
+            assert_eq!(labels.iter().any(|s| s.contains("main_test.go")), !hidden);
+            assert!(labels.iter().any(|s| s.contains("main.go")));
+            if hidden {
+                assert!(
+                    labels
+                        .iter()
+                        .any(|s| s == "1 of 2 changed files · 1 test file hidden")
+                );
+            }
+        }
+        assert_eq!(tool.repo.unwrap().files.len(), 1);
+    }
+
+    #[test]
     fn changed_file_click_opens_editor_and_context_menu_requests_diff() {
         use super::*;
         let ctx = egui::Context::default();
@@ -1412,7 +1580,7 @@ mod tests {
             uncommitted: true,
             ..Default::default()
         }];
-        let tree = ChangeTree::build(&files, "");
+        let tree = ChangeTree::build(&files, "", false);
         let mut time = 0.0;
         let mut frame = |events| {
             time += 0.1;

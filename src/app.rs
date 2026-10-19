@@ -55,6 +55,7 @@ pub struct Coder {
     active: usize,
     query: String,
     search_kind: SearchKind,
+    exclude_test_files: bool,
     results: Vec<Location>,
     search_rx: Option<Receiver<SearchUpdate>>,
     search_cancel: Arc<AtomicBool>,
@@ -323,6 +324,7 @@ impl Coder {
             active: 0,
             query: String::new(),
             search_kind: SearchKind::Text,
+            exclude_test_files: true,
             results: vec![],
             search_rx: None,
             search_cancel: Arc::new(AtomicBool::new(false)),
@@ -554,6 +556,11 @@ impl Coder {
     }
 
     fn start_search(&mut self, kind: SearchKind, use_cursor: bool) {
+        self.exclude_test_files = true;
+        self.run_search(kind, use_cursor);
+    }
+
+    fn run_search(&mut self, kind: SearchKind, use_cursor: bool) {
         self.search_cancel.store(true, Ordering::Relaxed);
         self.search_cancel = Arc::new(AtomicBool::new(false));
         self.search_rx = None;
@@ -595,6 +602,7 @@ impl Coder {
             .collect();
         let mut priority_paths = self.opened_search_paths();
         let git_known = self.git.repo.is_some();
+        let exclude_tests = self.exclude_test_files;
         let cancelled = self.search_cancel.clone();
         let (tx, rx) = mpsc::channel();
         self.search_rx = Some(rx);
@@ -610,6 +618,7 @@ impl Coder {
                 &root,
                 &query,
                 kind,
+                exclude_tests,
                 buffers,
                 priority_paths,
                 cancelled,
@@ -707,6 +716,9 @@ impl Coder {
     }
 
     fn open_search(&mut self) {
+        if !self.exclude_test_files {
+            self.start_search(self.search_kind, false);
+        }
         self.picker = None;
         self.search_open = true;
         self.search_focus = true;
@@ -1317,14 +1329,14 @@ impl Coder {
             });
         });
         ui.add_space(2.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Find").size(16.0).color(chrome::MUTED));
             let field = ui.add(
                 egui::TextEdit::singleline(&mut self.query)
                     .frame(false)
                     .font(FontId::proportional(16.0))
                     .hint_text("Search in project…")
-                    .desired_width((ui.available_width() - 255.0).max(100.0)),
+                    .desired_width((ui.available_width() - 420.0).max(100.0)),
             );
             if self.search_focus {
                 field.request_focus();
@@ -1334,16 +1346,16 @@ impl Coder {
             let mut words = self.search_kind != SearchKind::Text;
             let words_changed = ui.checkbox(&mut words, "Whole words")
                 .on_hover_text("Match complete words: generate matches generate() and build-generate, but excludes generated and generate_keys.").changed();
-            if run || chrome::dialog_button(ui, "Search", Some(chrome::BLUE)).clicked() || words_changed {
-                self.search_rx = None;
-                self.start_search(
-                    if words {
-                        SearchKind::References
-                    } else {
-                        SearchKind::Text
-                    },
-                    false,
-                );
+            let tests_changed = ui.checkbox(&mut self.exclude_test_files, "Exclude test files")
+                .on_hover_text("Skip common test filenames and folders in project search and Cmd/Ctrl-click navigation. Turn off to include tests.")
+                .changed();
+            let kind = if words { SearchKind::References } else { SearchKind::Text };
+            if run || chrome::dialog_button(ui, "Search", Some(chrome::BLUE)).clicked() {
+                self.start_search(kind, false);
+            } else if words_changed {
+                self.run_search(kind, false);
+            } else if tests_changed {
+                self.run_search(self.search_kind, false);
             }
         });
         ui.separator();
@@ -4715,6 +4727,117 @@ mod tests {
         click(&mut app, position("Opened"));
         assert_eq!(app.result_scope, Scope::Project);
         assert_eq!(app.search_view.indices, vec![0, 1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn search_test_toggle_defaults_on_and_reruns_navigation_search() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let production = root.join("main.ts");
+        let test = root.join("main.test.ts");
+        for path in [&production, &test] {
+            std::fs::write(path, "function needle() {}\n")?;
+        }
+        let mut app = Coder::empty(root.clone());
+        assert!(app.exclude_test_files);
+        app.open(production.clone(), None);
+        // Cursor navigation and Cmd-click both start the shared search pipeline.
+        app.query = "needle".into();
+        app.start_search(SearchKind::References, false);
+        let collect = |app: &Coder| -> std::collections::BTreeSet<PathBuf> {
+            let rx = app.search_rx.as_ref().unwrap();
+            let mut paths = std::collections::BTreeSet::new();
+            loop {
+                match rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("search completed")
+                {
+                    SearchUpdate::OpenFiles(rows) | SearchUpdate::Project(rows) => {
+                        paths.extend(rows.into_iter().map(|row| row.path));
+                    }
+                    SearchUpdate::Finished { .. } => break,
+                    SearchUpdate::Failed(error) => panic!("{error}"),
+                }
+            }
+            paths
+        };
+        assert_eq!(collect(&app), [production.clone()].into());
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let mut time = 0.0;
+        let mut frame = |app: &mut Coder, events| {
+            time += 0.1;
+            ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.search_contents(ui, true));
+                },
+            )
+        };
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(t) if t.galley.text() == "Exclude test files" => {
+                    Some(t.pos + t.galley.size() / 2.0)
+                }
+                _ => None,
+            })
+            .expect("test filter checkbox");
+        for exclude in [false, true] {
+            let previous_cancel = app.search_cancel.clone();
+            for pressed in [true, false] {
+                frame(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert_eq!(app.exclude_test_files, exclude);
+            assert!(previous_cancel.load(Ordering::Relaxed));
+            assert_eq!(
+                collect(&app),
+                if exclude {
+                    [production.clone()].into()
+                } else {
+                    [production.clone(), test.clone()].into()
+                }
+            );
+        }
+        // Each new search restores exclusion, including cursor navigation and reopening Find.
+        app.documents[app.active].cursor = 10; // Inside `needle`.
+        for kind in [
+            SearchKind::Text,
+            SearchKind::References,
+            SearchKind::Definitions,
+        ] {
+            app.exclude_test_files = false;
+            app.start_search(kind, true);
+            assert!(app.exclude_test_files);
+            assert_eq!(collect(&app), [production.clone()].into());
+        }
+        app.exclude_test_files = false;
+        app.open_search();
+        assert!(app.exclude_test_files);
+        assert_eq!(collect(&app), [production.clone()].into());
         Ok(())
     }
 

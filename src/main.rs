@@ -17,6 +17,7 @@ mod preview;
 mod search_view;
 mod sheet;
 mod terminal;
+mod test_files;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

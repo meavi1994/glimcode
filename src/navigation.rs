@@ -434,6 +434,7 @@ pub fn search_workspace(
     root: &Path,
     query: &str,
     kind: SearchKind,
+    exclude_tests: bool,
     buffers: Vec<(PathBuf, String)>,
     priority_paths: Vec<PathBuf>,
     cancelled: Arc<AtomicBool>,
@@ -443,6 +444,7 @@ pub fn search_workspace(
         return;
     }
     let mut remaining = MAX_RESULTS;
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut excluded = std::collections::HashSet::new();
     for (path, snapshot) in buffers
         .into_iter()
@@ -452,7 +454,9 @@ pub fn search_workspace(
         if cancelled.load(Ordering::Relaxed) {
             return;
         }
-        if !excluded.insert(path.clone()) {
+        if !excluded.insert(path.clone())
+            || (exclude_tests && is_test_search_path(root, &canonical_root, &path))
+        {
             continue;
         }
         let source = match snapshot {
@@ -478,6 +482,7 @@ pub fn search_workspace(
         root,
         query,
         kind,
+        exclude_tests,
         &excluded,
         remaining,
         cancelled.clone(),
@@ -500,6 +505,7 @@ pub fn search(root: &Path, query: &str, kind: SearchKind) -> Result<SearchResult
         root,
         query,
         kind,
+        false,
         &Default::default(),
         MAX_RESULTS,
         Arc::new(AtomicBool::new(false)),
@@ -643,10 +649,20 @@ fn search_file(
     Ok(())
 }
 
+// Classify relative to the workspace, so a checkout named `tests` is not all tests.
+fn is_test_search_path(root: &Path, canonical_root: &Path, path: &Path) -> bool {
+    crate::test_files::is_test_file(
+        path.strip_prefix(root)
+            .or_else(|_| path.strip_prefix(canonical_root))
+            .unwrap_or(path),
+    )
+}
+
 fn search_stream(
     root: &Path,
     query: &str,
     kind: SearchKind,
+    exclude_tests: bool,
     excluded: &std::collections::HashSet<PathBuf>,
     limit: usize,
     cancelled: Arc<AtomicBool>,
@@ -690,6 +706,7 @@ fn search_stream(
         let stopped = &stopped;
         let cancelled = &*cancelled;
         let excluded = &excluded;
+        let canonical_root = &canonical_root;
         scope.spawn(move || {
             walk.run(|| {
                 let sender = sender.clone();
@@ -709,7 +726,9 @@ fn search_stream(
                             return Ok(());
                         }
                         let path = entry.path();
-                        if excluded.contains(path) {
+                        if excluded.contains(path)
+                            || (exclude_tests && is_test_search_path(root, canonical_root, path))
+                        {
                             return Ok(());
                         }
                         search_file(
@@ -808,6 +827,107 @@ pub fn token_at(text: &str, position: usize) -> Option<String> {
 mod tests {
     use super::*;
     #[test]
+    fn test_exclusion_covers_buffers_changed_files_and_project_for_all_search_kinds() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        // The checkout name itself must not cause production files to be excluded.
+        let root = dir.path().join("tests");
+        std::fs::create_dir_all(root.join("__tests__"))?;
+        let source = "function needle() { needle(); }\n";
+        let production = root.join("production.ts");
+        let opened = root.join("opened.test.ts");
+        let changed = root.join("changed.spec.js");
+        let project = root.join("__tests__/helper.ts");
+        let unsaved = root.join("unsaved.test.tsx");
+        for path in [&production, &opened, &changed, &project] {
+            std::fs::write(path, source)?;
+        }
+        for kind in [
+            SearchKind::Text,
+            SearchKind::References,
+            SearchKind::Definitions,
+        ] {
+            for exclude_tests in [true, false] {
+                let updates = std::cell::RefCell::new(vec![]);
+                search_workspace(
+                    &root,
+                    "needle",
+                    kind,
+                    exclude_tests,
+                    vec![
+                        (opened.clone(), source.into()),
+                        (unsaved.clone(), source.into()),
+                    ],
+                    vec![changed.clone(), opened.clone()],
+                    Arc::new(AtomicBool::new(false)),
+                    |update| updates.borrow_mut().push(update),
+                );
+                let updates = updates.into_inner();
+                assert!(matches!(
+                    updates.last(),
+                    Some(SearchUpdate::Finished { truncated: false })
+                ));
+                let found: std::collections::BTreeSet<_> = updates
+                    .into_iter()
+                    .flat_map(|update| match update {
+                        SearchUpdate::OpenFiles(rows) | SearchUpdate::Project(rows) => rows,
+                        _ => vec![],
+                    })
+                    .map(|row| row.path)
+                    .collect();
+                let expected = if exclude_tests {
+                    vec![production.clone()]
+                } else {
+                    vec![
+                        production.clone(),
+                        opened.clone(),
+                        changed.clone(),
+                        project.clone(),
+                        unsaved.clone(),
+                    ]
+                };
+                assert_eq!(found, expected.into_iter().collect());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn excluded_tests_cannot_exhaust_the_search_result_limit() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let test = dir.path().join("large.test.js");
+        let production = dir.path().join("production.js");
+        std::fs::write(&test, "needle\n".repeat(MAX_RESULTS + 1))?;
+        std::fs::write(&production, "needle\n")?;
+        let updates = std::cell::RefCell::new(vec![]);
+        search_workspace(
+            dir.path(),
+            "needle",
+            SearchKind::Text,
+            true,
+            vec![],
+            vec![test],
+            Arc::new(AtomicBool::new(false)),
+            |update| updates.borrow_mut().push(update),
+        );
+        let updates = updates.into_inner();
+        assert!(matches!(
+            updates.last(),
+            Some(SearchUpdate::Finished { truncated: false })
+        ));
+        let rows: Vec<_> = updates
+            .into_iter()
+            .flat_map(|update| match update {
+                SearchUpdate::OpenFiles(rows) | SearchUpdate::Project(rows) => rows,
+                _ => vec![],
+            })
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, production);
+        Ok(())
+    }
+
+    #[test]
     fn open_snapshots_arrive_first_and_replace_their_disk_results() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let open = dir.path().join("open.rs");
@@ -820,6 +940,7 @@ mod tests {
             dir.path(),
             "needle",
             SearchKind::References,
+            false,
             vec![(open.clone(), "fn needle() {} // unsaved\n".into())],
             vec![],
             Arc::new(AtomicBool::new(false)),
@@ -866,6 +987,7 @@ mod tests {
             &root,
             "needle",
             SearchKind::Text,
+            false,
             vec![(open.clone(), "// needle unsaved\n".into())],
             vec![
                 open.clone(),
@@ -993,6 +1115,7 @@ mod tests {
             dir.path(),
             "needle",
             SearchKind::Text,
+            false,
             &Default::default(),
             MAX_RESULTS,
             cancelled.clone(),
@@ -1059,6 +1182,7 @@ mod tests {
                 &root,
                 &query,
                 SearchKind::References,
+                false,
                 &[root.join("cmd/cloud-controller-manager/main.go")].into(),
                 MAX_RESULTS,
                 Arc::new(AtomicBool::new(false)),
@@ -1092,6 +1216,7 @@ mod tests {
             &alias,
             "needle",
             SearchKind::Text,
+            false,
             &[open.canonicalize()?].into(),
             MAX_RESULTS,
             Arc::new(AtomicBool::new(false)),
@@ -1108,6 +1233,7 @@ mod tests {
             Path::new("/does-not-exist"),
             "needle",
             SearchKind::Text,
+            false,
             vec![],
             vec![],
             Arc::new(AtomicBool::new(true)),

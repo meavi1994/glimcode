@@ -814,12 +814,63 @@ fn color(color: vt100::Color, default: Color32) -> Color32 {
         }
     }
 }
+/// Keep path and URL punctuation inside a word; quotes and shell separators bound it.
+fn terminal_word(screen: &vt100::Screen, point: (u16, u16)) -> Option<((u16, u16), (u16, u16))> {
+    let (rows, cols) = screen.size();
+    let is_word = |(row, col)| {
+        screen.cell(row, col).is_some_and(|cell| {
+            cell.is_wide_continuation()
+                || (!cell.contents().is_empty()
+                    && cell
+                        .contents()
+                        .chars()
+                        .all(|c| !c.is_whitespace() && !"\"'`()[]{}<>|;,".contains(c)))
+        })
+    };
+    if point.0 >= rows || point.1 >= cols || !is_word(point) {
+        return None;
+    }
+    let (mut start, mut end) = (point, point);
+    loop {
+        let previous = if start.1 > 0 {
+            (start.0, start.1 - 1)
+        } else if start.0 > 0 && screen.row_wrapped(start.0 - 1) {
+            (start.0 - 1, cols - 1)
+        } else {
+            break;
+        };
+        if !is_word(previous) {
+            break;
+        }
+        start = previous;
+    }
+    loop {
+        let next = if end.1 + 1 < cols {
+            (end.0, end.1 + 1)
+        } else if end.0 + 1 < rows && screen.row_wrapped(end.0) {
+            (end.0 + 1, 0)
+        } else {
+            break;
+        };
+        if !is_word(next) {
+            break;
+        }
+        end = next;
+    }
+    Some((start, end))
+}
+
 fn render(ui: &mut egui::Ui, tab: &mut Session, enabled: bool, focus: &mut bool, font_size: f32) {
     let id = egui::Id::new(("terminal-input", tab.id));
     let font = FontId::monospace(font_size);
     let cell = ui.fonts_mut(|f| egui::vec2(f.glyph_width(&font, 'M'), f.row_height(&font) + 2.0));
     let (_, rect) = ui.allocate_space(ui.available_size().max(egui::vec2(10.0, 30.0)));
-    let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+    let response = ui
+        .interact(rect, id, egui::Sense::click_and_drag())
+        .on_hover_cursor(egui::CursorIcon::Text);
+    if response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+    }
     let size = (
         (rect.height() / cell.y).floor().clamp(2.0, 200.0) as u16,
         (rect.width() / cell.x).floor().clamp(10.0, 500.0) as u16,
@@ -890,6 +941,12 @@ fn render(ui: &mut egui::Ui, tab: &mut Session, enabled: bool, focus: &mut bool,
                 .set_scrollback(offset.max(0) as usize);
             tab.selection = None;
         }
+    }
+    if enabled
+        && response.double_clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        tab.selection = terminal_word(state.parser.screen(), point(pos));
     }
     let mut outgoing = vec![];
     let mut copy = false;
@@ -1095,6 +1152,147 @@ fn render(ui: &mut egui::Ui, tab: &mut Session, enabled: bool, focus: &mut bool,
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn double_click_words_preserve_paths_colors_unicode_and_wrapped_lines() {
+        let path = "hack/apidiff-changelog/main.go";
+        let mut parser = vt100::Parser::new(8, 80, 20);
+        parser.process(format!("modified:  \x1b[31m\"{path}\"\x1b[0m other").as_bytes());
+        for col in 12..12 + path.len() as u16 {
+            let (start, end) = terminal_word(parser.screen(), (0, col)).unwrap();
+            assert_eq!(
+                parser
+                    .screen()
+                    .contents_between(start.0, start.1, end.0, end.1 + 1),
+                path
+            );
+        }
+        assert!(terminal_word(parser.screen(), (0, 10)).is_none());
+        assert!(terminal_word(parser.screen(), (0, 11)).is_none()); // Quote.
+        assert!(terminal_word(parser.screen(), (7, 0)).is_none()); // Empty cell.
+        let mut wrapped = vt100::Parser::new(8, 16, 20);
+        wrapped.process(path.as_bytes());
+        let (start, end) = terminal_word(wrapped.screen(), (1, 4)).unwrap();
+        assert_eq!(
+            wrapped
+                .screen()
+                .contents_between(start.0, start.1, end.0, end.1 + 1),
+            path
+        );
+        let mut unicode = vt100::Parser::new(8, 80, 20);
+        unicode.process("'/tmp/猫/file.rs'\r\nseparate".as_bytes());
+        // The second column of a wide glyph must select the same complete path.
+        let (start, end) = terminal_word(unicode.screen(), (0, 7)).unwrap();
+        assert_eq!(
+            unicode
+                .screen()
+                .contents_between(start.0, start.1, end.0, end.1 + 1),
+            "/tmp/猫/file.rs"
+        );
+        let (start, end) = terminal_word(unicode.screen(), (1, 3)).unwrap();
+        assert_eq!(
+            unicode
+                .screen()
+                .contents_between(start.0, start.1, end.0, end.1 + 1),
+            "separate"
+        );
+    }
+
+    #[test]
+    fn terminal_double_click_selects_path_copies_it_and_shows_text_cursor() {
+        let ctx = egui::Context::default();
+        let (tx, _rx) = mpsc::sync_channel(128);
+        let screen = Arc::new(Mutex::new(ScreenState::default()));
+        let path = "hack/apidiff-changelog/main.go";
+        screen
+            .lock()
+            .unwrap()
+            .parser
+            .process(format!("modified:  {path}\r\n").as_bytes());
+        let mut tab = Session {
+            id: 1,
+            root: "/project".into(),
+            shell: "/bin/sh".into(),
+            default_name: String::new(),
+            screen,
+            tx,
+            stopped: Arc::new(AtomicBool::new(false)),
+            killer: Arc::new(Mutex::new(None)),
+            size: (24, 80),
+            selection: None,
+            scroll_remainder: 0.0,
+        };
+        let mut focus = true;
+        let mut time = 0.0;
+        let mut frame = |tab: &mut Session, events| {
+            time += 0.08;
+            let mut point = egui::Pos2::ZERO;
+            let output = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 500.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let font = FontId::monospace(14.0);
+                        let cell = ui.fonts_mut(|f| {
+                            egui::vec2(f.glyph_width(&font, 'M'), f.row_height(&font) + 2.0)
+                        });
+                        point = ui.available_rect_before_wrap().min
+                            + egui::vec2(cell.x * 20.5, cell.y / 2.0);
+                        render(ui, tab, true, &mut focus, 14.0);
+                    });
+                },
+            );
+            (output, point)
+        };
+        frame(&mut tab, vec![]);
+        let (_, point) = frame(&mut tab, vec![]);
+        let (output, _) = frame(&mut tab, vec![egui::Event::PointerMoved(point)]);
+        assert_eq!(output.platform_output.cursor_icon, egui::CursorIcon::Text);
+        for _ in 0..2 {
+            for pressed in [true, false] {
+                frame(
+                    &mut tab,
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        }
+        assert_eq!(
+            tab.selection,
+            Some(((0, 11), (0, 11 + path.len() as u16 - 1)))
+        );
+        let (output, _) = frame(&mut tab, vec![egui::Event::Copy]);
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == path)
+        }));
+        // An ordinary click still clears selection.
+        for pressed in [true, false] {
+            frame(
+                &mut tab,
+                vec![egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                }],
+            );
+        }
+        assert!(tab.selection.is_none());
+    }
+
     fn wait_for(state: &Arc<Mutex<ScreenState>>, condition: impl Fn(&ScreenState) -> bool) {
         let start = std::time::Instant::now();
         loop {
