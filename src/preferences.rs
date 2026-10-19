@@ -6,6 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const DEFAULT_FONT_SIZE: f32 = 14.0;
+
 #[derive(Clone)]
 pub struct Settings {
     pub shell: String,
@@ -30,8 +32,8 @@ impl Default for Settings {
                     .into()
                 }),
             tab_name: String::new(),
-            editor_font_size: 13.0,
-            terminal_font_size: 13.0,
+            editor_font_size: DEFAULT_FONT_SIZE,
+            terminal_font_size: DEFAULT_FONT_SIZE,
         }
     }
 }
@@ -74,7 +76,7 @@ impl Settings {
                 .as_f64()
                 .filter(|n| n.is_finite())
                 .map(|n| n.clamp(8.0, 40.0) as f32)
-                .unwrap_or(13.0)
+                .unwrap_or(DEFAULT_FONT_SIZE)
         };
         Ok(Self {
             shell: value["shell"].as_str().unwrap_or(&defaults.shell).into(),
@@ -135,7 +137,7 @@ impl Settings {
 }
 pub fn editor_font_size(ctx: &egui::Context) -> f32 {
     ctx.data(|data| data.get_temp(egui::Id::new("editor-font-size")))
-        .unwrap_or(13.0)
+        .unwrap_or(DEFAULT_FONT_SIZE)
 }
 pub fn line_height(ctx: &egui::Context) -> f32 {
     20.0 * editor_font_size(ctx) / 13.0
@@ -176,7 +178,7 @@ mod tests {
         let mut settings = Settings::load_or_migrate(&path, Some(&old))?;
         assert_eq!(settings.shell, "/bin/sh");
         assert_eq!(settings.tab_name, "Local");
-        assert_eq!(settings.editor_font_size, 13.0);
+        assert_eq!(settings.editor_font_size, 14.0);
         assert!(path.is_file());
         assert!(old.is_file());
         settings.editor_font_size = 19.0;

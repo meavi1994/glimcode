@@ -106,7 +106,7 @@ This edits CSV/TSV data, with no XLSX workbook or formula-calculation support.
 
 ## Preferences
 
-Open **Settings → Preferences**. Set separate **Editor font size** and **Terminal font size** values (8–40 pt). Save applies font changes immediately to open editors, code previews, diffs and existing terminal sessions.
+Open **Settings → Preferences**. Set separate **Editor font size** and **Terminal font size** values (8–40 pt; both default to 14 pt). Save applies font changes immediately to open editors, code previews, diffs and existing terminal sessions.
 
 Font and terminal preferences are stored in `~/.coder/settings.json`, including `editor_font_size`, `terminal_font_size`, `shell` and `tab_name`. The file is created with defaults on first launch. Previous terminal preferences are migrated automatically when this file does not yet exist; the old file is retained. Additional JSON keys are preserved when saving. Manual changes are loaded on restart.
 
