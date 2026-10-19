@@ -200,6 +200,46 @@ pub fn mark_matches(job: &mut LayoutJob, query: &str) {
     job.sections = sections;
 }
 
+/// Folder rows reserve geometry for the icon instead of padding labels with spaces.
+pub fn folder_header<R>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    name: &str,
+    default_open: bool,
+    open: Option<bool>,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::Response {
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        default_open,
+    );
+    if let Some(open) = open {
+        state.set_open(open);
+    }
+    let mut clicked = false;
+    let mut header = state.show_header(ui, |ui| {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 23.0), egui::Sense::click());
+        let icon = egui::Rect::from_min_size(rect.min, egui::vec2(23.0, 23.0));
+        folder(ui.painter(), icon);
+        ui.painter().text(
+            egui::pos2(icon.right() + 6.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            name,
+            FontId::proportional(13.0),
+            TEXT,
+        );
+        clicked = response.clicked();
+        response
+    });
+    if clicked {
+        header.toggle();
+    }
+    let (_, header_response, _) = header.body(body);
+    header_response.inner
+}
+
 pub fn folder(painter: &egui::Painter, rect: egui::Rect) {
     let min = rect.min + egui::vec2(2.0, 5.0);
     let points = vec![
@@ -324,6 +364,47 @@ pub fn tree_button(ui: &mut egui::Ui, action: usize) -> egui::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn folder_labels_keep_a_fixed_gap_at_wide_sizes_and_display_scales() {
+        for scale in [1.0, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            let mut rect = egui::Rect::NOTHING;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(2560.0, 1440.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        rect = folder_header(
+                            ui,
+                            egui::Id::new("folder"),
+                            "nested folder",
+                            true,
+                            None,
+                            |_| {},
+                        )
+                        .rect;
+                    });
+                },
+            );
+            let label = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "nested folder" => Some(text),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(label.pos.x >= rect.left() + 29.0);
+            assert!(label.pos.x + label.galley.size().x < rect.right());
+        }
+    }
+
     #[test]
     fn selected_tab_remains_visible_when_the_tab_strip_narrows() {
         let ctx = egui::Context::default();

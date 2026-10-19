@@ -758,20 +758,17 @@ impl ChangeTree {
                         }
                     });
                 } else {
-                    let header = egui::CollapsingHeader::new(format!("        {name}"))
-                        .id_salt(("git-folder", &path))
-                        .default_open(true)
-                        .show(ui, |ui| {
+                    chrome::folder_header(
+                        ui,
+                        ui.make_persistent_id(("git-folder", &path)),
+                        &name,
+                        true,
+                        None,
+                        |ui| {
                             if let Some(path) = node.show(ui, files, &path) {
                                 selected = Some(path);
                             }
-                        });
-                    chrome::folder(
-                        ui.painter(),
-                        egui::Rect::from_min_size(
-                            header.header_response.rect.min + egui::vec2(18.0, -1.0),
-                            egui::vec2(23.0, 23.0),
-                        ),
+                        },
                     );
                 }
             }
@@ -862,19 +859,7 @@ fn split_rows(rows: &[diff::Row], visible: &[ReviewRow]) -> Vec<SplitRow> {
 }
 
 fn change_targets(rows: &[diff::Row]) -> Vec<usize> {
-    let mut targets = Vec::new();
-    let mut pending = false;
-    for row in review_rows(rows, false) {
-        match row {
-            ReviewRow::Hunk(_) => pending = true,
-            ReviewRow::Line(index) if pending && rows[index].changed => {
-                targets.push(index);
-                pending = false;
-            }
-            _ => {}
-        }
-    }
-    targets
+    diff::hunk_targets(rows)
 }
 
 // Navigate from the viewport, so scrolling away never strands the selected hunk.

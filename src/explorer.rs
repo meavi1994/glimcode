@@ -200,42 +200,34 @@ impl FileTree {
                     }
                 } else {
                     let open_override = child.open_override.take();
-                    let header =
-                        egui::CollapsingHeader::new(format!("        {}", name.to_string_lossy()))
-                            .id_salt(&path)
-                            .default_open(active.is_some_and(|active| active.starts_with(&path)))
-                            .open(
-                                if !filter.is_empty()
-                                    || (reveal
-                                        && active.is_some_and(|file| file.starts_with(&path)))
-                                {
-                                    Some(true)
-                                } else {
-                                    open_override
-                                },
-                            )
-                            .show(ui, |ui| {
-                                if let Some(file) =
-                                    child.show_children(ui, root, &path, active, filter, reveal)
-                                {
-                                    opened = Some(file);
-                                }
-                            });
+                    let header_response = crate::chrome::folder_header(
+                        ui,
+                        ui.make_persistent_id(&path),
+                        &name.to_string_lossy(),
+                        active.is_some_and(|active| active.starts_with(&path)),
+                        if !filter.is_empty()
+                            || (reveal && active.is_some_and(|file| file.starts_with(&path)))
+                        {
+                            Some(true)
+                        } else {
+                            open_override
+                        },
+                        |ui| {
+                            if let Some(file) =
+                                child.show_children(ui, root, &path, active, filter, reveal)
+                            {
+                                opened = Some(file);
+                            }
+                        },
+                    );
                     if let Some(action) = child.action.take() {
                         self.action = Some(action);
                     }
-                    header.header_response.context_menu(|ui| {
+                    header_response.context_menu(|ui| {
                         if let Some(action) = context_menu(ui, root, &path, true) {
                             self.action = Some(action);
                         }
                     });
-                    crate::chrome::folder(
-                        ui.painter(),
-                        egui::Rect::from_min_size(
-                            header.header_response.rect.min + egui::vec2(18.0, -1.0),
-                            egui::vec2(23.0, 23.0),
-                        ),
-                    );
                 }
             }
         }

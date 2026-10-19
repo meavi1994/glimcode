@@ -1992,6 +1992,17 @@ impl Coder {
                     }
                     self.actions.push(FrameAction::Reload(self.active));
                 }
+                if let Some(data) = git_data.as_deref()
+                    && let Content::Text(text) = &doc.content
+                {
+                    let line = text.chars().take(doc.cursor).filter(|ch| *ch == '\n').count();
+                    if let Some(target) = editor_diff_navigation(ui, &data.change_lines, line) {
+                        doc.jump = Some((target + 1, 1));
+                        if doc.markdown == MarkdownMode::Preview {
+                            doc.markdown = MarkdownMode::Edit;
+                        }
+                    }
+                }
                 let mut csv_mode = None;
                 if doc.is_csv() {
                     let source = doc.csv_is_source();
@@ -3018,6 +3029,49 @@ fn file_toolbar(
     actions
 }
 
+fn editor_diff_target(targets: &[usize], line: usize, next: bool) -> Option<usize> {
+    if next {
+        targets
+            .iter()
+            .copied()
+            .find(|target| *target > line)
+            .or_else(|| targets.last().copied())
+    } else {
+        targets
+            .iter()
+            .copied()
+            .rev()
+            .find(|target| *target < line)
+            .or_else(|| targets.first().copied())
+    }
+}
+
+fn editor_diff_navigation(ui: &mut egui::Ui, targets: &[usize], line: usize) -> Option<usize> {
+    if targets.is_empty() {
+        return None;
+    }
+    let mut target = None;
+    egui::Frame::new()
+        .fill(chrome::TABS)
+        .inner_margin(egui::Margin::symmetric(10, 3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for (label, next) in [("↑ Previous", false), ("↓ Next", true)] {
+                    if ui
+                        .add(egui::Button::new(label).small())
+                        .on_hover_text("Jump to a changed hunk against the branch base")
+                        .clicked()
+                    {
+                        target = editor_diff_target(targets, line, next);
+                    }
+                }
+                let current = targets.partition_point(|target| *target <= line);
+                ui.weak(format!("{} / {} hunks", current, targets.len()));
+            });
+        });
+    target
+}
+
 fn file_breadcrumb(ui: &mut egui::Ui, path: &Path, root: &Path, width: f32) -> bool {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
     let relative = path.strip_prefix(root).unwrap_or(path);
@@ -4034,6 +4088,66 @@ mod tests {
     use super::*;
     use crate::search_view::{extension, result_visible};
     #[test]
+    fn editor_diff_buttons_navigate_from_the_caret_and_clamp_at_boundaries() {
+        let targets = [2, 20, 45];
+        for (line, next, expected) in [
+            (0, true, 2),
+            (2, true, 20),
+            (30, true, 45),
+            (99, true, 45),
+            (99, false, 45),
+            (45, false, 20),
+            (10, false, 2),
+            (0, false, 2),
+        ] {
+            assert_eq!(editor_diff_target(&targets, line, next), Some(expected));
+        }
+        assert_eq!(editor_diff_target(&[], 0, true), None);
+        let ctx = egui::Context::default();
+        let frame = |events| {
+            let mut target = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        target = editor_diff_navigation(ui, &targets, 2);
+                    });
+                },
+            );
+            (output, target)
+        };
+        frame(vec![]);
+        let (output, _) = frame(vec![]);
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "↓ Next" => {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                _ => None,
+            })
+            .unwrap();
+        for pressed in [true, false] {
+            let (_, target) = frame(vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            if !pressed {
+                assert_eq!(target, Some(20));
+            }
+        }
+    }
+
+    #[test]
     fn file_toolbar_fits_narrow_views_and_keeps_reload_and_blame_actions_separate() {
         let ctx = egui::Context::default();
         chrome::install(&ctx);
@@ -4156,6 +4270,7 @@ mod tests {
             path: "sample.rs".into(),
             base: source.clone(),
             text: source.clone(),
+            change_lines: vec![],
             marks: vec![],
             blame: vec![entry; 71],
             blame_note: None,
@@ -5518,6 +5633,7 @@ mod tests {
             path: "sample.rs".into(),
             base: String::new(),
             text: source.into(),
+            change_lines: vec![1],
             marks: vec![(1, crate::git::Mark::Added)],
             blame: vec![entry.clone(); 3],
             blame_note: None,

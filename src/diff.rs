@@ -82,9 +82,57 @@ pub fn compare(disk: &str, editor: &str) -> Vec<Row> {
     rows
 }
 
+/// First changed row in each hunk with three lines of surrounding context.
+pub fn hunk_targets(rows: &[Row]) -> Vec<usize> {
+    let mut targets = Vec::new();
+    let mut previous = None;
+    for (index, _) in rows.iter().enumerate().filter(|(_, row)| row.changed) {
+        if previous.is_none_or(|last| index > last + 7) {
+            targets.push(index);
+        }
+        previous = Some(index);
+    }
+    targets
+}
+
+pub fn change_lines(base: &str, current: &str) -> Vec<usize> {
+    let rows = compare(base, current);
+    let targets = hunk_targets(&rows);
+    let last_line = current.split('\n').count().saturating_sub(1);
+    targets
+        .into_iter()
+        .map(|index| {
+            // Deletions anchor to the next surviving line, including the empty EOF line.
+            rows[index..]
+                .iter()
+                .find_map(|row| row.editor)
+                .unwrap_or(last_line)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hunk_lines_group_context_and_anchor_deletions_in_the_editor() {
+        let before = (0..30).map(|i| format!("line {i}\n")).collect::<String>();
+        let after = before
+            .replace("line 2\n", "猫\n")
+            .replace("line 20\n", "new\n");
+        assert_eq!(change_lines(&before, &after), vec![2, 20]);
+        let nearby = before
+            .replace("line 2\n", "猫\n")
+            .replace("line 6\n", "new\n");
+        assert_eq!(change_lines(&before, &nearby), vec![2]);
+        assert_eq!(change_lines("a\nb\nc\n", "a\nc\n"), vec![1]);
+        assert_eq!(change_lines("a\nb", "a"), vec![0]);
+        assert_eq!(change_lines("a\nb\n", "a\n"), vec![1]);
+        assert_eq!(change_lines("a", ""), vec![0]);
+        assert_eq!(change_lines("", "猫\n"), vec![0]);
+        assert!(change_lines(&before, &before).is_empty());
+    }
+
     #[test]
     fn changes_align_and_preserve_unicode_and_newlines() {
         let rows = compare("α\nb\nc\n", "α\nnew\nb\nc");

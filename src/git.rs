@@ -65,6 +65,7 @@ pub struct FileData {
     pub base: String,
     pub text: String,
     pub marks: Vec<(usize, Mark)>,
+    pub change_lines: Vec<usize>,
     pub blame: Vec<BlameLine>,
     pub blame_note: Option<String>,
 }
@@ -472,11 +473,13 @@ pub fn file_data(
     } else {
         (vec![], None)
     };
+    let change_lines = crate::diff::change_lines(&base, &current);
     Ok(FileData {
         path: path.to_path_buf(),
         base,
         text: current,
         marks,
+        change_lines,
         blame,
         blame_note,
     })
