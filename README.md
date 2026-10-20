@@ -30,6 +30,8 @@ If an AI agent handles much of your typing, you still need to find the right fil
 
 Search uses the official `grep` library and `ignore` walker directly, with up to four background search workers, bounded result queues, and cancellation. It does not launch an external search process or parse command-line JSON output.
 
+Result rows in **Find in Files** are syntax colored: every file behind the visible rows is highlighted once on a background worker, and each row shows the colors of the line it came from with the match marked. The editor keeps only one copy of a document in its own memory, the undo history of a large file is capped, and the files behind a click are read within a fixed byte budget, so a search or a jump does not grow the footprint without limit.
+
 The architecture is designed to keep memory overhead low. **We do not yet publish a measured RAM comparison with IntelliJ or a fixed memory-usage promise.** Usage depends on project size, open files, terminal sessions, and workload. Reproducible performance measurements and improvements are welcome.
 
 ## Built for the work around AI-generated code
@@ -48,6 +50,8 @@ Use your preferred AI coding tool alongside Glimcode, or run a CLI tool in the i
 ### Code navigation and highlighting
 
 Tree-sitter navigation supports **Java, Kotlin, Go, Rust, Python, JavaScript/JSX, and TypeScript/TSX**. Syntax highlighting combines parser-based rules with Syntect’s bundled language definitions. Search can be narrowed to declarations, usages, strings, comments, imports, file extensions, open files, or the current file.
+
+Result rows in **Find in Files** carry the syntax colors of the file they come from, so a hit reads as code instead of as plain text. Cmd-click ranks the candidates: the same file and scope come first, then the type you are calling through, then imports and package, and never a mention inside a comment or a string.
 
 Definition jumps are syntax candidates and usages are text matches. Glimcode currently does **not** provide type-aware symbol resolution, code completion, semantic refactoring, debugging, or compiler diagnostics. Choose it for reading, navigating, editing, and reviewing code; use a full language IDE when you need those deeper capabilities.
 

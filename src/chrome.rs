@@ -143,6 +143,64 @@ pub fn highlighted(text: &str, query: &str, size: f32) -> LayoutJob {
     job
 }
 
+/// Drop the leading whitespace of a job, keeping the section ranges aligned
+/// with the shortened text.
+pub fn trim_start(job: &mut LayoutJob) {
+    let start = job.text.len() - job.text.trim_start().len();
+    if start == 0 {
+        return;
+    }
+    job.text = job.text[start..].to_owned();
+    job.sections
+        .retain(|section| section.byte_range.end > start);
+    for section in &mut job.sections {
+        section.byte_range.start = section.byte_range.start.saturating_sub(start);
+        section.byte_range.end = section.byte_range.end.saturating_sub(start);
+    }
+}
+
+/// A lowercased search term, prepared once and matched without allocating.
+///
+/// The explorer and the grid ask the same question for every row, so the
+/// term is lowered once instead of once per row.
+#[derive(Clone, Default)]
+pub struct CaseFilter {
+    needle: Vec<char>,
+}
+
+impl CaseFilter {
+    pub fn new(needle: &str) -> Self {
+        Self {
+            needle: needle.chars().flat_map(char::to_lowercase).collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.needle.is_empty()
+    }
+
+    /// Whether the text contains the term, ignoring case.
+    pub fn matches(&self, text: &str) -> bool {
+        let needle = &self.needle;
+        if needle.is_empty() {
+            return true;
+        }
+        let mut index = 0;
+        for character in text.chars().flat_map(char::to_lowercase) {
+            if character == needle[index] {
+                index += 1;
+                if index == needle.len() {
+                    return true;
+                }
+            } else {
+                // The match can start again on this character.
+                index = usize::from(character == needle[0]);
+            }
+        }
+        false
+    }
+}
+
 pub fn popup_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(Color32::from_rgb(39, 41, 46))
@@ -241,6 +299,10 @@ pub fn folder_header<R>(
 }
 
 pub fn folder(painter: &egui::Painter, rect: egui::Rect) {
+    folder_colored(painter, rect, TEXT);
+}
+
+pub fn folder_colored(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     let min = rect.min + egui::vec2(2.0, 5.0);
     let points = vec![
         min,
@@ -251,7 +313,7 @@ pub fn folder(painter: &egui::Painter, rect: egui::Rect) {
         min + egui::vec2(0.0, 14.0),
         min,
     ];
-    painter.add(egui::Shape::line(points, Stroke::new(1.3_f32, TEXT)));
+    painter.add(egui::Shape::line(points, Stroke::new(1.3_f32, color)));
 }
 
 pub fn tool_button(ui: &mut egui::Ui, tool: u8, active: bool) -> egui::Response {

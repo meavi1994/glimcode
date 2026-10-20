@@ -54,6 +54,9 @@ pub struct GitTool {
     pub visible: bool,
     pub show_blame: bool,
     pub repo: Option<Repository>,
+    /// Bumped whenever the repository is replaced, so caches that depend on
+    /// the changed files can be dropped.
+    pub generation: u64,
     pub note: Option<String>,
     pub file_note: Option<String>,
     project: PathBuf,
@@ -126,6 +129,7 @@ impl GitTool {
                     }
                     self.selected_base = Some(repo.base.clone());
                     self.repo = Some(repo);
+                    self.generation = self.generation.wrapping_add(1);
                     self.note = None;
                 }
                 Err(error) => self.note = Some(error),
@@ -555,6 +559,9 @@ impl GitTool {
                 });
             if close {
                 self.review_open = false;
+                // The review holds two copies of the compared files, so they
+                // are released when the window closes.
+                self.review = None;
             }
         }
         if self.detail_open {

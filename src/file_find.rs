@@ -7,6 +7,8 @@ use std::{
 pub struct FileFind {
     path: PathBuf,
     query: String,
+    /// Fingerprint of the text the matches were found in.
+    fingerprint: u64,
     pub matches: Vec<Range<usize>>,
     pub current: Option<usize>,
 }
@@ -14,6 +16,12 @@ pub struct FileFind {
 impl FileFind {
     /// Match offsets are bytes; the editor converts to character offsets at its boundary.
     pub fn refresh(&mut self, path: &Path, text: &str, query: &str, caret: usize) -> bool {
+        let fingerprint = eframe::egui::util::hash(text);
+        let reset = self.path != path || self.query != query;
+        if !reset && self.fingerprint == fingerprint {
+            // The text and the query are unchanged, so the matches still hold.
+            return false;
+        }
         let matches: Vec<_> = if query.is_empty() {
             vec![]
         } else {
@@ -21,7 +29,6 @@ impl FileFind {
                 .map(|(start, _)| start..start + query.len())
                 .collect()
         };
-        let reset = self.path != path || self.query != query;
         let previous = self.active().cloned();
         if reset || self.matches != matches {
             self.path = path.to_path_buf();
@@ -35,6 +42,7 @@ impl FileFind {
                 .then(|| matches.iter().position(|r| r.start >= anchor).unwrap_or(0));
             self.matches = matches;
         }
+        self.fingerprint = fingerprint;
         reset || previous != self.active().cloned()
     }
 

@@ -12,15 +12,18 @@ use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, LinkType, Ta
 #[derive(Default)]
 pub struct MarkdownCache {
     pub native: CommonMarkCache,
-    source: Option<String>,
+    /// Fingerprint of the parsed source. The source itself is not kept, so
+    /// the document is not held twice.
+    fingerprint: u64,
     pub events: Vec<Event<'static>>,
 }
 
 impl MarkdownCache {
     pub fn prepare(&mut self, source: &str) {
-        if self.source.as_deref() != Some(source) {
+        let fingerprint = eframe::egui::util::hash(source);
+        if fingerprint != self.fingerprint {
             self.events = parse(source);
-            self.source = Some(source.to_owned());
+            self.fingerprint = fingerprint;
         }
     }
 }

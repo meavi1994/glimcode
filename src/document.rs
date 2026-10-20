@@ -42,9 +42,40 @@ pub struct Document {
     pub cursor: usize,
     pub jump: Option<(usize, usize)>,
     pub editor_id: Option<eframe::egui::Id>,
+    /// The line ending of the file, shown in the status bar.
+    pub line_ending: &'static str,
     pub(crate) original: String,
-    disk_source: Option<String>,
+    /// Bumped whenever the text changes, so the cached cursor position is
+    /// refreshed.
+    revision: u64,
+    /// Cached line and column of the cursor: (revision, cursor, line, column).
+    cursor_position: std::cell::Cell<Option<(u64, usize, usize, usize)>>,
+    /// Fingerprint of the file on disk, used to skip needless reads.
+    disk_stamp: Option<DiskStamp>,
+    /// Hash of the file on disk. The text itself is not kept, so an open
+    /// document holds one copy less.
+    disk_hash: Option<u64>,
     disk_checked: Instant,
+}
+
+/// Cheap fingerprint of a file: its size and modification time.
+type DiskStamp = (u64, u64);
+
+fn content_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn disk_stamp(path: &Path) -> Option<DiskStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let nanos = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as u64;
+    Some((nanos, meta.len()))
 }
 
 impl Document {
@@ -57,6 +88,7 @@ impl Document {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_lowercase();
+        let source_path = path.clone();
         let content = match extension.as_str() {
             "csv" => Content::Csv(Box::new(Sheet::parse(
                 &source,
@@ -95,7 +127,15 @@ impl Document {
             cursor: 0,
             jump: None,
             editor_id: None,
-            disk_source: Some(source.clone()),
+            line_ending: if source.contains("\r\n") {
+                "CRLF"
+            } else {
+                "LF"
+            },
+            revision: 0,
+            cursor_position: std::cell::Cell::new(None),
+            disk_stamp: disk_stamp(&source_path),
+            disk_hash: Some(content_hash(&source)),
             disk_checked: Instant::now(),
             original: source,
         })
@@ -143,20 +183,63 @@ impl Document {
         }
     }
 
+    /// Note that the text changed, so cached positions are dropped.
+    pub fn mark_changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// The one-based line and column of the cursor.
+    ///
+    /// The result is cached, because the status bar asks for it every frame
+    /// and walking the document is expensive in a large file.
+    pub fn cursor_line_column(&self, cursor: usize) -> (usize, usize) {
+        let Content::Text(text) = &self.content else {
+            return (1, 1);
+        };
+        if let Some((revision, cached, line, column)) = self.cursor_position.get()
+            && revision == self.revision
+            && cached == cursor
+        {
+            return (line, column);
+        }
+        let byte = text
+            .char_indices()
+            .nth(cursor)
+            .map_or(text.len(), |(byte, _)| byte);
+        let prefix = &text[..byte];
+        let line = prefix.bytes().filter(|&byte| byte == b'\n').count() + 1;
+        let column = prefix.rsplit('\n').next().unwrap_or("").len() + 1;
+        self.cursor_position
+            .set(Some((self.revision, cursor, line, column)));
+        (line, column)
+    }
+
+    /// Whether the file on disk changed since it was opened or saved.
+    ///
+    /// The file is only read again when its size or modification time moved,
+    /// so an idle editor does not re-read the same file twice a second.
     pub fn can_reload(&mut self) -> bool {
         if self.disk_checked.elapsed() >= Duration::from_millis(500) {
-            self.disk_source = navigation::read_text(&self.path).ok();
             self.disk_checked = Instant::now();
+            let stamp = disk_stamp(&self.path);
+            if stamp != self.disk_stamp {
+                self.disk_stamp = stamp;
+                self.disk_hash = navigation::read_text(&self.path)
+                    .ok()
+                    .map(|text| content_hash(&text));
+            }
         }
-        let Some(disk) = &self.disk_source else {
+        let Some(disk) = self.disk_hash else {
             return false;
         };
         if !self.dirty {
-            return self.original != *disk;
+            return content_hash(&self.original) != disk;
         }
         match &self.content {
-            Content::Text(text) => text != disk,
-            Content::Csv(_) => self.source_text().is_ok_and(|text| text != *disk),
+            Content::Text(text) => content_hash(text) != disk,
+            Content::Csv(_) => self
+                .source_text()
+                .is_ok_and(|text| content_hash(&text) != disk),
         }
     }
 
@@ -231,7 +314,8 @@ impl Document {
         }
         let text = self.source_text()?;
         atomic_write(&self.path, text.as_bytes())?;
-        self.disk_source = Some(text.clone());
+        self.disk_stamp = disk_stamp(&self.path);
+        self.disk_hash = Some(content_hash(&text));
         self.disk_checked = Instant::now();
         self.original = text;
         self.dirty = false;
@@ -252,6 +336,56 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_status_bar_reports_the_line_ending_of_the_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let crlf = dir.path().join("crlf.txt");
+        std::fs::write(&crlf, "one\r\ntwo\r\n")?;
+        assert_eq!(Document::open(crlf, true)?.line_ending, "CRLF");
+        let lf = dir.path().join("lf.txt");
+        std::fs::write(&lf, "one\ntwo\n")?;
+        assert_eq!(Document::open(lf, true)?.line_ending, "LF");
+        Ok(())
+    }
+
+    #[test]
+    fn the_cursor_position_follows_the_text_and_its_changes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("lines.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n")?;
+        let mut doc = Document::open(path, true)?;
+        // The cursor sits in front of "three".
+        let cursor = "one\ntwo\n".chars().count();
+        assert_eq!(doc.cursor_line_column(cursor), (3, 1));
+        // The same answer comes from the cache.
+        assert_eq!(doc.cursor_line_column(cursor), (3, 1));
+        assert_eq!(doc.cursor_line_column(0), (1, 1));
+        // A change in front of the cursor moves it.
+        if let Content::Text(text) = &mut doc.content {
+            text.insert_str(0, "zero\n");
+        }
+        doc.mark_changed();
+        // The cursor index still points at the same offset in the text.
+        assert_eq!(doc.cursor_line_column(cursor), (2, 4));
+        // When the cursor moves along with the text, the line follows.
+        assert_eq!(doc.cursor_line_column(cursor + 5), (4, 1));
+        Ok(())
+    }
+
+    #[test]
+    fn the_file_on_disk_is_only_read_again_when_it_changed() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("watched.txt");
+        std::fs::write(&path, "one\n")?;
+        let mut doc = Document::open(path.clone(), true)?;
+        assert!(!doc.can_reload());
+        std::fs::write(&path, "two\n")?;
+        // The file is polled at most twice a second.
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(doc.can_reload());
+        Ok(())
+    }
+
     #[test]
     fn large_file_open_defers_outline_and_discards_results_for_edited_buffers() -> Result<()> {
         let dir = tempfile::tempdir()?;

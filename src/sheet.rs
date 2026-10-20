@@ -696,10 +696,10 @@ impl RowViewer<Row> for Viewer {
                                 selection = Some(BTreeSet::new());
                             }
                         });
-                        let search = self.value_search[column].to_lowercase();
+                        let search = crate::chrome::CaseFilter::new(&self.value_search[column]);
                         let matching: Vec<_> = self.unique_values[column]
                             .iter()
-                            .filter(|(value, _)| value.to_lowercase().contains(&search))
+                            .filter(|(value, _)| search.matches(value))
                             .collect();
                         if matching.is_empty() {
                             ui.weak("No matching values");

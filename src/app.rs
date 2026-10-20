@@ -3,6 +3,7 @@ use crate::{
     chrome,
     document::{Content, Document, MarkdownMode},
     navigation::{self, Location, SearchKind, SearchUpdate},
+    ranking,
 };
 use eframe::egui::{self, Align, Color32, FontId, Key, RichText};
 use egui_commonmark::CommonMarkViewer;
@@ -41,6 +42,65 @@ enum Picker {
     Recent,
     Line,
 }
+
+/// What a click most likely means, inferred from what was clicked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Intent {
+    /// The click landed on a declaration: the user wants to see its usages.
+    Usages,
+    /// The click landed on a usage or an import: the user wants the
+    /// declaration.
+    Declarations,
+    /// The click landed on prose or an unclassified spot: show every match.
+    Everything,
+}
+
+impl Intent {
+    /// The results tab that answers this intent.
+    fn category(self) -> Option<navigation::MatchCategory> {
+        match self {
+            Intent::Usages => Some(navigation::MatchCategory::Usage),
+            Intent::Declarations => Some(navigation::MatchCategory::Declaration),
+            Intent::Everything => None,
+        }
+    }
+
+    /// Infer the intent from the syntactic role of the clicked occurrence.
+    fn for_category(category: navigation::MatchCategory) -> Self {
+        match category {
+            navigation::MatchCategory::Declaration => Intent::Usages,
+            navigation::MatchCategory::Usage | navigation::MatchCategory::Import => {
+                Intent::Declarations
+            }
+            _ => Intent::Everything,
+        }
+    }
+}
+
+/// A click that is waiting for its search results.
+struct PendingClick {
+    token: String,
+    intent: Intent,
+    /// Present when the click could be analysed; used to rank candidates.
+    context: Option<ranking::ClickContext>,
+}
+
+/// Ranking of the candidates of a click. It runs on a worker because it reads
+/// candidate files; the ordering it produces is deterministic and local.
+struct FocusSearch {
+    rx: Receiver<Vec<ranking::Ranked>>,
+    cancel: Arc<AtomicBool>,
+    token: String,
+}
+
+#[derive(Clone, Debug)]
+struct TextClick {
+    char_index: usize,
+    token: String,
+}
+
+/// How many navigation steps are remembered.
+const MAX_HISTORY: usize = 200;
 
 pub struct Coder {
     root: PathBuf,
@@ -98,6 +158,14 @@ pub struct Coder {
     result_selection: usize,
     search_focus: bool,
     preview: crate::preview::PreviewService,
+    search_highlight: crate::search_highlight::SearchHighlight,
+    /// Set when a dialog closes, so the editor takes the keyboard back.
+    focus_editor: bool,
+    /// Colors of the changed files, kept until the repository changes.
+    git_colors: (u64, Arc<std::collections::BTreeMap<PathBuf, Color32>>),
+    goto: Option<FocusSearch>,
+    pending_click: Option<PendingClick>,
+    pending_reveal: bool,
     file_action: Option<crate::explorer::FileAction>,
     file_action_name: String,
     file_action_focus: bool,
@@ -307,7 +375,14 @@ impl Coder {
                 }
             } else if mode == "files" {
                 app.show_picker(Picker::Files);
-                app.picker_query = "nav".into();
+                app.picker_query =
+                    std::env::var("GLIMCODE_PREVIEW_QUERY").unwrap_or_else(|_| "nav".into());
+                if let Ok(size) = std::env::var("GLIMCODE_PREVIEW_DIALOG_FONT_SIZE")
+                    && let Ok(size) = size.parse::<f32>()
+                {
+                    app.terminal.settings.dialog_font_size = size;
+                    app.terminal.settings.apply(&cc.egui_ctx);
+                }
             }
         }
         app
@@ -370,6 +445,12 @@ impl Coder {
             result_selection: 0,
             search_focus: false,
             preview: Default::default(),
+            search_highlight: Default::default(),
+            focus_editor: false,
+            git_colors: (0, Arc::new(std::collections::BTreeMap::new())),
+            goto: None,
+            pending_click: None,
+            pending_reveal: false,
             file_action: None,
             file_action_name: String::new(),
             file_action_focus: false,
@@ -418,6 +499,10 @@ impl Coder {
         self.file_find = Default::default();
         self.replacement.clear();
         self.picker = None;
+        self.pending_click = None;
+        if let Some(goto) = self.goto.take() {
+            goto.cancel.store(true, Ordering::Relaxed);
+        }
         self.file_action = None;
         self.git = Default::default();
         self.status = "Project opened".into();
@@ -463,19 +548,15 @@ impl Coder {
 
     fn current_location(&self) -> Option<Location> {
         let doc = self.documents.get(self.active)?;
-        let Content::Text(text) = &doc.content else {
+        let Content::Text(_) = &doc.content else {
             return None;
         };
-        let byte = text
-            .char_indices()
-            .nth(doc.cursor)
-            .map_or(text.len(), |(b, _)| b);
-        let prefix = &text[..byte];
+        let (line, column) = doc.cursor_line_column(doc.cursor);
         Some(Location {
             category: navigation::MatchCategory::Other,
             path: doc.path.clone(),
-            line: prefix.bytes().filter(|&b| b == b'\n').count() + 1,
-            column: prefix.rsplit('\n').next().unwrap_or("").len() + 1,
+            line,
+            column,
             preview: String::new(),
         })
     }
@@ -483,6 +564,11 @@ impl Coder {
     fn navigate(&mut self, location: Location) {
         if let Some(current) = self.current_location() {
             self.history.push(current);
+            // The history is a convenience, not a log: it never grows without
+            // bound during a session.
+            if self.history.len() > MAX_HISTORY {
+                self.history.remove(0);
+            }
         }
         self.open(location.path, Some((location.line, location.column)));
     }
@@ -504,10 +590,16 @@ impl Coder {
         }
     }
 
-    fn close(&mut self, index: usize) {
+    fn close(&mut self, index: usize, ctx: &egui::Context) {
         if self.defer_actions {
             self.queue_action(FrameAction::Close(index));
             return;
+        }
+        // egui keeps a full copy of the text for every undo point in the
+        // persisted editor state. Releasing it here keeps a closed tab from
+        // holding on to its whole history.
+        if let Some(id) = self.documents.get(index).and_then(|doc| doc.editor_id) {
+            release_editor_state(ctx, id);
         }
         self.documents.remove(index);
         if self.active > index {
@@ -586,7 +678,10 @@ impl Coder {
         self.picker = None;
         self.result_selection = 0;
         self.preview.clear();
+        self.search_highlight.clear();
         self.selected_category = None;
+        // A manual search replaces any pending click.
+        self.pending_click = None;
         self.extension_filter = None;
         self.results.clear();
         self.results_revision += 1;
@@ -604,7 +699,7 @@ impl Coder {
                 };
                 (doc.path.clone(), source)
             })
-            .collect();
+            .collect::<Vec<_>>();
         let mut priority_paths = self.opened_search_paths();
         let git_known = self.git.repo.is_some();
         let exclude_tests = self.exclude_test_files;
@@ -624,7 +719,7 @@ impl Coder {
                 &query,
                 kind,
                 exclude_tests,
-                buffers,
+                &buffers,
                 priority_paths,
                 cancelled,
                 |update| {
@@ -636,6 +731,7 @@ impl Coder {
 
     fn poll(&mut self, ctx: &egui::Context) {
         self.git.poll(&self.root, ctx);
+        self.search_highlight.poll();
         if let Some(rx) = &self.files_rx
             && let Ok(result) = rx.try_recv()
         {
@@ -702,14 +798,226 @@ impl Coder {
                     self.search_open = false;
                 }
             }
+            self.resolve_pending_click();
         }
         self.preview.poll();
         for doc in &mut self.documents {
             doc.poll_outline(ctx);
         }
-        if self.files_rx.is_some() || self.search_rx.is_some() || self.preview.loading() {
+        self.poll_focus();
+        if self.files_rx.is_some()
+            || self.search_rx.is_some()
+            || self.goto.is_some()
+            || self.preview.loading()
+        {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
+    }
+
+    /// The ranking of a click runs on a worker. When it finishes, the best
+    /// candidate is focused in the results list.
+    fn poll_focus(&mut self) {
+        let Some(search) = &self.goto else {
+            return;
+        };
+        let token = search.token.clone();
+        match search.rx.try_recv() {
+            Ok(ranked) => {
+                self.goto = None;
+                let Some(best) = ranked.first() else {
+                    return;
+                };
+                self.search_view.refresh(
+                    &self.results,
+                    self.results_revision,
+                    self.selected_category,
+                    self.extension_filter.as_deref(),
+                );
+                if let Some(index) = self.search_view.indices.iter().position(|index| {
+                    let location = &self.results[*index];
+                    location.path == best.location.path
+                        && location.line == best.location.line
+                        && location.column == best.location.column
+                }) {
+                    self.result_selection = index;
+                    self.pending_reveal = true;
+                }
+                let reason = best
+                    .reasons
+                    .first()
+                    .map(|(label, _)| reason_label(label))
+                    .unwrap_or("");
+                self.status = format!(
+                    "{}:{} · {token} · {reason}",
+                    best.location
+                        .path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                    best.location.line
+                );
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.goto = None;
+            }
+        }
+    }
+
+    fn editor_buffers(&self) -> Vec<(PathBuf, String)> {
+        self.documents
+            .iter()
+            .map(|doc| {
+                let source = match &doc.content {
+                    Content::Text(text) => text.clone(),
+                    Content::Csv(sheet) => sheet.serialize().unwrap_or_default(),
+                };
+                (doc.path.clone(), source)
+            })
+            .collect()
+    }
+
+    /// Cmd/Ctrl-click. The clicked occurrence decides what the user is after:
+    /// a declaration leads to its usages, a usage leads to the declaration,
+    /// and anything else shows every match.
+    fn click_search(&mut self, click: TextClick) {
+        let Some(doc) = self.documents.get(self.active) else {
+            return;
+        };
+        let Content::Text(text) = &doc.content else {
+            return;
+        };
+        let open_paths = self.documents.iter().map(|doc| doc.path.clone()).collect();
+        let recent_paths = self.recent_file_searches.iter().cloned().collect();
+        let Some(context) = ranking::ClickContext::new(
+            &self.root,
+            &doc.path,
+            text,
+            click.char_index,
+            open_paths,
+            recent_paths,
+        ) else {
+            if !click.token.is_empty() {
+                self.open_token_search(click.token, Intent::Everything, None);
+            }
+            return;
+        };
+        let intent = Intent::for_category(context.category);
+        let token = context.token.clone();
+        self.open_token_search(token, intent, Some(context));
+    }
+
+    /// "Go to Declaration": the user asked for the declaration explicitly.
+    fn goto_declaration(&mut self) {
+        let Some(doc) = self.documents.get(self.active) else {
+            return;
+        };
+        let Content::Text(text) = &doc.content else {
+            return;
+        };
+        let mut index = doc.cursor;
+        if navigation::token_at(text, index).is_none() {
+            if index == 0 {
+                return;
+            }
+            index -= 1;
+        }
+        let Some(token) = navigation::token_at(text, index) else {
+            return;
+        };
+        let open_paths = self.documents.iter().map(|doc| doc.path.clone()).collect();
+        let recent_paths = self.recent_file_searches.iter().cloned().collect();
+        let context = ranking::ClickContext::new(
+            &self.root,
+            &doc.path,
+            text,
+            index,
+            open_paths,
+            recent_paths,
+        );
+        self.open_token_search(token, Intent::Declarations, context);
+    }
+
+    /// Open the search dialog on a token with the tab that answers the
+    /// intent. The candidates are ranked once the results arrive.
+    fn open_token_search(
+        &mut self,
+        token: String,
+        intent: Intent,
+        context: Option<ranking::ClickContext>,
+    ) {
+        self.cancel_focus();
+        self.query = token.clone();
+        self.start_search(SearchKind::References, false);
+        // `start_search` resets the category filter, so the intent is applied
+        // afterwards.
+        self.selected_category = intent.category();
+        self.result_selection = 0;
+        self.pending_reveal = true;
+        self.pending_click = Some(PendingClick {
+            token: token.clone(),
+            intent,
+            context,
+        });
+        self.status = match intent {
+            Intent::Usages => format!("Usages of {token}…"),
+            Intent::Declarations => format!("Declarations of {token}…"),
+            Intent::Everything => format!("Matches for {token}…"),
+        };
+    }
+
+    fn cancel_focus(&mut self) {
+        if let Some(previous) = self.goto.take() {
+            previous.cancel.store(true, Ordering::Relaxed);
+        }
+        self.pending_click = None;
+    }
+
+    /// Called when the search of a click finished: fall back to every match if
+    /// the intended tab is empty, and rank the candidates so the most likely
+    /// declaration comes first.
+    fn resolve_pending_click(&mut self) {
+        let Some(pending) = self.pending_click.take() else {
+            return;
+        };
+        if let Some(category) = pending.intent.category()
+            && !self
+                .results
+                .iter()
+                .any(|location| location.category == category)
+        {
+            // Nothing matches the intent; show every hit instead of an empty
+            // tab.
+            self.selected_category = None;
+        }
+        if pending.intent != Intent::Declarations {
+            return;
+        }
+        let Some(context) = pending.context else {
+            return;
+        };
+        let candidates: Vec<Location> = self
+            .results
+            .iter()
+            .filter(|location| location.category == navigation::MatchCategory::Declaration)
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        let buffers = self.editor_buffers();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let ranked = ranking::rank(&context, candidates, &buffers, &worker_cancel);
+            let _ = tx.send(ranked);
+        });
+        self.goto = Some(FocusSearch {
+            rx,
+            cancel,
+            token: pending.token,
+        });
     }
 
     fn open_search(&mut self) {
@@ -798,7 +1106,7 @@ impl Coder {
                         }
                         ui.separator();
                         if ui.button("Go to Declaration    ⌘/Ctrl B").clicked() {
-                            self.start_search(SearchKind::Definitions, true);
+                            self.goto_declaration();
                             ui.close();
                         }
                         if ui.button("Find Usages    Alt F7").clicked() {
@@ -838,8 +1146,6 @@ impl Coder {
                             self.terminal.toggle(&self.root, ctx);
                             ui.close();
                         }
-                        ui.separator();
-                        egui::widgets::global_theme_preference_buttons(ui);
                     });
                     ui.menu_button("Settings", |ui| {
                         if ui.button("Preferences…").clicked() {
@@ -908,28 +1214,35 @@ impl Coder {
     fn sidebar(&mut self, ctx: &egui::Context) {
         let mut open = None;
         let mut force_root = self.tree.reveal_pending();
-        let colors = self
-            .git
-            .repo
-            .as_ref()
-            .map(|repo| {
-                let dirty: Vec<_> = self
-                    .documents
-                    .iter()
-                    .filter(|doc| doc.dirty)
-                    .map(|doc| doc.path.clone())
-                    .collect();
-                crate::git_view::tree_files(repo, &dirty)
-                    .iter()
-                    .map(|file| {
-                        (
-                            repo.root.join(&file.path),
-                            crate::git_view::file_color(file),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        // The colors of the changed files are kept until the repository or the
+        // edited documents change, so the tree is not rebuilt every frame.
+        let dirty: Vec<PathBuf> = self
+            .documents
+            .iter()
+            .filter(|doc| doc.dirty)
+            .map(|doc| doc.path.clone())
+            .collect();
+        let colors_key = eframe::egui::util::hash((self.git.generation, &dirty));
+        if self.git_colors.0 != colors_key {
+            let colors = self
+                .git
+                .repo
+                .as_ref()
+                .map(|repo| {
+                    crate::git_view::tree_files(repo, &dirty)
+                        .iter()
+                        .map(|file| {
+                            (
+                                repo.root.join(&file.path),
+                                crate::git_view::file_color(file),
+                            )
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                })
+                .unwrap_or_default();
+            self.git_colors = (colors_key, Arc::new(colors));
+        }
+        let colors = self.git_colors.1.clone();
         egui::SidePanel::left("explorer")
             .default_width(285.0)
             .width_range(160.0..=500.0)
@@ -1287,6 +1600,7 @@ impl Coder {
                 });
             if !open {
                 self.search_open = false;
+                self.focus_editor = true;
             }
         }
     }
@@ -1339,6 +1653,7 @@ impl Coder {
                 .clicked()
                 {
                     self.search_open = false;
+                    self.focus_editor = true;
                 }
                 if chrome::icon_button(
                     ui,
@@ -1479,7 +1794,8 @@ impl Coder {
         );
         let visible = self.search_view.indices.clone();
         self.result_selection = self.result_selection.min(visible.len().saturating_sub(1));
-        let mut reveal_selection = false;
+        let mut reveal_selection = self.pending_reveal;
+        self.pending_reveal = false;
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowDown)) {
             if !visible.is_empty() {
                 self.result_selection = (self.result_selection + 1) % visible.len();
@@ -1497,6 +1813,8 @@ impl Coder {
         let space = (ui.available_height() - 80.0).max(0.0);
         let list_height = space * self.search_split;
         let preview_height = space - list_height;
+        let dark = ui.visuals().dark_mode;
+        self.search_highlight.set_dark(dark);
         let mut matches = egui::ScrollArea::vertical()
             .id_salt("search-matches")
             .auto_shrink([false, false])
@@ -1518,6 +1836,7 @@ impl Coder {
             };
             matches = matches.vertical_scroll_offset(offset);
         }
+        let mut wanted: Vec<PathBuf> = vec![];
         matches.show_rows(ui, row_height, visible.len(), |ui, range| {
             if visible.is_empty() {
                 ui.weak(if self.search_rx.is_some() {
@@ -1589,18 +1908,34 @@ impl Coder {
                             egui::pos2(rect.right() - right_width - 24.0, rect.bottom()),
                         )),
                 );
-                let galley = ui.fonts_mut(|fonts| {
-                    fonts.layout_job(chrome::highlighted(
-                        location.preview.trim_start(),
-                        &self.query,
-                        result_size,
-                    ))
-                });
+                // The line is colored with the syntax of the file it comes
+                // from. Until that file has been highlighted the plain match is
+                // shown, so a row is never blank.
+                let mut job = self
+                    .search_highlight
+                    .line(&location.path, location.line)
+                    .unwrap_or_else(|| {
+                        egui::text::LayoutJob::simple(
+                            location.preview.trim_start().to_owned(),
+                            FontId::monospace(result_size),
+                            chrome::TEXT,
+                            f32::INFINITY,
+                        )
+                    });
+                chrome::trim_start(&mut job);
+                for section in &mut job.sections {
+                    section.format.font_id.size = result_size;
+                }
+                chrome::mark_matches(&mut job, &self.query);
+                let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
                 painter.galley(
                     rect.left_center() + egui::vec2(10.0, -galley.size().y / 2.0),
                     galley,
                     chrome::TEXT,
                 );
+                if !wanted.contains(&location.path) {
+                    wanted.push(location.path.clone());
+                }
                 if response.clicked() {
                     self.result_selection = index;
                 }
@@ -1609,6 +1944,19 @@ impl Coder {
                 }
             }
         });
+        // Highlight the files of the visible rows in the background, so the
+        // colors arrive a moment later without blocking the frame.
+        for path in wanted {
+            self.search_highlight.request(&path, || {
+                self.documents
+                    .iter()
+                    .find(|doc| doc.path == path)
+                    .and_then(|doc| match &doc.content {
+                        Content::Text(text) => Some(text.clone()),
+                        Content::Csv(_) => None,
+                    })
+            });
+        }
         let (divider, drag) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::drag());
         ui.painter().hline(
@@ -1666,11 +2014,13 @@ impl Coder {
         }
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
             self.search_open = false;
+            self.focus_editor = true;
         }
         if let Some(location) = navigate {
             self.navigate(location);
             if !docked {
                 self.search_open = false;
+                self.focus_editor = true;
             }
         }
     }
@@ -1712,9 +2062,7 @@ impl Coder {
         };
         let scale = crate::preferences::editor_font_size(ui.ctx()) / 13.0;
         let row_height = crate::preferences::line_height(ui.ctx());
-        let jump = preview
-            .select(location.line, location.column)
-            .map(|offset| offset * scale);
+        let jump = preview.select(location.line, location.column, row_height);
         egui::Frame::new()
             .fill(chrome::EDITOR)
             .inner_margin(8)
@@ -1856,6 +2204,7 @@ impl Coder {
                             {
                                 *text = text.replace(&self.find, &self.replacement);
                                 doc.dirty = *text != doc.original;
+                                doc.mark_changed();
                                 doc.outline_refresh = Some(Instant::now());
                             }
                             scroll |= self.refresh_file_find();
@@ -1942,7 +2291,7 @@ impl Coder {
                         self.pending = Some(Pending::Close(index));
                         self.commit_current_sheet();
                     } else {
-                        self.close(index);
+                        self.close(index, ctx);
                     }
                 }
                 ui.separator();
@@ -2137,6 +2486,7 @@ impl Coder {
                         }
                         if changed {
                             doc.dirty = *text != doc.original;
+                            doc.mark_changed();
                             doc.outline_refresh = Some(Instant::now());
                         }
                     }
@@ -2150,15 +2500,20 @@ impl Coder {
                     }
                     ui.ctx().request_repaint();
                 }
+                // A dialog that took the keyboard gives it back to the editor,
+                // unless the terminal is the one being typed into.
+                if std::mem::take(&mut self.focus_editor)
+                    && !self.terminal.focused(ctx)
+                    && let Some(id) = doc.editor_id
+                {
+                    ctx.memory_mut(|memory| memory.request_focus(id));
+                }
             });
         if let Some(blame) = clicked_blame {
             self.git.show_commit(blame, ctx);
         }
-        if let Some(token) = clicked_token {
-            // A new click supersedes an earlier search; its detached worker cannot replace these results.
-            self.search_rx = None;
-            self.query = token;
-            self.start_search(SearchKind::References, false);
+        if let Some(click) = clicked_token {
+            self.click_search(click);
         }
     }
 
@@ -2345,7 +2700,7 @@ impl Coder {
                 };
                 if saved {
                     match self.pending.take() {
-                        Some(Pending::Close(index)) => self.close(index),
+                        Some(Pending::Close(index)) => self.close(index, ctx),
                         Some(Pending::Reload(index)) => {
                             if let Err(error) = self.documents[index].reload(self.csv_headers) {
                                 self.error = Some(error.to_string());
@@ -2413,8 +2768,18 @@ impl Coder {
             }
             FileAction::Delete(path) => {
                 std::fs::remove_file(&path)?;
+                // Removing a document before the active one shifts every later
+                // tab down, so the active index has to follow.
+                let removed = self.documents.iter().position(|doc| doc.path == path);
                 self.documents.retain(|doc| doc.path != path);
-                self.active = self.active.min(self.documents.len().saturating_sub(1));
+                if removed.is_some() {
+                    if let Some(index) = removed
+                        && self.active > index
+                    {
+                        self.active -= 1;
+                    }
+                    self.active = self.active.min(self.documents.len().saturating_sub(1));
+                }
                 self.history.retain(|location| location.path != path);
                 self.recent_file_searches.retain(|recent| recent != &path);
             }
@@ -2476,7 +2841,7 @@ impl Coder {
             self.show_picker(Picker::Line);
         }
         if key(M::COMMAND, Key::B) {
-            self.start_search(SearchKind::Definitions, true);
+            self.goto_declaration();
         }
         if key(M::ALT, Key::F7) {
             self.start_search(SearchKind::References, true);
@@ -2509,7 +2874,7 @@ impl Coder {
                 self.pending = Some(Pending::Close(self.active));
                 self.commit_current_sheet();
             } else {
-                self.close(self.active);
+                self.close(self.active, ctx);
             }
         }
         if (key(M::ALT, Key::ArrowLeft) || key(M::COMMAND, Key::OpenBracket))
@@ -2682,27 +3047,6 @@ impl Coder {
                         .show(ui, |ui| {
                             for (index, (label, location)) in entries.iter().enumerate() {
                                 let selected = index == self.picker_selection;
-                                let (rect, response) = ui.allocate_exact_size(
-                                    egui::vec2(
-                                        ui.available_width(),
-                                        (dialog_size * 2.0 + 18.0).max(48.0),
-                                    ),
-                                    egui::Sense::click(),
-                                );
-                                if selected && self.picker_selection != previous_selection {
-                                    ui.scroll_to_rect(rect, None);
-                                }
-                                if selected || response.hovered() {
-                                    ui.painter().rect_filled(
-                                        rect,
-                                        5.0,
-                                        if selected {
-                                            chrome::SELECTED
-                                        } else {
-                                            chrome::HEADER
-                                        },
-                                    );
-                                }
                                 let display =
                                     if mode == Picker::Symbols || label.starts_with("Symbol:") {
                                         label.to_owned()
@@ -2712,58 +3056,32 @@ impl Coder {
                                             .file_name()
                                             .unwrap_or_default()
                                             .to_string_lossy()
-                                            .to_string()
+                                            .into_owned()
                                     };
-                                let galley = ui.fonts_mut(|f| {
-                                    f.layout_job(chrome::highlighted(
-                                        &display,
-                                        file_query,
-                                        dialog_size,
-                                    ))
-                                });
-                                let filename_rect = egui::Rect::from_min_max(
-                                    rect.min + egui::vec2(34.0, 0.0),
-                                    rect.max - egui::vec2(12.0, 0.0),
-                                );
-                                ui.painter()
-                                    .with_clip_rect(filename_rect.intersect(ui.clip_rect()))
-                                    .galley(rect.min + egui::vec2(34.0, 5.0), galley, chrome::TEXT);
-                                ui.put(
-                                    egui::Rect::from_min_size(
-                                        rect.min + egui::vec2(6.0, 4.0),
-                                        egui::vec2(24.0, 24.0),
-                                    ),
-                                    egui::Label::new(
-                                        if self.folders.binary_search(&location.path).is_ok() {
-                                            egui::RichText::new("▸").color(chrome::WARNING)
-                                        } else {
-                                            chrome::file_icon(&location.path)
-                                        },
-                                    ),
-                                );
-                                if !matches!(mode, Picker::Symbols) {
+                                let parent = (mode != Picker::Symbols).then(|| {
                                     let parent = relative(
                                         location.path.parent().unwrap_or(Path::new("")),
                                         &self.root,
                                     );
-                                    let parent = if parent.is_empty() { "." } else { &parent };
-                                    let galley = ui.fonts_mut(|f| {
-                                        f.layout_job(chrome::highlighted(
-                                            parent,
-                                            file_query,
-                                            dialog_size - 1.0,
-                                        ))
-                                    });
-                                    ui.painter()
-                                        .with_clip_rect(filename_rect.intersect(ui.clip_rect()))
-                                        .galley(
-                                            rect.min + egui::vec2(34.0, dialog_size + 9.0),
-                                            galley,
-                                            chrome::MUTED,
-                                        );
+                                    if parent.is_empty() {
+                                        ".".into()
+                                    } else {
+                                        parent
+                                    }
+                                });
+                                let response = picker_result_row(
+                                    ui,
+                                    &display,
+                                    parent.as_deref(),
+                                    &location.path,
+                                    self.folders.binary_search(&location.path).is_ok(),
+                                    file_query,
+                                    dialog_size,
+                                    selected,
+                                );
+                                if selected && self.picker_selection != previous_selection {
+                                    ui.scroll_to_rect(response.rect, None);
                                 }
-                                let response =
-                                    response.on_hover_text(location.path.display().to_string());
                                 if response.clicked() || (enter && index == self.picker_selection) {
                                     open = Some(location.clone());
                                 }
@@ -2793,8 +3111,10 @@ impl Coder {
                 self.navigate(location);
             }
             self.picker = None;
+            self.focus_editor = true;
         } else if close {
             self.picker = None;
+            self.focus_editor = true;
         }
     }
 
@@ -2847,7 +3167,11 @@ impl Coder {
                     if let Some(location) = self.current_location() {
                         ui.small(format!("{}:{}", location.line, location.column));
                     }
-                    ui.small("LF");
+                    ui.small(
+                        self.documents
+                            .get(self.active)
+                            .map_or("LF", |doc| doc.line_ending),
+                    );
                 });
             });
         });
@@ -2876,7 +3200,7 @@ impl Coder {
                 FrameAction::Save(index) => {
                     self.save(index);
                 }
-                FrameAction::Close(index) => self.close(index),
+                FrameAction::Close(index) => self.close(index, ctx),
                 FrameAction::Activate(index) => self.active = index,
                 FrameAction::GitDiff(index) => {
                     let doc = &self.documents[index];
@@ -3004,6 +3328,108 @@ fn split_file_location(query: &str) -> (&str, Option<(usize, usize)>) {
         return (query, None);
     }
     (prefix, Some((number.max(1), 1)))
+}
+
+/// Allocate the entire result once; painting icons must not move the list cursor.
+#[allow(clippy::too_many_arguments)]
+fn reason_label(label: &str) -> &'static str {
+    match label {
+        "definition" => "declaration",
+        "kind" => "declaration shape",
+        "file" => "same or imported file",
+        "scope" => "same scope",
+        "name" => "exact name",
+        "stem" => "file name matches",
+        "path" => "path matches",
+        "visible" => "visibility",
+        "top" => "top level",
+        "doc" => "documented",
+        "prior" => "declaration kind",
+        "unique" => "only definition",
+        "specific" => "specific name",
+        "near" => "close to click",
+        "above" => "above the click",
+        "recent" => "open recently",
+        "focus" => "focused file",
+        "noise" => "test/vendor penalty",
+        "size" => "large file penalty",
+        "dup" => "duplicate name penalty",
+        _ => "match",
+    }
+}
+
+fn picker_result_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    parent: Option<&str>,
+    path: &Path,
+    folder: bool,
+    query: &str,
+    font_size: f32,
+    selected: bool,
+) -> egui::Response {
+    let width = ui.available_width();
+    let text_left = 38.0;
+    let padding = 8.0;
+    let gap = 3.0;
+    let text_width = (width - text_left - 12.0).max(1.0);
+    let layout = |text: &str, size: f32, color: Color32| {
+        let mut job = chrome::highlighted(text, query, size);
+        for section in &mut job.sections {
+            if section.format.background == Color32::TRANSPARENT {
+                section.format.color = color;
+            }
+        }
+        job.wrap.max_width = text_width;
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        ui.fonts_mut(|fonts| fonts.layout_job(job))
+    };
+    let name = layout(name, font_size, chrome::TEXT);
+    let parent = parent.map(|parent| layout(parent, (font_size - 1.0).max(10.0), chrome::MUTED));
+    let height =
+        padding * 2.0 + name.size().y + parent.as_ref().map_or(0.0, |parent| gap + parent.size().y);
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, height.max(36.0)), egui::Sense::click());
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    if selected || response.hovered() {
+        painter.rect_filled(
+            rect,
+            5.0,
+            if selected {
+                chrome::SELECTED
+            } else {
+                chrome::HEADER
+            },
+        );
+    }
+    let name_origin = rect.min + egui::vec2(text_left, padding);
+    let icon_center = egui::pos2(rect.left() + 19.0, name_origin.y + name.size().y / 2.0);
+    if folder {
+        chrome::folder_colored(
+            &painter,
+            egui::Rect::from_center_size(icon_center, egui::vec2(23.0, 23.0)),
+            chrome::WARNING,
+        );
+    } else {
+        let (icon, color) = chrome::file_kind(path);
+        painter.text(
+            icon_center,
+            egui::Align2::CENTER_CENTER,
+            icon,
+            FontId::monospace(12.0),
+            color,
+        );
+    }
+    if let Some(parent) = parent {
+        painter.galley(
+            name_origin + egui::vec2(0.0, name.size().y + gap),
+            parent,
+            chrome::MUTED,
+        );
+    }
+    painter.galley(name_origin, name, chrome::TEXT);
+    response.on_hover_text(path.display().to_string())
 }
 
 fn file_candidates(
@@ -3449,6 +3875,56 @@ struct EditorFind<'a> {
     blame: bool,
 }
 
+/// egui stores a full copy of the text for every undo point, so a large file
+/// would otherwise keep hundreds of copies of itself. The budget keeps the
+/// undo history of one file near a megabyte.
+fn undo_budget(len: usize) -> usize {
+    const MIB: usize = 1024 * 1024;
+    if len <= 64 * 1024 {
+        100
+    } else if len <= 256 * 1024 {
+        40
+    } else if len <= MIB {
+        16
+    } else if len <= 4 * MIB {
+        8
+    } else {
+        4
+    }
+}
+
+/// Give the editor an undo history that fits the size of the file. The
+/// history is only replaced when the budget changes, so typing does not throw
+/// away the undo stack.
+fn apply_undo_budget(ui: &egui::Ui, id: egui::Id, len: usize) {
+    let budget = undo_budget(len);
+    let key = id.with("undo-budget");
+    if ui.ctx().data(|data| data.get_temp::<usize>(key)) == Some(budget) {
+        return;
+    }
+    let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+    let settings = egui::util::undoer::Settings {
+        max_undos: budget,
+        ..Default::default()
+    };
+    let undoer: egui::util::undoer::Undoer<(egui::text::CCursorRange, String)> =
+        egui::util::undoer::Undoer::with_settings(settings);
+    state.set_undoer(undoer);
+    state.store(ui.ctx(), id);
+    ui.ctx().data_mut(|data| data.insert_temp(key, budget));
+}
+
+/// Drop the undo history of a closed file, so its text is not kept in the
+/// persisted editor state.
+fn release_editor_state(ctx: &egui::Context, id: egui::Id) {
+    ctx.data_mut(|data| {
+        if let Some(mut state) = data.get_persisted::<egui::widgets::text_edit::TextEditState>(id) {
+            state.clear_undoer();
+            data.insert_persisted(id, state);
+        }
+    });
+}
+
 fn text_editor(
     ui: &mut egui::Ui,
     text: &mut String,
@@ -3457,10 +3933,11 @@ fn text_editor(
     jump: &mut Option<(usize, usize)>,
     editor_id: &mut Option<egui::Id>,
     find: EditorFind<'_>,
-) -> (bool, Option<String>, Option<crate::git::BlameLine>) {
+) -> (bool, Option<TextClick>, Option<crate::git::BlameLine>) {
     let id = ui.make_persistent_id("source-editor");
     let font_size = crate::preferences::editor_font_size(ui.ctx());
     *editor_id = Some(id);
+    apply_undo_budget(ui, id, text.len());
     let find_offset = find
         .active
         .as_ref()
@@ -3512,7 +3989,10 @@ fn text_editor(
         .ctx()
         .data_mut(|data| data.get_temp::<crate::folding::State>(fold_id))
         .unwrap_or_default();
-    folds.sync(text);
+    // One fingerprint of the document per frame, shared by the fold state
+    // and the layout cache.
+    let source_hash = egui::util::hash(text.as_str());
+    folds.sync(source_hash);
     let large = crate::editor_analysis::is_large(text);
     let analysis = large
         .then(|| crate::editor_analysis::get(ui, text, path))
@@ -3549,14 +4029,14 @@ fn text_editor(
             .data_mut(|data| data.insert_temp(fold_id.with("capture-seeded"), true));
     }
     let active_folds = folds.active(fold_regions);
-    let source_hash = egui::util::hash(text.as_str());
     let large_layout = large.then(|| crate::editor_analysis::layout_cache(ui, id));
     let folded = egui::util::hash(&folds.collapsed);
     let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, _wrap_width: f32| {
-        let buffer_hash = egui::util::hash(buffer.as_str());
+        // The buffer is the text we were handed, so its fingerprint is known.
+        let buffer_hash = source_hash;
         let syntax = analysis
             .as_ref()
-            .filter(|a| a.syntax.text == buffer.as_str());
+            .filter(|a| a.syntax.text.len() == buffer.as_str().len());
         let layout_key = egui::util::hash((
             buffer_hash,
             syntax.map(|a| a.key),
@@ -3683,7 +4163,10 @@ fn text_editor(
                     );
                     if ui.input(|i| i.pointer.primary_clicked()) {
                         *cursor = range.start;
-                        clicked_token = Some(token);
+                        clicked_token = Some(TextClick {
+                            char_index: range.start,
+                            token,
+                        });
                     }
                 }
                 let caret = output
@@ -4161,7 +4644,14 @@ fn text_editor(
                 changed = output.response.changed();
             });
         });
-    folds.sync(text);
+    // An edit invalidates the collapsed regions, so the fingerprint is taken
+    // again only when the text actually changed.
+    let changed_hash = if changed {
+        egui::util::hash(text.as_str())
+    } else {
+        source_hash
+    };
+    folds.sync(changed_hash);
     ui.ctx().data_mut(|data| data.insert_temp(fold_id, folds));
     (changed, clicked_token, clicked_blame)
 }
@@ -4180,13 +4670,20 @@ fn hovered_token(
                 if position.x >= x && position.x < x + glyph.advance_width {
                     let index = offset + column;
                     let token = navigation::token_at(text, index)?;
-                    let start = index
-                        - text.chars().collect::<Vec<_>>()[..index]
-                            .iter()
-                            .copied()
-                            .rev()
-                            .take_while(|c| c.is_alphanumeric() || *c == '_')
-                            .count();
+                    // Walk back over the identifier without materializing the
+                    // whole document as a character vector.
+                    let byte = text
+                        .char_indices()
+                        .nth(index)
+                        .map_or(text.len(), |(byte, _)| byte);
+                    let mut start = index;
+                    for character in text[..byte].chars().rev() {
+                        if character.is_alphanumeric() || character == '_' {
+                            start -= 1;
+                        } else {
+                            break;
+                        }
+                    }
                     return Some((start..start + token.chars().count(), token));
                 }
             }
@@ -5329,6 +5826,70 @@ mod tests {
     }
 
     #[test]
+    fn picker_rows_keep_icons_text_and_hit_targets_in_separate_bounds_at_every_font_size() {
+        for scale in [1.0, 2.0] {
+            for font_size in [12.0, 14.0, 20.0, 28.0] {
+                for width in [280.0, 620.0] {
+                    let ctx = egui::Context::default();
+                    chrome::install(&ctx);
+                    ctx.set_pixels_per_point(scale);
+                    let mut rows = vec![];
+                    let output = ctx.run(egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 900.0))),
+                        ..Default::default()
+                    }, |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            for (index, name) in ["api", "main.go", "a_very_long_file_name_that_should_be_truncated_猫.rs", "main_test.go"].iter().enumerate() {
+                                let response = picker_result_row(ui, name,
+                                    Some("staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/testing/long_parent"),
+                                    Path::new(name), index == 0, "main", font_size, index == 0);
+                                rows.push(response.rect);
+                            }
+                            assert!(ui.min_rect().bottom() >= rows.last().unwrap().bottom());
+                        });
+                    });
+                    for pair in rows.windows(2) {
+                        assert!(
+                            pair[0].bottom() <= pair[1].top(),
+                            "overlapping result bounds at font {font_size}, scale {scale}"
+                        );
+                    }
+                    let mut text_count = 0;
+                    let mut folder_paths = 0;
+                    for shape in &output.shapes {
+                        match &shape.shape {
+                            egui::Shape::Text(text) => {
+                                let bounds =
+                                    egui::Rect::from_min_size(text.pos, text.galley.size());
+                                assert!(
+                                    rows.iter().any(|row| row.expand(0.5).contains_rect(bounds)),
+                                    "text escapes its result: {} at font {font_size}, scale {scale}",
+                                    text.galley.text()
+                                );
+                                assert_eq!(
+                                    text.galley.rows.len(),
+                                    1,
+                                    "result text must remain one line"
+                                );
+                                text_count += 1;
+                            }
+                            egui::Shape::Path(path)
+                                if path.stroke.color
+                                    == egui::epaint::ColorMode::Solid(chrome::WARNING) =>
+                            {
+                                folder_paths += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    assert_eq!(text_count, 11); // Two text lines per result plus three file icons.
+                    assert_eq!(folder_paths, 1); // A drawn folder, independent of font glyph support.
+                }
+            }
+        }
+    }
+
+    #[test]
     fn matching_folders_are_not_capped_out_by_their_contents() {
         let root = Path::new("/project");
         let folder = root.join("sources");
@@ -5637,6 +6198,88 @@ mod tests {
     }
 
     #[test]
+    fn cmd_click_opens_the_search_dialog_on_the_tab_that_matches_the_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let declaration = root.join("declaration.rs");
+        let usage = root.join("usage.rs");
+        std::fs::write(&declaration, "fn needle() {}\n").unwrap();
+        std::fs::write(&usage, "fn other() { needle(); }\n").unwrap();
+        let mut app = Coder::empty(root.clone());
+        app.open(usage.clone(), None);
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+
+        // A click on a usage asks for the declarations.
+        let source = std::fs::read_to_string(&usage).unwrap();
+        app.click_search(TextClick {
+            char_index: source.find("needle").unwrap(),
+            token: "needle".into(),
+        });
+        assert!(app.search_open, "the click must open the search dialog");
+        assert!(matches!(
+            app.selected_category,
+            Some(navigation::MatchCategory::Declaration)
+        ));
+        wait_for_search(&mut app, &ctx);
+        assert!(matches!(
+            app.selected_category,
+            Some(navigation::MatchCategory::Declaration)
+        ));
+        // The best declaration is ranked first and focused.
+        wait_for_focus(&mut app);
+        app.search_view.refresh(
+            &app.results,
+            app.results_revision,
+            app.selected_category,
+            app.extension_filter.as_deref(),
+        );
+        let focused = &app.results[app.search_view.indices[app.result_selection]];
+        assert_eq!(focused.path, declaration);
+
+        // A click on the declaration asks for the usages.
+        app.open(declaration.clone(), None);
+        let source = std::fs::read_to_string(&declaration).unwrap();
+        app.click_search(TextClick {
+            char_index: source.find("needle").unwrap(),
+            token: "needle".into(),
+        });
+        assert!(matches!(
+            app.selected_category,
+            Some(navigation::MatchCategory::Usage)
+        ));
+        wait_for_search(&mut app, &ctx);
+        assert!(matches!(
+            app.selected_category,
+            Some(navigation::MatchCategory::Usage)
+        ));
+        assert!(app.results.iter().any(|location| location.path == usage
+            && location.category == navigation::MatchCategory::Usage));
+    }
+
+    /// Wait until the background search of a click finished.
+    fn wait_for_search(app: &mut Coder, ctx: &egui::Context) {
+        for _ in 0..500 {
+            app.poll(ctx);
+            if app.search_rx.is_none() && app.pending_click.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Wait until the ranking of a click finished.
+    fn wait_for_focus(app: &mut Coder) {
+        for _ in 0..500 {
+            app.poll_focus();
+            if app.goto.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
     fn command_click_uses_pointer_token_rather_than_previous_caret() {
         let ctx = egui::Context::default();
         let mut source = "fn old() {}\nfn needle() {}".to_owned();
@@ -5727,7 +6370,7 @@ mod tests {
             ],
             modifiers,
         );
-        assert_eq!(token.as_deref(), Some("needle"));
+        assert_eq!(token.map(|click| click.token).as_deref(), Some("needle"));
     }
     #[test]
     fn markdown_preview_uses_heading_sizes_and_inert_html_images() {
@@ -5885,6 +6528,60 @@ mod tests {
                 hovered_token(source, &galley, egui::vec2(galley.size().x + 40.0, 5.0)).is_none()
             );
         });
+    }
+
+    #[test]
+    fn closing_the_search_dialog_gives_the_keyboard_back_to_the_editor() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("sample.rs");
+        std::fs::write(&path, "fn main() {}\n")?;
+        let mut app = Coder::empty(dir.path().to_path_buf());
+        app.open(path, None);
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let mut time = 0.0;
+        let mut frame = |app: &mut Coder, events| {
+            time += 0.1;
+            ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            )
+        };
+        // Open the search dialog and let it take the keyboard.
+        app.open_search();
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        assert!(app.search_open);
+        // Escape closes it, and the editor gets the keyboard back.
+        let escape = [
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        frame(&mut app, escape.to_vec());
+        assert!(!app.search_open);
+        frame(&mut app, vec![]);
+        assert_eq!(ctx.memory(|m| m.focused()), app.documents[0].editor_id);
+        Ok(())
     }
 
     #[test]

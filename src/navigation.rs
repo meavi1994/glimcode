@@ -25,6 +25,8 @@ pub struct Symbol {
     pub kind: String,
     pub line: usize,
     pub column: usize,
+    /// The type, class or module that holds the symbol, when it has one.
+    pub owner: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,12 +72,124 @@ impl MatchCategory {
 #[cfg(test)]
 static CLASSIFY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The syntactic construct surrounding a position, used by click-to-navigate
+/// ranking to separate locals and parameters from file-level declarations.
+#[derive(Clone, Debug)]
+pub struct Scope {
+    pub start: usize,
+    pub end: usize,
+}
+
+pub struct Analysis {
+    pub category: MatchCategory,
+    pub scope: Option<Scope>,
+    /// The type, class or module around the position.
+    pub owner: Option<String>,
+}
+
+/// Classify a byte range and find its innermost function, method, type or
+/// module. This parses one file on demand; there is no index to keep in sync.
+pub fn analyze_at(path: &Path, source: &str, start: usize, end: usize) -> Analysis {
+    let Some(classifier) = Classifier::new(path, source) else {
+        return Analysis {
+            category: MatchCategory::Other,
+            scope: None,
+            owner: None,
+        };
+    };
+    Analysis {
+        category: classifier.category(start, end),
+        scope: classifier.scope(start, end),
+        owner: classifier.owner(source, start, end),
+    }
+}
+
+/// Node kinds that hold the symbols inside them.
+fn is_owner_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "struct_item"
+            | "enum_item"
+            | "trait_item"
+            | "impl_item"
+            | "mod_item"
+            | "type_item"
+            | "class_declaration"
+            | "class_definition"
+            | "abstract_class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "object_declaration"
+            | "record_declaration"
+            | "type_declaration"
+    )
+}
+
+/// The receiver type of a Go method, which is written on the declaration
+/// instead of around it.
+fn go_receiver(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let receiver = node.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    let parameter = receiver
+        .named_children(&mut cursor)
+        .find(|child| child.child_by_field_name("type").is_some())?;
+    let kind = parameter.child_by_field_name("type")?;
+    let text = kind.utf8_text(source).ok()?;
+    let text = text.trim().trim_start_matches('*');
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// The name of the type, class or module that holds `node`.
+fn owner_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    if node.kind() == "method_declaration"
+        && let Some(receiver) = go_receiver(node, source)
+    {
+        return Some(receiver);
+    }
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "method_declaration"
+            && let Some(receiver) = go_receiver(parent, source)
+        {
+            return Some(receiver);
+        }
+        let kind = parent.kind();
+        if kind == "type_declaration" {
+            // Go keeps the name in a `type_spec` child.
+            let mut cursor = parent.walk();
+            let spec = parent
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "type_spec")?;
+            let name = spec.child_by_field_name("name")?;
+            return name.utf8_text(source).ok().map(|text| text.to_owned());
+        }
+        if is_owner_kind(kind) {
+            let mut cursor = parent.walk();
+            let name = parent
+                .child_by_field_name("name")
+                .or_else(|| parent.child_by_field_name("type"))
+                .or_else(|| {
+                    parent
+                        .named_children(&mut cursor)
+                        .find(|child| matches!(child.kind(), "identifier" | "type_identifier"))
+                })?;
+            let text = name.utf8_text(source).ok()?;
+            // Strip generic arguments so `Store<T>` is stored as `Store`.
+            let text = text.split('<').next().unwrap_or(text);
+            let text = text.trim().trim_start_matches('\'');
+            return (!text.is_empty()).then(|| text.to_owned());
+        }
+        current = parent.parent();
+    }
+    None
+}
+
 struct Classifier {
     tree: tree_sitter::Tree,
 }
 
 impl Classifier {
-    fn new(path: &Path, source: &str) -> Option<Self> {
+    pub(crate) fn new(path: &Path, source: &str) -> Option<Self> {
         let mut parser = Parser::new();
         parser.set_language(&language(path)?).ok()?;
         #[cfg(test)]
@@ -204,6 +318,53 @@ impl Classifier {
         }
         category
     }
+
+    /// Innermost scope containing the range. `block` is deliberately excluded:
+    /// a local variable is only special relative to its function or type.
+    fn scope(&self, start: usize, end: usize) -> Option<Scope> {
+        let mut node = self.tree.root_node().descendant_for_byte_range(start, end);
+        while let Some(current) = node {
+            if matches!(
+                current.kind(),
+                "function_item"
+                    | "function_definition"
+                    | "function_declaration"
+                    | "method_declaration"
+                    | "method_definition"
+                    | "constructor_declaration"
+                    | "constructor_definition"
+                    | "arrow_function"
+                    | "function_expression"
+                    | "generator_function_declaration"
+                    | "class_definition"
+                    | "class_declaration"
+                    | "struct_item"
+                    | "enum_item"
+                    | "trait_item"
+                    | "impl_item"
+                    | "interface_declaration"
+                    | "object_declaration"
+                    | "record_declaration"
+                    | "mod_item"
+            ) {
+                return Some(Scope {
+                    start: current.start_byte(),
+                    end: current.end_byte(),
+                });
+            }
+            node = current.parent();
+        }
+        None
+    }
+
+    /// The type, class or module around the range.
+    fn owner(&self, source: &str, start: usize, end: usize) -> Option<String> {
+        let node = self
+            .tree
+            .root_node()
+            .descendant_for_byte_range(start, end)?;
+        owner_name(node, source.as_bytes())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -321,6 +482,7 @@ fn collect_symbol(node: Node<'_>, source: &[u8], result: &mut Vec<Symbol>) {
                     kind: kind.to_owned(),
                     line: name.start_position().row + 1,
                     column: name.start_position().column + 1,
+                    owner: owner_name(node, source),
                 });
             }
         }
@@ -465,10 +627,10 @@ pub fn search_workspace(
     query: &str,
     kind: SearchKind,
     exclude_tests: bool,
-    buffers: Vec<(PathBuf, String)>,
+    buffers: &[(PathBuf, String)],
     priority_paths: Vec<PathBuf>,
     cancelled: Arc<AtomicBool>,
-    emit: impl Fn(SearchUpdate),
+    mut emit: impl FnMut(SearchUpdate),
 ) {
     if cancelled.load(Ordering::Relaxed) {
         return;
@@ -476,11 +638,27 @@ pub fn search_workspace(
     let mut remaining = MAX_RESULTS;
     let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut excluded = std::collections::HashSet::new();
-    for (path, snapshot) in buffers
-        .into_iter()
-        .map(|(path, source)| (path, Some(source)))
-        .chain(priority_paths.into_iter().map(|path| (path, None)))
-    {
+    for (path, source) in buffers {
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        if !excluded.insert(path.clone())
+            || (exclude_tests && is_test_search_path(root, &canonical_root, path))
+        {
+            continue;
+        }
+        let mut locations = search_buffer(path, source, query, kind, &cancelled);
+        locations.truncate(remaining);
+        remaining -= locations.len();
+        if !locations.is_empty() {
+            emit(SearchUpdate::OpenFiles(locations));
+        }
+        if remaining == 0 {
+            emit(SearchUpdate::Finished { truncated: true });
+            return;
+        }
+    }
+    for path in priority_paths {
         if cancelled.load(Ordering::Relaxed) {
             return;
         }
@@ -489,12 +667,8 @@ pub fn search_workspace(
         {
             continue;
         }
-        let source = match snapshot {
-            Some(source) => source,
-            None => match read_text(&path) {
-                Ok(source) => source,
-                Err(_) => continue,
-            },
+        let Ok(source) = read_text(&path) else {
+            continue;
         };
         let mut locations = search_buffer(&path, &source, query, kind, &cancelled);
         locations.truncate(remaining);
@@ -831,17 +1005,34 @@ pub fn char_offset(text: &str, line: usize, column: usize) -> usize {
 }
 
 pub fn word_at(text: &str, position: usize) -> String {
-    let chars: Vec<_> = text.chars().collect();
-    let mut start = position.min(chars.len());
-    let mut end = start;
     let ident = |c: char| c.is_alphanumeric() || c == '_';
-    while start > 0 && ident(chars[start - 1]) {
-        start -= 1;
+    // Byte offset of the character at `position`, without copying the text.
+    let mut start = None;
+    for (index, (byte, _)) in text.char_indices().enumerate() {
+        if index == position {
+            start = Some(byte);
+            break;
+        }
     }
-    while end < chars.len() && ident(chars[end]) {
-        end += 1;
+    let Some(mut start) = start else {
+        return String::new();
+    };
+    let mut end = start + text[start..].chars().next().map_or(0, char::len_utf8);
+    let mut tail = end;
+    while let Some(character) = text[tail..].chars().next() {
+        if !ident(character) {
+            break;
+        }
+        tail += character.len_utf8();
     }
-    chars[start..end].iter().collect()
+    end = tail;
+    while let Some(character) = text[..start].chars().next_back() {
+        if !ident(character) {
+            break;
+        }
+        start -= character.len_utf8();
+    }
+    text[start..end].to_owned()
 }
 
 /// Unlike keyboard navigation, a click on whitespace must not select the preceding token.
@@ -901,6 +1092,27 @@ mod tests {
     }
 
     #[test]
+    fn locals_are_classified_as_declarations() {
+        let source =
+            "fn compute() {\n    let value = 1;\n    println!(\"{value}\");\n    value\n}\n";
+        let cancelled = AtomicBool::new(false);
+        let locations = search_buffer(
+            Path::new("src/lib.rs"),
+            source,
+            "value",
+            SearchKind::References,
+            &cancelled,
+        );
+        assert!(
+            locations
+                .iter()
+                .any(|location| location.line == 2
+                    && location.category == MatchCategory::Declaration),
+            "a local binding is a declaration: {locations:?}"
+        );
+    }
+
+    #[test]
     fn test_exclusion_covers_buffers_changed_files_and_project_for_all_search_kinds() -> Result<()>
     {
         let dir = tempfile::tempdir()?;
@@ -928,7 +1140,7 @@ mod tests {
                     "needle",
                     kind,
                     exclude_tests,
-                    vec![
+                    &[
                         (opened.clone(), source.into()),
                         (unsaved.clone(), source.into()),
                     ],
@@ -979,7 +1191,7 @@ mod tests {
             "needle",
             SearchKind::Text,
             true,
-            vec![],
+            &[],
             vec![test],
             Arc::new(AtomicBool::new(false)),
             |update| updates.borrow_mut().push(update),
@@ -1015,7 +1227,7 @@ mod tests {
             "needle",
             SearchKind::References,
             false,
-            vec![(open.clone(), "fn needle() {} // unsaved\n".into())],
+            &[(open.clone(), "fn needle() {} // unsaved\n".into())],
             vec![],
             Arc::new(AtomicBool::new(false)),
             |update| recorded.borrow_mut().push(update),
@@ -1062,7 +1274,7 @@ mod tests {
             "needle",
             SearchKind::Text,
             false,
-            vec![(open.clone(), "// needle unsaved\n".into())],
+            &[(open.clone(), "// needle unsaved\n".into())],
             vec![
                 open.clone(),
                 changed.clone(),
@@ -1319,7 +1531,7 @@ mod tests {
             "needle",
             SearchKind::Text,
             false,
-            vec![],
+            &[],
             vec![],
             Arc::new(AtomicBool::new(true)),
             |_| panic!("cancelled search published an update"),

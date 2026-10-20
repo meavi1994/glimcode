@@ -89,13 +89,15 @@ impl SourcePreview {
         self.lines.len()
     }
 
-    pub fn select(&mut self, line: usize, column: usize) -> Option<f32> {
+    /// Scroll so that `line` sits a few rows below the top. The offset is in
+    /// pixels, so the caller passes the row height it actually renders with.
+    pub fn select(&mut self, line: usize, column: usize, row_height: f32) -> Option<f32> {
         let target = (line, column);
         if self.selected == Some(target) {
             return None;
         }
         self.selected = Some(target);
-        Some(line.saturating_sub(4) as f32 * 20.0)
+        Some(line.saturating_sub(4) as f32 * row_height)
     }
 
     pub fn line(&self, index: usize, query: &str) -> LayoutJob {
@@ -338,13 +340,13 @@ mod tests {
                     preview.line(999, "value_1000").text,
                     "let value_1000 = 1000;"
                 );
-                assert!(preview.select(500, 5).is_some());
+                assert!(preview.select(500, 5, 20.0).is_some());
                 assert_eq!(
-                    preview.select(500, 5),
+                    preview.select(500, 5, 20.0),
                     None,
                     "manual scrolling must not be reset each frame"
                 );
-                assert!(preview.select(900, 5).is_some());
+                assert!(preview.select(900, 5, 20.0).is_some());
             });
         });
     }

@@ -117,13 +117,14 @@ impl FileTree {
         tree
     }
 
-    fn matches(&self, root: &Path, filter: &str) -> bool {
+    fn matches(&self, root: &Path, filter: &crate::chrome::CaseFilter) -> bool {
         self.file.as_ref().is_some_and(|path| {
-            path.strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_lowercase()
-                .contains(filter)
+            filter.matches(
+                path.strip_prefix(root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .as_ref(),
+            )
         }) || self
             .children
             .values()
@@ -148,7 +149,7 @@ impl FileTree {
             root,
             root,
             active,
-            &filter.to_lowercase(),
+            &crate::chrome::CaseFilter::new(filter),
             reveal,
             colors,
         )
@@ -160,7 +161,7 @@ impl FileTree {
         root: &Path,
         directory: &Path,
         active: Option<&Path>,
-        filter: &str,
+        filter: &crate::chrome::CaseFilter,
         reveal: bool,
         colors: &BTreeMap<PathBuf, egui::Color32>,
     ) -> Option<PathBuf> {
@@ -294,14 +295,17 @@ mod tests {
     }
     #[test]
     fn groups_nested_files_and_keeps_matching_ancestors() {
+        fn filter(needle: &str) -> crate::chrome::CaseFilter {
+            crate::chrome::CaseFilter::new(needle)
+        }
         let root = Path::new("/project");
         let tree = FileTree::build(
             root,
             &[root.join("src/nested/main.rs"), root.join("README.md")],
         );
         assert_eq!(tree.children.len(), 2);
-        assert!(tree.children[&OsString::from("src")].matches(root, "main.rs"));
-        assert!(!tree.children[&OsString::from("src")].matches(root, "readme"));
-        assert!(tree.matches(root, "src/nested"));
+        assert!(tree.children[&OsString::from("src")].matches(root, &filter("main.rs")));
+        assert!(!tree.children[&OsString::from("src")].matches(root, &filter("readme")));
+        assert!(tree.matches(root, &filter("src/nested")));
     }
 }

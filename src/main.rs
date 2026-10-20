@@ -15,6 +15,8 @@ mod markdown_images;
 mod navigation;
 mod preferences;
 mod preview;
+mod ranking;
+mod search_highlight;
 mod search_view;
 mod sheet;
 mod terminal;

@@ -18,8 +18,9 @@ pub struct State {
     pub collapsed: BTreeSet<usize>,
 }
 impl State {
-    pub fn sync(&mut self, text: &str) {
-        let fingerprint = egui::util::hash(text);
+    /// Forget the collapsed regions when the source changed. The caller
+    /// passes a fingerprint of the text, so the document is not hashed twice.
+    pub fn sync(&mut self, fingerprint: u64) {
         if fingerprint != self.fingerprint {
             self.collapsed.clear();
             self.fingerprint = fingerprint;
@@ -216,7 +217,7 @@ mod tests {
             vec![(0, 7), (1, 3), (4, 6)]
         );
         let mut state = State::default();
-        state.sync(source);
+        state.sync(egui::util::hash(source));
         state.collapsed.extend(regions.iter().map(|r| r.start));
         assert_eq!(state.active(&regions).len(), 1);
         assert!(state.reveal(&regions, regions[1].end..=regions[1].end));

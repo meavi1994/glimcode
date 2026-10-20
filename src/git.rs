@@ -9,6 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// The most a single Git command may write before the rest is dropped. The
+/// editor refuses files above 20 MiB, so this is already generous.
+const MAX_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChangedFile {
     pub path: PathBuf,
@@ -119,8 +123,10 @@ fn run(mut command: Command, input: Option<Vec<u8>>, timeout: Duration) -> Resul
     let stderr = child.stderr.take().unwrap();
     let out = std::thread::spawn(move || {
         let mut bytes = vec![];
+        // A command that produces more than this is not something the editor
+        // can show, so the rest is dropped instead of filling the memory.
         stdout
-            .take(80 * 1024 * 1024)
+            .take(MAX_OUTPUT_BYTES)
             .read_to_end(&mut bytes)
             .map(|_| bytes)
     });

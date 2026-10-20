@@ -11,7 +11,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, SyncSender},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub use crate::preferences::Settings;
@@ -275,6 +275,42 @@ struct Session {
     selection: Option<((u16, u16), (u16, u16))>,
     scroll_remainder: f32,
 }
+/// The size a shell falls back to when the interface never reports one.
+const FALLBACK_SIZE: PtySize = PtySize {
+    rows: 24,
+    cols: 80,
+    pixel_width: 0,
+    pixel_height: 0,
+};
+
+/// How long the shell waits for the real terminal size before it starts.
+///
+/// The panel reports its size in the first frame, so this only matters when a
+/// tab is created while the panel is never shown.
+const SIZE_WAIT: Duration = Duration::from_secs(5);
+
+/// Wait for the first size the interface reports.
+///
+/// The shell is started with the size it is given, because a shell that reads
+/// the size of the terminal once, when it starts, keeps the prompt it built
+/// for that size. Commands that arrive first are handed back so they are not
+/// lost.
+fn wait_for_size(rx: &mpsc::Receiver<Command>) -> (PtySize, Vec<Command>) {
+    let deadline = Instant::now() + SIZE_WAIT;
+    let mut queued = vec![];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return (FALLBACK_SIZE, queued);
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(Command::Resize(size)) => return (size, queued),
+            Ok(command) => queued.push(command),
+            Err(_) => return (FALLBACK_SIZE, queued),
+        }
+    }
+}
+
 impl Session {
     fn spawn(id: u64, root: PathBuf, settings: Settings, ctx: egui::Context) -> Self {
         let screen = Arc::new(Mutex::new(ScreenState::default()));
@@ -289,15 +325,30 @@ impl Session {
         let default_name = settings.tab_name.clone();
         std::thread::spawn(move || {
             let result = (|| -> Result<()> {
-                let pair = portable_pty::native_pty_system().openpty(PtySize {
-                    rows: 24,
-                    cols: 80,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })?;
+                // A shell reads the size of the terminal once, when it starts,
+                // and builds its prompt from that number. A prompt that is
+                // right aligned keeps the width it was built with until the
+                // next command, so the real size is awaited before the shell
+                // starts. Otherwise the first prompt is laid out for the
+                // fallback size and the time sits in the middle of the line.
+                let (size, queued) = wait_for_size(&rx);
+                let mut queued: std::collections::VecDeque<Command> = queued.into();
+                // The pty is opened with the real size. Changing the size of
+                // an existing pty afterwards is not seen by the shell that is
+                // started with it.
+                let pair = portable_pty::native_pty_system().openpty(size)?;
                 let mut reader = pair.master.try_clone_reader()?;
                 let mut writer = pair.master.take_writer()?;
-                let mut child = ManagedChild(pair.slave.spawn_command(settings.command(&cwd)?)?);
+                // The screen starts at the fallback size, so it is told about
+                // the real one before the first output arrives.
+                shared
+                    .lock()
+                    .unwrap()
+                    .parser
+                    .screen_mut()
+                    .set_size(size.rows, size.cols);
+                let command = settings.command(&cwd)?;
+                let mut child = ManagedChild(pair.slave.spawn_command(command)?);
                 drop(pair.slave);
                 *kill.lock().unwrap() = Some(child.0.clone_killer());
                 shared.lock().unwrap().status = "Running".into();
@@ -331,7 +382,13 @@ impl Session {
                         writer.write_all(&replies)?;
                         writer.flush()?;
                     }
-                    match rx.recv_timeout(Duration::from_millis(10)) {
+                    // Commands that arrived while the size was awaited run
+                    // before the ones that arrive later.
+                    let command = match queued.pop_front() {
+                        Some(command) => Ok(command),
+                        None => rx.recv_timeout(Duration::from_millis(10)),
+                    };
+                    match command {
                         Ok(Command::Input(bytes)) => {
                             writer.write_all(&bytes)?;
                             writer.flush()?;
@@ -371,7 +428,8 @@ impl Session {
             tx,
             stopped,
             killer,
-            size: (24, 80),
+            // Unknown, so the first frame always reports the real size.
+            size: (0, 0),
             selection: None,
             scroll_remainder: 0.0,
         }
@@ -398,6 +456,9 @@ pub struct Terminal {
     settings_error: Option<String>,
     tabs: Vec<Session>,
     active: usize,
+    /// The last size the panel reported, shared with the tabs in the
+    /// background.
+    size: Option<PtySize>,
     next_id: u64,
     focus: bool,
     pending_close: Option<u64>,
@@ -523,16 +584,28 @@ impl Terminal {
                     .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
                         if let Some(tab) = self.tabs.get_mut(self.active) {
-                            render(
+                            let size = render(
                                 ui,
                                 tab,
                                 enabled && !self.settings_open,
                                 &mut self.focus,
                                 self.settings.terminal_font_size,
                             );
+                            self.size = Some(size);
                         }
                     });
             });
+        // Every tab learns the size of the panel, not only the one that is on
+        // screen. A shell that starts with the wrong width builds its prompt
+        // for that width, and a right aligned prompt keeps it until the next
+        // command.
+        if let Some(size) = self.size {
+            for (index, tab) in self.tabs.iter_mut().enumerate() {
+                if index != self.active && tab.size == (0, 0) {
+                    tab.send(Command::Resize(size));
+                }
+            }
+        }
         if new {
             self.new_tab(root, ctx);
         }
@@ -1005,7 +1078,76 @@ fn mouse_bytes(screen: &vt100::Screen, code: u8, point: (u16, u16), released: bo
     }
 }
 
-fn render(ui: &mut egui::Ui, tab: &mut Session, enabled: bool, focus: &mut bool, font_size: f32) {
+/// The text of one terminal row and the color of every run in it.
+///
+/// Every cell contributes one character, so that the row keeps the columns of
+/// the grid. A cell that was never written is a blank.
+fn row_runs(
+    screen: &vt100::Screen,
+    row: u16,
+    cols: u16,
+    selection: Option<((u16, u16), (u16, u16))>,
+) -> (String, Vec<(std::ops::Range<usize>, Color32)>) {
+    let mut text = String::with_capacity(cols as usize);
+    let mut runs: Vec<(std::ops::Range<usize>, Color32)> = vec![];
+    let mut start = 0usize;
+    let mut color: Option<Color32> = None;
+    for col in 0..cols {
+        let Some(c) = screen.cell(row, col) else {
+            // A cell outside the screen is a blank, but the row still needs
+            // one character for it.
+            text.push(' ');
+            continue;
+        };
+        let (fg, _) = cell_colors(c, selection, row, col);
+        let cell_color = if c.dim() { fg.gamma_multiply(0.6) } else { fg };
+        match color {
+            None => color = Some(cell_color),
+            Some(current) if current != cell_color => {
+                runs.push((start..text.len(), current));
+                start = text.len();
+                color = Some(cell_color);
+            }
+            Some(_) => {}
+        }
+        if c.contents().is_empty() {
+            text.push(' ');
+        } else {
+            text.push_str(c.contents());
+        }
+    }
+    if let Some(current) = color {
+        runs.push((start..text.len(), current));
+    }
+    (text, runs)
+}
+
+/// The foreground and background of one terminal cell, with the selection
+/// applied.
+fn cell_colors(
+    c: &vt100::Cell,
+    selection: Option<((u16, u16), (u16, u16))>,
+    row: u16,
+    col: u16,
+) -> (Color32, Color32) {
+    let mut fg = color(c.fgcolor(), chrome::TEXT);
+    let mut bg = color(c.bgcolor(), chrome::EDITOR);
+    if c.inverse() {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if selection.is_some_and(|(start, end)| (row, col) >= start && (row, col) <= end) {
+        bg = chrome::SELECTED;
+    }
+    (fg, bg)
+}
+
+fn render(
+    ui: &mut egui::Ui,
+    tab: &mut Session,
+    enabled: bool,
+    focus: &mut bool,
+    font_size: f32,
+) -> PtySize {
     let id = egui::Id::new(("terminal-input", tab.id));
     let font = FontId::monospace(font_size);
     let cell = ui.fonts_mut(|f| egui::vec2(f.glyph_width(&font, 'M'), f.row_height(&font) + 2.0));
@@ -1020,14 +1162,13 @@ fn render(ui: &mut egui::Ui, tab: &mut Session, enabled: bool, focus: &mut bool,
         (rect.height() / cell.y).floor().clamp(2.0, 200.0) as u16,
         (rect.width() / cell.x).floor().clamp(10.0, 500.0) as u16,
     );
-    if size != tab.size
-        && tab.send(Command::Resize(PtySize {
-            rows: size.0,
-            cols: size.1,
-            pixel_width: 0,
-            pixel_height: 0,
-        }))
-    {
+    let pty = PtySize {
+        rows: size.0,
+        cols: size.1,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    if size != tab.size && tab.send(Command::Resize(pty)) {
         tab.size = size;
         tab.selection = None;
     }
@@ -1340,6 +1481,8 @@ fn render(ui: &mut egui::Ui, tab: &mut Session, enabled: bool, focus: &mut bool,
     let screen = state.parser.screen();
     let painter = ui.painter().with_clip_rect(rect);
     for row in 0..size.0 {
+        // The background and the underline belong to the cell, not to the
+        // text, so they are painted for every cell.
         for col in 0..size.1 {
             let Some(c) = screen.cell(row, col) else {
                 continue;
@@ -1349,25 +1492,9 @@ fn render(ui: &mut egui::Ui, tab: &mut Session, enabled: bool, focus: &mut bool,
                 origin,
                 egui::vec2(cell.x * if c.is_wide() { 2.0 } else { 1.0 }, cell.y),
             );
-            let mut fg = color(c.fgcolor(), chrome::TEXT);
-            let mut bg = color(c.bgcolor(), chrome::EDITOR);
-            if c.inverse() {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if selection.is_some_and(|(start, end)| (row, col) >= start && (row, col) <= end) {
-                bg = chrome::SELECTED;
-            }
+            let (fg, bg) = cell_colors(c, selection, row, col);
             if bg != chrome::EDITOR {
                 painter.rect_filled(cell_rect, 0.0, bg);
-            }
-            if !c.is_wide_continuation() && !c.contents().is_empty() {
-                painter.text(
-                    origin,
-                    egui::Align2::LEFT_TOP,
-                    c.contents(),
-                    font.clone(),
-                    if c.dim() { fg.gamma_multiply(0.6) } else { fg },
-                );
             }
             if c.underline() {
                 painter.line_segment(
@@ -1376,6 +1503,53 @@ fn render(ui: &mut egui::Ui, tab: &mut Session, enabled: bool, focus: &mut bool,
                 );
             }
         }
+        // A row is painted as one text run, so the font is laid out once per
+        // row instead of once per cell. Wide characters do not keep the grid
+        // alignment inside a single run, so those rows are painted cell by
+        // cell.
+        let wide = (0..size.1).any(|col| screen.cell(row, col).is_some_and(|cell| cell.is_wide()));
+        if wide {
+            for col in 0..size.1 {
+                let Some(c) = screen.cell(row, col) else {
+                    continue;
+                };
+                let origin =
+                    rect.min + egui::vec2(f32::from(col) * cell.x, f32::from(row) * cell.y);
+                if !c.is_wide_continuation() && !c.contents().is_empty() {
+                    let (fg, _) = cell_colors(c, selection, row, col);
+                    painter.text(
+                        origin,
+                        egui::Align2::LEFT_TOP,
+                        c.contents(),
+                        font.clone(),
+                        if c.dim() { fg.gamma_multiply(0.6) } else { fg },
+                    );
+                }
+            }
+            continue;
+        }
+        let mut job = egui::text::LayoutJob::default();
+        let (text, runs) = row_runs(screen, row, size.1, selection);
+        for (range, color) in runs {
+            job.append(
+                &text[range],
+                0.0,
+                egui::TextFormat {
+                    font_id: font.clone(),
+                    color,
+                    ..Default::default()
+                },
+            );
+        }
+        if job.sections.is_empty() {
+            continue;
+        }
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        painter.galley(
+            rect.min + egui::vec2(0.0, f32::from(row) * cell.y),
+            galley,
+            chrome::TEXT,
+        );
     }
     if focused && !screen.hide_cursor() && screen.scrollback() == 0 && !state.exited {
         let (row, col) = screen.cursor_position();
@@ -1407,6 +1581,7 @@ fn render(ui: &mut egui::Ui, tab: &mut Session, enabled: bool, focus: &mut bool,
             chrome::MUTED,
         );
     }
+    pty
 }
 
 #[cfg(test)]
@@ -2061,7 +2236,84 @@ mod tests {
             Some(b"\x1b[Z".to_vec())
         );
     }
-    #[cfg(unix)]
+    #[test]
+    fn a_row_keeps_one_character_per_cell_so_the_columns_line_up() {
+        // A right aligned prompt leaves a long gap between the text and the
+        // time. The gap has to keep its place in the grid, so every cell
+        // contributes one character to the row.
+        let mut parser = vt100::Parser::new(4, 40, 10);
+        parser.process(b"left");
+        parser.process(b"\x1b[1;36mright\x1b[0m");
+        let screen = parser.screen();
+        let (text, runs) = row_runs(screen, 0, 40, None);
+        assert_eq!(text.chars().count(), 40, "one character per cell");
+        assert_eq!(&text[..4], "left");
+        assert_eq!(&text[4..9], "right");
+        assert!(
+            text[9..].chars().all(|character| character == ' '),
+            "the rest of the row is blank: {text:?}"
+        );
+        assert_eq!(runs.len(), 3, "the text, the color and the blank after it");
+        assert_eq!(&text[runs[0].0.clone()], "left");
+        assert_eq!(&text[runs[1].0.clone()], "right");
+        assert_eq!(&text[runs[2].0.clone()], " ".repeat(31));
+        // The runs cover the row without a gap.
+        assert_eq!(runs[0].0.start, 0);
+        assert_eq!(runs.last().unwrap().0.end, text.len());
+    }
+
+    #[test]
+    fn the_shell_starts_with_the_size_the_interface_reports() -> Result<()> {
+        // A shell reads the size of the terminal once, when it starts, and
+        // builds its prompt from that number. A right aligned prompt keeps the
+        // width it was built with, so the shell must start with the real size
+        // and not with a fallback that is corrected later.
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let ctx = egui::Context::default();
+        let mut terminal = Terminal::default();
+        terminal.settings.shell = "/bin/sh -c 'stty size'".into();
+        terminal.settings.tab_name = "Local".into();
+        terminal.new_tab(&root, &ctx);
+        let state = terminal.tabs[0].screen.clone();
+        assert!(terminal.tabs[0].send(Command::Resize(PtySize {
+            rows: 30,
+            cols: 132,
+            pixel_width: 0,
+            pixel_height: 0,
+        })));
+        wait_for(&state, |s| s.parser.screen().contents().contains("30 132"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_first_reported_size_is_used_and_earlier_commands_are_kept() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Command::Input(b"typed".to_vec())).unwrap();
+        tx.send(Command::Resize(PtySize {
+            rows: 30,
+            cols: 132,
+            pixel_width: 0,
+            pixel_height: 0,
+        }))
+        .unwrap();
+        let (size, queued) = wait_for_size(&rx);
+        assert_eq!((size.rows, size.cols), (30, 132));
+        assert_eq!(queued.len(), 1);
+        assert!(matches!(queued.first(), Some(Command::Input(bytes)) if bytes == b"typed"));
+    }
+
+    #[test]
+    fn a_shell_without_a_reported_size_falls_back_after_a_short_wait() {
+        let (_tx, rx) = mpsc::channel();
+        let (size, queued) = wait_for_size(&rx);
+        assert_eq!(
+            (size.rows, size.cols),
+            (FALLBACK_SIZE.rows, FALLBACK_SIZE.cols)
+        );
+        assert!(queued.is_empty());
+    }
+
     #[test]
     fn real_pty_starts_each_tab_in_project_resizes_and_closes() -> Result<()> {
         let first = tempfile::tempdir()?;

@@ -3,7 +3,7 @@ use std::path::Path;
 
 #[derive(Default)]
 pub struct SearchView {
-    key: Option<(u64, usize, Option<MatchCategory>, Option<String>)>,
+    key: Option<(u64, usize, Option<MatchCategory>, Option<u64>)>,
     pub indices: Vec<usize>,
     pub counts: [usize; 6],
     pub total: usize,
@@ -44,7 +44,8 @@ impl SearchView {
             revision,
             results.len(),
             category,
-            selected_extension.map(str::to_owned),
+            // A hash keeps the key free of allocations on every frame.
+            selected_extension.map(eframe::egui::util::hash),
         );
         if self.key.as_ref() == Some(&key) {
             return;
