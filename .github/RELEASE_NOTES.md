@@ -1,10 +1,14 @@
-## Changes in v0.1.1
+## Changes in v0.1.2
 
-- Improved responsiveness for large source files with background syntax and outline analysis, cached text layouts, and deferred Git annotations.
-- Fixed stack overflows when collecting symbols from deeply nested TypeScript syntax.
-- Unified Git status colors in Project and Changes: committed changes are green, uncommitted changes amber, and deletions red.
-- Added independent Editor, Dialogs, Terminal, Search results, and Search filters font controls, all defaulting to 14 pt. Search rows and dialog controls adapt to larger fonts.
-- Fixed the Linux CI clipboard test to use the terminal copy shortcut and verify Ctrl+C remains a shell interrupt.
+- Search results are syntax colored. Every file behind the visible rows is highlighted once on a background worker, and each row shows the colors of the line it came from with the match marked. Rows use the monospaced editor font, so a hit reads as code instead of as plain text.
+- Click-to-navigate now ranks by the type you are calling through. A method of the receiver's type wins over a same-named method elsewhere, `self.` calls prefer the type around the click, and mentions inside comments and strings never win. The ranking is recomputed on every click and follows the code as it changes.
+- Fixed a right aligned shell prompt, such as a clock in the corner, appearing behind the prompt instead of at the right edge of the terminal. The shell now starts with the size of the terminal, so it builds its prompt for the width it actually has.
+- The editor keeps one copy of a document in memory instead of three, the undo history of a large file is capped near a megabyte and released when the tab closes, and the files read for a click stay inside a fixed byte budget.
+- The terminal paints one text run per row instead of one per cell, the status bar no longer walks the whole document on every frame, and the document is fingerprinted once per frame instead of three times.
+- Fixed the search dialog and the file picker keeping the keyboard after they closed: the editor now gets the focus back, so typing and the editing shortcuts work again.
+- Fixed deleting a file leaving the wrong tab active.
+- The status bar reports the real line ending of a file instead of always claiming LF.
+- Removed the theme buttons from the View menu. The workspace chrome is built for a single dark theme, and the light option left the panels unreadable.
 
 ## Installation
 
