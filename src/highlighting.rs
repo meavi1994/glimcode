@@ -1,6 +1,6 @@
 use eframe::egui::{self, text::LayoutJob};
 use egui_extras::syntax_highlighting::{CodeTheme, SyntectSettings, highlight_with};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use syntect::highlighting::{Color, FontStyle, StyleModifier, Theme, ThemeItem, ThemeSettings};
 
 fn color(hex: u32) -> Color {
@@ -234,12 +234,12 @@ pub fn background(
     (!cancelled()).then_some(job)
 }
 
-pub fn highlight(ui: &egui::Ui, text: &str, extension: &str) -> LayoutJob {
-    let mut job = highlight_base(ui, text, extension);
-    for section in &mut job.sections {
-        section.format.font_id.size = crate::preferences::editor_font_size(ui.ctx());
-    }
-    job
+/// The syntax colors of a text.
+///
+/// The result is shared, so the editor and the panels that show the same
+/// document use one copy of the laid out text instead of one each.
+pub fn highlight(ui: &egui::Ui, text: &str, extension: &str) -> Arc<LayoutJob> {
+    highlight_base(ui, text, extension)
 }
 
 /// Match outline entries to the exact foreground painted on their declaration
@@ -294,7 +294,8 @@ pub fn symbol_badge(kind: &str) -> &'static str {
     }
 }
 
-fn highlight_base(ui: &egui::Ui, text: &str, extension: &str) -> LayoutJob {
+fn highlight_base(ui: &egui::Ui, text: &str, extension: &str) -> Arc<LayoutJob> {
+    let size = crate::preferences::editor_font_size(ui.ctx());
     if matches!(
         extension.to_lowercase().as_str(),
         "java"
@@ -315,8 +316,8 @@ fn highlight_base(ui: &egui::Ui, text: &str, extension: &str) -> LayoutJob {
         return ui.ctx().memory_mut(|memory| {
             memory
                 .caches
-                .cache::<egui::cache::FrameCache<LayoutJob, TypedHighlighter>>()
-                .get((text, extension, ui.visuals().dark_mode))
+                .cache::<egui::cache::FrameCache<Arc<LayoutJob>, TypedHighlighter>>()
+                .get((text, extension, ui.visuals().dark_mode, size.to_bits()))
         });
     }
     let theme = if ui.visuals().dark_mode {
@@ -343,7 +344,10 @@ fn highlight_base(ui: &egui::Ui, text: &str, extension: &str) -> LayoutJob {
     if extension == "json" {
         normalize_json_quotes(&mut job, ui.visuals().dark_mode);
     }
-    job
+    for section in &mut job.sections {
+        section.format.font_id.size = size;
+    }
+    Arc::new(job)
 }
 
 #[cfg(test)]
@@ -397,6 +401,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn deeply_nested_go_files_use_a_bounded_call_stack() {
+        const CHILD: &str = "GLIMCODE_DEEP_GO_HIGHLIGHT";
+        if std::env::var_os(CHILD).is_some() {
+            // A long generated expression produces a deep AST.
+            let source = format!(
+                "package main\n\nfunc run() {{\n\tvalue := {}\n\t_ = value\n}}\n",
+                "value +\n".repeat(12_000)
+            );
+            std::thread::Builder::new()
+                .name("go-highlight-regression".into())
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    let syntax = background(&source, "go", true, &|| false).unwrap();
+                    assert_eq!(syntax.text, source);
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            return;
+        }
+        // A stack overflow aborts the process, so isolate this regression check.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "highlighting::tests::deeply_nested_go_files_use_a_bounded_call_stack",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "go highlight worker crashed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -713,16 +755,24 @@ func local(flag Config) { flag.String() }
 
 #[derive(Default)]
 struct TypedHighlighter;
-impl egui::cache::ComputerMut<(&str, &str, bool), LayoutJob> for TypedHighlighter {
-    fn compute(&mut self, (text, extension, dark): (&str, &str, bool)) -> LayoutJob {
-        typed_highlight(text, extension, dark, &|| false).unwrap_or_else(|| {
+impl egui::cache::ComputerMut<(&str, &str, bool, u32), Arc<LayoutJob>> for TypedHighlighter {
+    fn compute(
+        &mut self,
+        (text, extension, dark, size): (&str, &str, bool, u32),
+    ) -> Arc<LayoutJob> {
+        let size = f32::from_bits(size);
+        let mut job = typed_highlight(text, extension, dark, &|| false).unwrap_or_else(|| {
             LayoutJob::simple(
                 text.into(),
                 egui::FontId::monospace(13.0),
                 crate::chrome::TEXT,
                 f32::INFINITY,
             )
-        })
+        });
+        for section in &mut job.sections {
+            section.format.font_id.size = size;
+        }
+        Arc::new(job)
     }
 }
 
@@ -932,93 +982,122 @@ fn typed_highlight(
 #[derive(Default)]
 struct GoNames {
     packages: std::collections::HashSet<String>,
-    shadows: Vec<(String, std::ops::Range<usize>)>,
+    /// The scopes that shadow a name, indexed by the name.
+    shadows: std::collections::HashMap<String, Vec<std::ops::Range<usize>>>,
 }
 
 impl GoNames {
     fn collect(root: tree_sitter::Node<'_>, text: &str) -> Self {
-        fn visit(
-            node: tree_sitter::Node<'_>,
-            text: &str,
-            scope: std::ops::Range<usize>,
-            names: &mut GoNames,
-        ) {
-            let kind = node.kind();
-            let scope = if matches!(
-                kind,
-                "block"
-                    | "function_declaration"
-                    | "method_declaration"
-                    | "func_literal"
-                    | "for_statement"
-            ) {
-                node.byte_range()
-            } else {
-                scope
-            };
-            if kind == "import_spec" {
-                let name = node
-                    .child_by_field_name("name")
-                    .and_then(|n| n.utf8_text(text.as_bytes()).ok())
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        node.child_by_field_name("path")
-                            .and_then(|n| n.utf8_text(text.as_bytes()).ok())
-                            .map(|s| {
-                                s.trim_matches(['"', '`'])
-                                    .rsplit('/')
-                                    .next()
-                                    .unwrap_or(s)
-                                    .to_owned()
-                            })
-                    });
-                if let Some(name) = name {
-                    names.packages.insert(name);
-                }
+        let mut names = Self::default();
+        // The tree is walked with a cursor instead of with recursion: a
+        // generated file can nest thousands of levels deep, and the worker
+        // thread has a small stack.
+        let mut cursor = root.walk();
+        // The scope every node on the way down inherits.
+        let mut scopes: Vec<std::ops::Range<usize>> = vec![root.byte_range()];
+        loop {
+            let node = cursor.node();
+            let inherited = scopes.last().cloned().unwrap_or_else(|| node.byte_range());
+            let scope = scope_of(node, inherited);
+            if let Some(last) = scopes.last_mut() {
+                *last = scope.clone();
             }
-            if matches!(
-                kind,
-                "parameter_declaration"
-                    | "variadic_parameter_declaration"
-                    | "var_spec"
-                    | "const_spec"
-            ) {
-                for name in node.children_by_field_name("name", &mut node.walk()) {
-                    if let Ok(name) = name.utf8_text(text.as_bytes()) {
-                        names.shadows.push((name.to_owned(), scope.clone()));
-                    }
-                }
+            names.visit(node, text, &scope);
+            if cursor.goto_first_child() {
+                scopes.push(scope);
+                continue;
             }
-            if kind == "short_var_declaration"
-                && let Some(left) = node.child_by_field_name("left")
-            {
-                for name in left.named_children(&mut left.walk()) {
-                    if name.kind() == "identifier"
-                        && let Ok(name) = name.utf8_text(text.as_bytes())
-                    {
-                        names
-                            .shadows
-                            .push((name.to_owned(), node.end_byte()..scope.end));
-                    }
+            // Climb up until a sibling is found.
+            loop {
+                if cursor.goto_next_sibling() {
+                    break;
                 }
-            }
-            for child in node.named_children(&mut node.walk()) {
-                visit(child, text, scope.clone(), names);
+                if !cursor.goto_parent() {
+                    return names;
+                }
+                scopes.pop();
             }
         }
-        let mut names = Self::default();
-        visit(root, text, root.byte_range(), &mut names);
-        names
     }
+
+    fn visit(&mut self, node: tree_sitter::Node<'_>, text: &str, scope: &std::ops::Range<usize>) {
+        let kind = node.kind();
+        if kind == "import_spec" {
+            let name = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(text.as_bytes()).ok())
+                .map(str::to_owned)
+                .or_else(|| {
+                    node.child_by_field_name("path")
+                        .and_then(|n| n.utf8_text(text.as_bytes()).ok())
+                        .map(|s| {
+                            s.trim_matches(['"', '`'])
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(s)
+                                .to_owned()
+                        })
+                });
+            if let Some(name) = name {
+                self.packages.insert(name);
+            }
+        }
+        if matches!(
+            kind,
+            "parameter_declaration" | "variadic_parameter_declaration" | "var_spec" | "const_spec"
+        ) {
+            for name in node.children_by_field_name("name", &mut node.walk()) {
+                if let Ok(name) = name.utf8_text(text.as_bytes()) {
+                    self.shadow(name, scope.clone());
+                }
+            }
+        }
+        if kind == "short_var_declaration"
+            && let Some(left) = node.child_by_field_name("left")
+        {
+            for name in left.named_children(&mut left.walk()) {
+                if name.kind() == "identifier"
+                    && let Ok(name) = name.utf8_text(text.as_bytes())
+                {
+                    self.shadow(name, node.end_byte()..scope.end);
+                }
+            }
+        }
+    }
+
+    fn shadow(&mut self, name: &str, range: std::ops::Range<usize>) {
+        self.shadows.entry(name.to_owned()).or_default().push(range);
+    }
+
     fn is_package(&self, node: tree_sitter::Node<'_>, text: &str) -> bool {
         let Ok(name) = node.utf8_text(text.as_bytes()) else {
             return false;
         };
-        self.packages.contains(name)
-            && !self
-                .shadows
+        if !self.packages.contains(name) {
+            return false;
+        }
+        // The names that shadow the package are few, so the lookup is by
+        // name and not over every shadowed name in the file.
+        self.shadows.get(name).is_none_or(|ranges| {
+            !ranges
                 .iter()
-                .any(|(shadow, range)| shadow == name && range.contains(&node.start_byte()))
+                .any(|range| range.contains(&node.start_byte()))
+        })
+    }
+}
+
+/// The scope a node opens, if it opens one.
+fn scope_of(
+    node: tree_sitter::Node<'_>,
+    inherited: std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    if matches!(
+        node.kind(),
+        "block" | "function_declaration" | "method_declaration" | "func_literal" | "for_statement"
+    ) {
+        node.byte_range()
+    } else {
+        inherited
     }
 }
 

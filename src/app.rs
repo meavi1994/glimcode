@@ -457,10 +457,20 @@ impl Coder {
         }
     }
 
+    /// Ask the user before a step that would lose work.
+    ///
+    /// A question that is already on screen is kept, so a request is never
+    /// silently dropped.
+    fn ask(&mut self, pending: Pending) {
+        if self.pending.is_none() {
+            self.pending = Some(pending);
+        }
+    }
+
     fn request_project(&mut self, root: PathBuf) {
         self.commit_current_sheet();
         if self.documents.iter().any(|doc| doc.dirty) {
-            self.pending = Some(Pending::SwitchProject(root));
+            self.ask(Pending::SwitchProject(root));
         } else if self.defer_actions {
             self.actions.push(FrameAction::SwitchProject(root));
         } else {
@@ -661,6 +671,10 @@ impl Coder {
         self.search_cancel.store(true, Ordering::Relaxed);
         self.search_cancel = Arc::new(AtomicBool::new(false));
         self.search_rx = None;
+        // A manual search replaces any pending click. The ranking of the
+        // previous click is cancelled as well: it would move the selection of
+        // the new search and report a token that is not searched for.
+        self.cancel_focus();
         if use_cursor
             && let Some(doc) = self.documents.get(self.active)
             && let Content::Text(text) = &doc.content
@@ -671,6 +685,14 @@ impl Coder {
             }
         }
         if self.query.trim().is_empty() {
+            // The results of the previous query do not answer this one.
+            self.results.clear();
+            self.results_revision += 1;
+            self.open_matches = 0;
+            self.result_selection = 0;
+            self.preview.clear();
+            self.search_highlight.clear();
+            self.search_note = "Type something to search".into();
             return;
         }
         self.search_kind = kind;
@@ -680,8 +702,6 @@ impl Coder {
         self.preview.clear();
         self.search_highlight.clear();
         self.selected_category = None;
-        // A manual search replaces any pending click.
-        self.pending_click = None;
         self.extension_filter = None;
         self.results.clear();
         self.results_revision += 1;
@@ -689,13 +709,16 @@ impl Coder {
         self.search_note = "Searching opened and changed files…".into();
         let root = self.root.clone();
         let query = self.query.clone();
+        // Only the files that changed are copied. The rest is read by the
+        // worker, so a search does not freeze the interface.
         let buffers = std::iter::once(self.active)
             .chain((0..self.documents.len()).filter(|index| *index != self.active))
             .filter_map(|index| self.documents.get(index))
             .map(|doc| {
                 let source = match &doc.content {
-                    Content::Text(text) => text.clone(),
-                    Content::Csv(sheet) => sheet.serialize().unwrap_or_default(),
+                    Content::Text(text) if doc.dirty => Some(text.clone()),
+                    Content::Text(_) => None,
+                    Content::Csv(sheet) => Some(sheet.serialize().unwrap_or_default()),
                 };
                 (doc.path.clone(), source)
             })
@@ -719,7 +742,7 @@ impl Coder {
                 &query,
                 kind,
                 exclude_tests,
-                &buffers,
+                buffers,
                 priority_paths,
                 cancelled,
                 |update| {
@@ -864,9 +887,14 @@ impl Coder {
         }
     }
 
+    /// The text of the open files that changed.
+    ///
+    /// The files that were not changed are read by the worker, so a click
+    /// does not copy every open file.
     fn editor_buffers(&self) -> Vec<(PathBuf, String)> {
         self.documents
             .iter()
+            .filter(|doc| doc.dirty)
             .map(|doc| {
                 let source = match &doc.content {
                     Content::Text(text) => text.clone(),
@@ -1480,14 +1508,22 @@ impl Coder {
                         .collect();
                     let syntax = match &doc.content {
                         Content::Text(text) if !crate::editor_analysis::is_large(text) => {
-                            Some(crate::highlighting::highlight(
-                                ui,
-                                text,
-                                doc.path
-                                    .extension()
-                                    .and_then(|ext| ext.to_str())
-                                    .unwrap_or(""),
-                            ))
+                            // The colors are the ones the editor paints, so
+                            // the same cached result is used.
+                            let fingerprint = egui::util::hash(text.as_str());
+                            Some(
+                                syntax_cache(
+                                    ui,
+                                    &doc.path,
+                                    text,
+                                    doc.path
+                                        .extension()
+                                        .and_then(|ext| ext.to_str())
+                                        .unwrap_or(""),
+                                    fingerprint,
+                                )
+                                .job,
+                            )
                         }
                         _ => None,
                     };
@@ -1580,7 +1616,12 @@ impl Coder {
                 });
         } else {
             let size = ctx.content_rect().size();
-            let width = (size.x - 100.0).clamp(480.0, 980.0);
+            // The window has to fit into the viewport, also on a small
+            // screen, or its field is cut off and cannot be reached.
+            let width = (size.x - 100.0)
+                .clamp(320.0, 980.0)
+                .min(size.x - 32.0)
+                .max(240.0);
             let mut open = true;
             egui::Window::new("Find in Files")
                 .id(egui::Id::new("find-in-files"))
@@ -1588,9 +1629,9 @@ impl Coder {
                 .collapsible(false)
                 .resizable(true)
                 .open(&mut open)
-                .default_pos(egui::pos2((size.x - width) / 2.0, 85.0))
+                .default_pos(egui::pos2(((size.x - width) / 2.0).max(8.0), 85.0))
                 .default_width(width - 48.0)
-                .min_width(480.0)
+                .min_width(240.0)
                 .default_height((size.y * 0.78).clamp(350.0, 720.0))
                 .min_height(350.0)
                 .frame(chrome::popup_frame().inner_margin(14))
@@ -1759,12 +1800,6 @@ impl Coder {
                 ui.spinner();
             }
         });
-        self.search_view.refresh(
-            &self.results,
-            self.results_revision,
-            self.selected_category,
-            self.extension_filter.as_deref(),
-        );
         ui.horizontal_wrapped(|ui| {
             crate::preferences::search_filter_style(ui);
             category_toggle(
@@ -1786,6 +1821,7 @@ impl Coder {
                 );
             }
         });
+        // The filter buttons may have changed the category.
         self.search_view.refresh(
             &self.results,
             self.results_revision,
@@ -1977,6 +2013,9 @@ impl Coder {
         }
         drag.on_hover_cursor(egui::CursorIcon::ResizeVertical)
             .on_hover_text("Drag to resize results and preview · ↑/↓ to select · Enter to open");
+        // The key is taken even when there is nothing to open, so it does not
+        // reach the editor or the terminal behind the panel.
+        let enter = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
         if let Some(index) = visible.get(self.result_selection) {
             let location = self.results[*index].clone();
             ui.horizontal(|ui| {
@@ -1997,7 +2036,7 @@ impl Coder {
                 );
             });
             self.search_preview(ui, &location, preview_height);
-            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
+            if enter {
                 navigate = Some(location);
             }
         } else {
@@ -2288,7 +2327,7 @@ impl Coder {
                 }
                 if let Some(index) = close {
                     if self.documents[index].dirty {
-                        self.pending = Some(Pending::Close(index));
+                        self.ask(Pending::Close(index));
                         self.commit_current_sheet();
                     } else {
                         self.close(index, ctx);
@@ -2442,7 +2481,13 @@ impl Coder {
                 let path = doc.path.clone();
                 ui.push_id(&path, |ui| match &mut doc.content {
                     Content::Csv(sheet) => {
-                        doc.dirty |= sheet.ui(ui);
+                        let changed = sheet.ui(ui);
+                        if changed {
+                            // The grid changed, so the cached hash of the
+                            // buffer is stale.
+                            doc.mark_changed();
+                        }
+                        doc.dirty |= changed;
                     }
                     Content::Text(text) => {
                         let mut changed = false;
@@ -2622,7 +2667,15 @@ impl Coder {
                     }
                     match self.pending {
                         Some(Pending::Close(i) | Pending::Reload(i)) => {
-                            chrome::dialog_path(ui, &self.documents[i].path)
+                            // The document may have been closed while the
+                            // question was on screen.
+                            match self.documents.get(i) {
+                                Some(doc) => chrome::dialog_path(ui, &doc.path),
+                                None => {
+                                    self.pending = None;
+                                    return;
+                                }
+                            }
                         }
                         _ => {
                             let dirty: Vec<_> =
@@ -2846,9 +2899,6 @@ impl Coder {
         if key(M::ALT, Key::F7) {
             self.start_search(SearchKind::References, true);
         }
-        if mac && key(M::ALT, Key::F12) {
-            self.start_search(SearchKind::References, true);
-        }
         if key(M::COMMAND | M::SHIFT, Key::F) {
             self.open_search();
         } else if key(M::COMMAND, Key::F) {
@@ -2871,7 +2921,7 @@ impl Coder {
         }
         if key(M::COMMAND, Key::W) && !self.documents.is_empty() {
             if self.documents[self.active].dirty {
-                self.pending = Some(Pending::Close(self.active));
+                self.ask(Pending::Close(self.active));
                 self.commit_current_sheet();
             } else {
                 self.close(self.active, ctx);
@@ -2895,6 +2945,7 @@ impl Coder {
             {
                 edit_line(text, doc.cursor, &doc.path, duplicate);
                 doc.dirty = true;
+                doc.mark_changed();
                 doc.outline_refresh = Some(Instant::now());
             }
         }
@@ -3075,7 +3126,8 @@ impl Coder {
                                     parent.as_deref(),
                                     &location.path,
                                     self.folders.binary_search(&location.path).is_ok(),
-                                    file_query,
+                                    &highlight_term(&display, file_query),
+                                    &highlight_term(parent.as_deref().unwrap_or(""), file_query),
                                     dialog_size,
                                     selected,
                                 );
@@ -3154,7 +3206,7 @@ impl Coder {
             && self.documents.iter().any(|d| d.dirty)
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.pending = Some(Pending::Exit);
+            self.ask(Pending::Exit);
             self.commit_current_sheet();
         }
         self.toolbar(ctx);
@@ -3201,9 +3253,17 @@ impl Coder {
                     self.save(index);
                 }
                 FrameAction::Close(index) => self.close(index, ctx),
-                FrameAction::Activate(index) => self.active = index,
+                FrameAction::Activate(index) => {
+                    if index < self.documents.len() {
+                        self.active = index;
+                    }
+                }
                 FrameAction::GitDiff(index) => {
-                    let doc = &self.documents[index];
+                    // The index was taken in an earlier frame, and a document
+                    // may have been closed in between.
+                    let Some(doc) = self.documents.get(index) else {
+                        continue;
+                    };
                     let buffer = if doc.dirty {
                         match &doc.content {
                             Content::Text(text) => Some(text.clone()),
@@ -3215,8 +3275,11 @@ impl Coder {
                     self.git.open_review(doc.path.clone(), buffer, ctx);
                 }
                 FrameAction::Reload(index) => {
-                    if self.documents[index].dirty {
-                        self.pending = Some(Pending::Reload(index));
+                    let Some(doc) = self.documents.get(index) else {
+                        continue;
+                    };
+                    if doc.dirty {
+                        self.ask(Pending::Reload(index));
                     } else if let Err(error) = self.documents[index].reload(self.csv_headers) {
                         self.error = Some(error.to_string());
                     }
@@ -3351,6 +3414,7 @@ fn reason_label(label: &str) -> &'static str {
         "above" => "above the click",
         "recent" => "open recently",
         "focus" => "focused file",
+        "dir" => "next to the file",
         "noise" => "test/vendor penalty",
         "size" => "large file penalty",
         "dup" => "duplicate name penalty",
@@ -3358,13 +3422,34 @@ fn reason_label(label: &str) -> &'static str {
     }
 }
 
+/// The part of the term that the text holds, so the mark is visible.
+///
+/// A path is typed with separators, and the name of a file holds only its
+/// last part. Marking that part shows why the row is in the list.
+fn highlight_term(text: &str, query: &str) -> String {
+    if query.is_empty() {
+        return String::new();
+    }
+    let lower = text.to_lowercase();
+    if lower.contains(&query.to_lowercase()) {
+        return query.to_owned();
+    }
+    query
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty() && lower.contains(&part.to_lowercase()))
+        .unwrap_or(query)
+        .to_owned()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn picker_result_row(
     ui: &mut egui::Ui,
     name: &str,
     parent: Option<&str>,
     path: &Path,
     folder: bool,
-    query: &str,
+    name_query: &str,
+    parent_query: &str,
     font_size: f32,
     selected: bool,
 ) -> egui::Response {
@@ -3373,7 +3458,7 @@ fn picker_result_row(
     let padding = 8.0;
     let gap = 3.0;
     let text_width = (width - text_left - 12.0).max(1.0);
-    let layout = |text: &str, size: f32, color: Color32| {
+    let layout = |text: &str, query: &str, size: f32, color: Color32| {
         let mut job = chrome::highlighted(text, query, size);
         for section in &mut job.sections {
             if section.format.background == Color32::TRANSPARENT {
@@ -3385,8 +3470,15 @@ fn picker_result_row(
         job.wrap.break_anywhere = true;
         ui.fonts_mut(|fonts| fonts.layout_job(job))
     };
-    let name = layout(name, font_size, chrome::TEXT);
-    let parent = parent.map(|parent| layout(parent, (font_size - 1.0).max(10.0), chrome::MUTED));
+    let name = layout(name, name_query, font_size, chrome::TEXT);
+    let parent = parent.map(|parent| {
+        layout(
+            parent,
+            parent_query,
+            (font_size - 1.0).max(10.0),
+            chrome::MUTED,
+        )
+    });
     let height =
         padding * 2.0 + name.size().y + parent.as_ref().map_or(0.0, |parent| gap + parent.size().y);
     let (rect, response) =
@@ -3756,14 +3848,19 @@ fn markdown_preview(ui: &mut egui::Ui, cache: &mut MarkdownCache, text: &str, pa
                 );
                 style.spacing.item_spacing.y = 12.0;
                 style.url_in_tooltip = true;
+                // A document that could not be resolved to an absolute path
+                // has no directory to resolve the images against. The preview
+                // is still shown, without the images.
                 let directory =
-                    url::Url::from_directory_path(path.parent().unwrap_or(Path::new(".")))
-                        .expect("document directory is absolute");
+                    url::Url::from_directory_path(path.parent().unwrap_or(Path::new("."))).ok();
                 let base = directory.clone();
                 let html = move |ui: &mut egui::Ui, source: &str| {
                     // Render inert image tags only; never execute embedded HTML or scripts.
                     let render = |ui: &mut egui::Ui| {
                         for image in html_images(source) {
+                            let Some(base) = &base else {
+                                continue;
+                            };
                             let Ok(uri) = base.join(&image.src) else {
                                 continue;
                             };
@@ -3801,11 +3898,13 @@ fn markdown_preview(ui: &mut egui::Ui, cache: &mut MarkdownCache, text: &str, pa
                     }
                 };
                 cache.prepare(text);
-                CommonMarkViewer::new()
-                    .default_implicit_uri_scheme(directory.to_string())
+                let mut viewer = CommonMarkViewer::new()
                     .max_image_width(Some(ui.available_width().max(1.0) as usize))
-                    .render_html_fn(Some(&html))
-                    .show_events(ui, &mut cache.native, cache.events.iter().cloned());
+                    .render_html_fn(Some(&html));
+                if let Some(directory) = &directory {
+                    viewer = viewer.default_implicit_uri_scheme(directory.to_string());
+                }
+                viewer.show_events(ui, &mut cache.native, cache.events.iter().cloned());
             });
         });
 }
@@ -3925,6 +4024,66 @@ fn release_editor_state(ctx: &egui::Context, id: egui::Id) {
     });
 }
 
+/// The syntax colors of a document, kept between frames.
+///
+/// The text is parsed and laid out once per change instead of once per
+/// frame, and the editor and the panels share one copy of the result.
+#[derive(Clone)]
+struct SyntaxCache {
+    path: PathBuf,
+    /// The fingerprint of the text the colors belong to.
+    fingerprint: u64,
+    extension: String,
+    dark: bool,
+    /// The size of the editor font, which the colors are laid out for.
+    size: f32,
+    job: Arc<egui::text::LayoutJob>,
+    regions: Arc<Vec<crate::folding::Region>>,
+}
+
+/// The syntax colors of the text, computed when the text changed.
+///
+/// The caller passes the fingerprint of the text, so the text is not hashed
+/// again for every panel that shows it.
+fn syntax_cache(
+    ui: &egui::Ui,
+    path: &Path,
+    text: &str,
+    extension: &str,
+    fingerprint: u64,
+) -> SyntaxCache {
+    // One entry for the editor, so the memory of a file is released when
+    // another one is shown.
+    let id = egui::Id::new("editor-syntax");
+    let dark = ui.visuals().dark_mode;
+    let size = crate::preferences::editor_font_size(ui.ctx());
+    let cached = ui.ctx().data_mut(|data| data.get_temp::<SyntaxCache>(id));
+    if let Some(cache) = cached
+        && cache.path == path
+        && cache.fingerprint == fingerprint
+        && cache.extension == extension
+        && cache.dark == dark
+        && cache.size == size
+    {
+        return cache;
+    }
+    let job = crate::highlighting::highlight(ui, text, extension);
+    let structure = crate::editor_structure::Structure::build(&job);
+    let regions = crate::folding::regions(&job.text, &structure, extension);
+    let cache = SyntaxCache {
+        path: path.to_path_buf(),
+        fingerprint,
+        extension: extension.to_owned(),
+        dark,
+        size,
+        job: job.clone(),
+        regions: Arc::new(regions),
+    };
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(id, cache.clone()));
+    cache
+}
+
 fn text_editor(
     ui: &mut egui::Ui,
     text: &mut String,
@@ -3997,14 +4156,10 @@ fn text_editor(
     let analysis = large
         .then(|| crate::editor_analysis::get(ui, text, path))
         .flatten();
-    let small_regions = if large {
-        Vec::new()
+    let small_regions: Arc<Vec<crate::folding::Region>> = if large {
+        Arc::new(Vec::new())
     } else {
-        let job = crate::highlighting::highlight(ui, text, extension);
-        ui.ctx().memory_mut(|memory| {
-            memory.caches.cache::<egui::cache::FrameCache<Vec<crate::folding::Region>, crate::folding::Computer>>()
-                .get((&job, extension))
-        })
+        syntax_cache(ui, path, text, extension, source_hash).regions
     };
     let fold_regions = analysis
         .as_ref()
@@ -4070,7 +4225,10 @@ fn text_editor(
                 |a| a.syntax.clone(),
             )
         } else {
-            crate::highlighting::highlight(ui, buffer.as_str(), extension)
+            // The job is shared with the panels that show the same text, so
+            // it is copied only when it is changed here.
+            let mut shared = crate::highlighting::highlight(ui, buffer.as_str(), extension);
+            std::mem::take(&mut *Arc::make_mut(&mut shared))
         };
         for section in &mut job.sections {
             section.format.font_id.size = font_size;
@@ -4728,6 +4886,18 @@ fn edit_line(text: &mut String, cursor: usize, path: &Path, duplicate: bool) {
 mod tests {
     use super::*;
     use crate::search_view::{extension, result_visible};
+    #[test]
+    fn the_picker_marks_the_part_of_the_term_that_is_in_the_row() {
+        // The term is in the name.
+        assert_eq!(highlight_term("app.rs", "app"), "app");
+        // A path is typed with separators, and the name holds the last part.
+        assert_eq!(highlight_term("app.rs", "src/app"), "app");
+        // The term is in the directory.
+        assert_eq!(highlight_term("src", "src/app"), "src");
+        // Nothing of the term is in the text, so the term is kept.
+        assert_eq!(highlight_term("main.go", "zzz"), "zzz");
+        assert_eq!(highlight_term("main.go", ""), "");
+    }
     #[test]
     fn search_results_and_filter_fonts_update_independently_in_both_layouts() {
         let ctx = egui::Context::default();
@@ -5842,7 +6012,7 @@ mod tests {
                             for (index, name) in ["api", "main.go", "a_very_long_file_name_that_should_be_truncated_猫.rs", "main_test.go"].iter().enumerate() {
                                 let response = picker_result_row(ui, name,
                                     Some("staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/testing/long_parent"),
-                                    Path::new(name), index == 0, "main", font_size, index == 0);
+                                    Path::new(name), index == 0, "main", "main", font_size, index == 0);
                                 rows.push(response.rect);
                             }
                             assert!(ui.min_rect().bottom() >= rows.last().unwrap().bottom());

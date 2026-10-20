@@ -599,13 +599,7 @@ impl Terminal {
         // screen. A shell that starts with the wrong width builds its prompt
         // for that width, and a right aligned prompt keeps it until the next
         // command.
-        if let Some(size) = self.size {
-            for (index, tab) in self.tabs.iter_mut().enumerate() {
-                if index != self.active && tab.size == (0, 0) {
-                    tab.send(Command::Resize(size));
-                }
-            }
-        }
+        self.sync_background_size();
         if new {
             self.new_tab(root, ctx);
         }
@@ -613,6 +607,32 @@ impl Terminal {
             self.request_close(index);
         }
     }
+    /// Tell the tabs in the background about the size of the panel.
+    ///
+    /// The size a tab was told about is remembered, so a background tab is
+    /// resized once instead of on every frame. A resize per frame floods the
+    /// session queue, keeps the shell busy redrawing, and pushes the user's
+    /// own input to the back of the line.
+    fn sync_background_size(&mut self) {
+        let Some(size) = self.size else {
+            return;
+        };
+        let pty = PtySize {
+            rows: size.rows,
+            cols: size.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            if index != self.active
+                && tab.size != (pty.rows, pty.cols)
+                && tab.send(Command::Resize(pty))
+            {
+                tab.size = (pty.rows, pty.cols);
+            }
+        }
+    }
+
     pub fn shortcuts(&mut self, ctx: &egui::Context, root: &Path) {
         if !self.focused(ctx) {
             return;
@@ -1458,11 +1478,23 @@ fn render(
         });
     }
     if copy && let Some((start, end)) = selection {
+        // The selection is measured in the panel, but the screen the shell
+        // drew may be narrower. A column past the last one makes the terminal
+        // library subtract past zero, so the selection is clamped to the
+        // screen before it is read.
+        let (rows, cols) = state.parser.screen().size();
+        let clamp = |(row, col): (u16, u16)| {
+            (
+                row.min(rows.saturating_sub(1)),
+                col.min(cols.saturating_sub(1)),
+            )
+        };
+        let (start, end) = (clamp(start), clamp(end));
         ui.ctx().copy_text(state.parser.screen().contents_between(
             start.0,
             start.1,
             end.0,
-            end.1 + 1,
+            end.1.saturating_add(1).min(cols),
         ));
     }
     if !outgoing.is_empty() {
@@ -2365,6 +2397,72 @@ mod tests {
         wait_for(&first_state, |s| s.exited);
         Ok(())
     }
+    #[test]
+    fn a_background_tab_is_resized_once_per_size_change() {
+        let (tx, rx) = mpsc::sync_channel(128);
+        let screen = Arc::new(Mutex::new(ScreenState::default()));
+        let background = Session {
+            id: 2,
+            root: "/project".into(),
+            shell: "/bin/sh".into(),
+            default_name: String::new(),
+            screen: screen.clone(),
+            tx,
+            stopped: Arc::new(AtomicBool::new(false)),
+            killer: Arc::new(Mutex::new(None)),
+            size: (0, 0),
+            selection: None,
+            scroll_remainder: 0.0,
+        };
+        let (tx, rx_active) = mpsc::sync_channel(128);
+        let active = Session {
+            id: 1,
+            root: "/project".into(),
+            shell: "/bin/sh".into(),
+            default_name: String::new(),
+            screen,
+            tx,
+            stopped: Arc::new(AtomicBool::new(false)),
+            killer: Arc::new(Mutex::new(None)),
+            size: (24, 80),
+            selection: None,
+            scroll_remainder: 0.0,
+        };
+        let mut terminal = Terminal {
+            tabs: vec![active, background],
+            active: 0,
+            size: Some(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            }),
+            ..Default::default()
+        };
+        // The background tab learns the size once, not on every frame.
+        terminal.sync_background_size();
+        terminal.sync_background_size();
+        let resizes = rx
+            .try_iter()
+            .filter(|command| matches!(command, Command::Resize(_)))
+            .count();
+        assert_eq!(resizes, 1, "the tab must be resized once");
+        assert!(rx_active.try_iter().next().is_none());
+        // A new size is sent again.
+        terminal.size = Some(PtySize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+        terminal.sync_background_size();
+        let resizes = rx
+            .try_iter()
+            .filter(|command| matches!(command, Command::Resize(_)))
+            .count();
+        assert_eq!(resizes, 1, "a new size must be sent again");
+    }
+
     #[test]
     fn focus_persists_and_paste_uses_terminal_input_not_an_editor() {
         let ctx = egui::Context::default();

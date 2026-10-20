@@ -116,6 +116,10 @@ pub fn file_icon(path: &Path) -> RichText {
     RichText::new(icon).monospace().size(12.0).color(color)
 }
 
+/// Lay out `text` with every occurrence of `query` highlighted.
+///
+/// The match ignores case, because the file picker filters case-insensitively
+/// as well: a term that keeps a row visible must also be visible in it.
 pub fn highlighted(text: &str, query: &str, size: f32) -> LayoutJob {
     let mut job = LayoutJob::default();
     let normal = egui::TextFormat::simple(FontId::proportional(size), TEXT);
@@ -128,18 +132,36 @@ pub fn highlighted(text: &str, query: &str, size: f32) -> LayoutJob {
         job.append(text, 0.0, normal);
         return job;
     }
-    // Search results are literal and case-sensitive, matching ripgrep's search mode.
-    let mut remaining = text;
-    while let Some(index) = remaining.find(query) {
-        job.append(&remaining[..index], 0.0, normal.clone());
-        job.append(
-            &remaining[index..index + query.len()],
-            0.0,
-            highlight.clone(),
-        );
-        remaining = &remaining[index + query.len()..];
+    let needle: Vec<char> = query.chars().map(lower_char).collect();
+    let haystack: Vec<char> = text.chars().collect();
+    let lowered: Vec<char> = haystack
+        .iter()
+        .map(|character| lower_char(*character))
+        .collect();
+    // Byte offset of every character, so the original text can be sliced.
+    let mut offsets: Vec<usize> = Vec::with_capacity(haystack.len() + 1);
+    let mut offset = 0;
+    for character in &haystack {
+        offsets.push(offset);
+        offset += character.len_utf8();
     }
-    job.append(remaining, 0.0, normal);
+    offsets.push(offset);
+    let mut index = 0;
+    let mut cursor = 0;
+    while index + needle.len() <= haystack.len() {
+        let matched = lowered[index..index + needle.len()] == needle[..];
+        if matched {
+            let start = offsets[index];
+            let end = offsets[index + needle.len()];
+            job.append(&text[cursor..start], 0.0, normal.clone());
+            job.append(&text[start..end], 0.0, highlight.clone());
+            cursor = end;
+            index += needle.len();
+        } else {
+            index += 1;
+        }
+    }
+    job.append(&text[cursor..], 0.0, normal);
     job
 }
 
@@ -166,13 +188,31 @@ pub fn trim_start(job: &mut LayoutJob) {
 #[derive(Clone, Default)]
 pub struct CaseFilter {
     needle: Vec<char>,
+    /// KMP failure table: `failure[i]` is the length of the longest proper
+    /// prefix of `needle[..=i]` that is also a suffix of it.
+    failure: Vec<usize>,
+}
+
+/// The lowercase form of a character, keeping one character per character.
+fn lower_char(character: char) -> char {
+    character.to_lowercase().next().unwrap_or(character)
 }
 
 impl CaseFilter {
     pub fn new(needle: &str) -> Self {
-        Self {
-            needle: needle.chars().flat_map(char::to_lowercase).collect(),
+        let needle: Vec<char> = needle.chars().map(lower_char).collect();
+        let mut failure = vec![0; needle.len()];
+        let mut matched = 0;
+        for index in 1..needle.len() {
+            while matched > 0 && needle[index] != needle[matched] {
+                matched = failure[matched - 1];
+            }
+            if needle[index] == needle[matched] {
+                matched += 1;
+            }
+            failure[index] = matched;
         }
+        Self { needle, failure }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -180,21 +220,27 @@ impl CaseFilter {
     }
 
     /// Whether the text contains the term, ignoring case.
+    ///
+    /// The scan is the Knuth-Morris-Pratt algorithm: a mismatch falls back to
+    /// the longest prefix that is still a suffix, so overlapping terms such
+    /// as `aab` inside `aaab` are found. A plain "restart at the first
+    /// character" scan misses them and hides rows that do match.
     pub fn matches(&self, text: &str) -> bool {
         let needle = &self.needle;
         if needle.is_empty() {
             return true;
         }
-        let mut index = 0;
-        for character in text.chars().flat_map(char::to_lowercase) {
-            if character == needle[index] {
-                index += 1;
-                if index == needle.len() {
+        let mut matched = 0;
+        for character in text.chars() {
+            let character = lower_char(character);
+            while matched > 0 && character != needle[matched] {
+                matched = self.failure[matched - 1];
+            }
+            if character == needle[matched] {
+                matched += 1;
+                if matched == needle.len() {
                     return true;
                 }
-            } else {
-                // The match can start again on this character.
-                index = usize::from(character == needle[0]);
             }
         }
         false
@@ -426,6 +472,45 @@ pub fn tree_button(ui: &mut egui::Ui, action: usize) -> egui::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_case_filter_finds_overlapping_terms() {
+        // A naive scan restarts at the first character on a mismatch and
+        // misses this one, which hid rows that do match.
+        assert!(CaseFilter::new("aab").matches("aaab"));
+        assert!(CaseFilter::new("abab").matches("xxababyy"));
+        assert!(CaseFilter::new("abc").matches("ABC"));
+        assert!(!CaseFilter::new("abc").matches("abd"));
+        assert!(!CaseFilter::new("abc").matches("ab"));
+        assert!(CaseFilter::new("").matches("anything"));
+    }
+
+    #[test]
+    fn the_case_filter_matches_the_text_it_filters() {
+        for (needle, text, expected) in [
+            ("app", "src/App.rs", true),
+            ("app", "src/app.rs", true),
+            ("src/app", "src/app.rs", true),
+            ("zzz", "src/app.rs", false),
+        ] {
+            assert_eq!(
+                CaseFilter::new(needle).matches(text),
+                expected,
+                "{needle} in {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_picker_highlights_the_term_it_filters_with() {
+        let job = highlighted("App.rs", "app", 12.0);
+        let highlighted_sections = job
+            .sections
+            .iter()
+            .filter(|section| section.format.background != Color32::TRANSPARENT)
+            .count();
+        assert_eq!(highlighted_sections, 1, "the term must be marked");
+        assert!(job.text.contains("App.rs"));
+    }
     #[test]
     fn folder_labels_keep_a_fixed_gap_at_wide_sizes_and_display_scales() {
         for scale in [1.0, 1.5, 2.0] {

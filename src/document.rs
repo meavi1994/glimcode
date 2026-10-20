@@ -48,18 +48,28 @@ pub struct Document {
     /// Bumped whenever the text changes, so the cached cursor position is
     /// refreshed.
     revision: u64,
-    /// Cached line and column of the cursor: (revision, cursor, line, column).
-    cursor_position: std::cell::Cell<Option<(u64, usize, usize, usize)>>,
+    /// Cached cursor position: (revision, cursor, byte, line, line start).
+    cursor_position: std::cell::Cell<Option<CursorPosition>>,
     /// Fingerprint of the file on disk, used to skip needless reads.
     disk_stamp: Option<DiskStamp>,
     /// Hash of the file on disk. The text itself is not kept, so an open
     /// document holds one copy less.
     disk_hash: Option<u64>,
     disk_checked: Instant,
+    /// Hash of the buffer as it is now: (revision, hash). The status bar asks
+    /// whether the file changed on disk every frame, and hashing the whole
+    /// text again each time is expensive in a large file.
+    buffer_hash: std::cell::Cell<Option<(u64, u64)>>,
+    /// Hash of the text as it was loaded or saved.
+    original_hash: std::cell::Cell<Option<u64>>,
 }
 
 /// Cheap fingerprint of a file: its size and modification time.
 type DiskStamp = (u64, u64);
+
+/// The cached cursor position: the revision it belongs to, the cursor, the
+/// byte offset of the cursor, the line and the start of the line.
+type CursorPosition = (u64, usize, usize, usize, usize);
 
 fn content_hash(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -137,6 +147,8 @@ impl Document {
             disk_stamp: disk_stamp(&source_path),
             disk_hash: Some(content_hash(&source)),
             disk_checked: Instant::now(),
+            buffer_hash: std::cell::Cell::new(None),
+            original_hash: std::cell::Cell::new(Some(content_hash(&source))),
             original: source,
         })
     }
@@ -191,33 +203,86 @@ impl Document {
     /// The one-based line and column of the cursor.
     ///
     /// The result is cached, because the status bar asks for it every frame
-    /// and walking the document is expensive in a large file.
+    /// and walking the document is expensive in a large file. A cursor that
+    /// moved without the text changing is found by walking the short
+    /// distance to it.
     pub fn cursor_line_column(&self, cursor: usize) -> (usize, usize) {
         let Content::Text(text) = &self.content else {
             return (1, 1);
         };
-        if let Some((revision, cached, line, column)) = self.cursor_position.get()
-            && revision == self.revision
-            && cached == cursor
-        {
-            return (line, column);
+        if let Some((revision, cached, byte, line, line_start)) = self.cursor_position.get() {
+            if revision == self.revision && cached == cursor {
+                return (line, byte - line_start + 1);
+            }
+            if revision == self.revision
+                && let Some((byte, line, line_start)) =
+                    self.walk_to(text, cached, byte, line, line_start, cursor)
+            {
+                self.cursor_position
+                    .set(Some((self.revision, cursor, byte, line, line_start)));
+                return (line, byte - line_start + 1);
+            }
         }
-        let byte = text
-            .char_indices()
-            .nth(cursor)
-            .map_or(text.len(), |(byte, _)| byte);
-        let prefix = &text[..byte];
-        let line = prefix.bytes().filter(|&byte| byte == b'\n').count() + 1;
-        let column = prefix.rsplit('\n').next().unwrap_or("").len() + 1;
+        let (byte, line, line_start) = self.scan_to(text, cursor);
         self.cursor_position
-            .set(Some((self.revision, cursor, line, column)));
-        (line, column)
+            .set(Some((self.revision, cursor, byte, line, line_start)));
+        (line, byte - line_start + 1)
+    }
+
+    /// Walk from a known cursor position to another one.
+    ///
+    /// Only a short distance is walked, so a long move falls back to a scan
+    /// of the document.
+    fn walk_to(
+        &self,
+        text: &str,
+        from: usize,
+        from_byte: usize,
+        from_line: usize,
+        from_start: usize,
+        to: usize,
+    ) -> Option<(usize, usize, usize)> {
+        let distance = to.checked_sub(from)?;
+        if distance > 256 {
+            return None;
+        }
+        let mut byte = from_byte;
+        let mut line = from_line;
+        let mut line_start = from_start;
+        for (offset, character) in text[from_byte..].char_indices().take(distance) {
+            byte = from_byte + offset + character.len_utf8();
+            if character == '\n' {
+                line += 1;
+                line_start = byte;
+            }
+        }
+        Some((byte, line, line_start))
+    }
+
+    /// The byte offset, the line and the start of the line of a cursor.
+    fn scan_to(&self, text: &str, cursor: usize) -> (usize, usize, usize) {
+        let mut byte = 0;
+        let mut line = 1;
+        let mut line_start = 0;
+        for (index, (offset, character)) in text.char_indices().enumerate() {
+            if index == cursor {
+                byte = offset;
+                break;
+            }
+            if character == '\n' {
+                line += 1;
+                line_start = offset + 1;
+            }
+        }
+        (byte, line, line_start)
     }
 
     /// Whether the file on disk changed since it was opened or saved.
     ///
     /// The file is only read again when its size or modification time moved,
-    /// so an idle editor does not re-read the same file twice a second.
+    /// so an idle editor does not re-read the same file twice a second. The
+    /// hashes are kept as well, because the answer is asked every frame and
+    /// hashing a large text every frame is wasteful.
     pub fn can_reload(&mut self) -> bool {
         if self.disk_checked.elapsed() >= Duration::from_millis(500) {
             self.disk_checked = Instant::now();
@@ -233,14 +298,47 @@ impl Document {
             return false;
         };
         if !self.dirty {
-            return content_hash(&self.original) != disk;
+            return self.original_hash() != disk;
         }
-        match &self.content {
-            Content::Text(text) => content_hash(text) != disk,
-            Content::Csv(_) => self
-                .source_text()
-                .is_ok_and(|text| content_hash(&text) != disk),
+        self.buffer_hash() != disk
+    }
+
+    /// The hash of the text as it was loaded or saved.
+    fn original_hash(&self) -> u64 {
+        if let Some(hash) = self.original_hash.get() {
+            return hash;
         }
+        let hash = content_hash(&self.original);
+        self.original_hash.set(Some(hash));
+        hash
+    }
+
+    /// The hash of the buffer as it is now.
+    ///
+    /// The result is cached until the text changes, so the answer costs
+    /// nothing on the frames where nothing was typed.
+    fn buffer_hash(&self) -> u64 {
+        if let Some((revision, hash)) = self.buffer_hash.get()
+            && revision == self.revision
+        {
+            return hash;
+        }
+        let hash = match &self.content {
+            Content::Text(text) => content_hash(text),
+            Content::Csv(sheet) => match sheet.serialize() {
+                Ok(text) => {
+                    // The exact source is kept until the grid changes, so the
+                    // file on disk is compared with the same bytes.
+                    match self.csv.as_ref() {
+                        Some(csv) if csv.grid_snapshot == text => content_hash(&csv.source),
+                        _ => content_hash(&text),
+                    }
+                }
+                Err(_) => 0,
+            },
+        };
+        self.buffer_hash.set(Some((self.revision, hash)));
+        hash
     }
 
     pub fn reload(&mut self, headers: bool) -> Result<()> {
@@ -267,11 +365,10 @@ impl Document {
             Content::Text(text) => Ok(text.clone()),
             Content::Csv(sheet) => {
                 let text = sheet.serialize()?;
-                Ok(self
-                    .csv
-                    .as_ref()
-                    .filter(|csv| csv.grid_snapshot == text)
-                    .map_or(text.clone(), |csv| csv.source.clone()))
+                match self.csv.as_ref() {
+                    Some(csv) if csv.grid_snapshot == text => Ok(csv.source.clone()),
+                    _ => Ok(text),
+                }
             }
         }
     }
@@ -295,6 +392,7 @@ impl Document {
         }
         self.csv_error = None;
         self.dirty = self.source_text()? != self.original;
+        self.mark_changed();
         Ok(())
     }
 
@@ -317,6 +415,7 @@ impl Document {
         self.disk_stamp = disk_stamp(&self.path);
         self.disk_hash = Some(content_hash(&text));
         self.disk_checked = Instant::now();
+        self.original_hash.set(Some(content_hash(&text)));
         self.original = text;
         self.dirty = false;
         Ok(())
@@ -503,6 +602,47 @@ mod tests {
         assert!(doc.can_reload());
         doc.reload(true)?;
         assert!(!doc.can_reload());
+        Ok(())
+    }
+
+    #[test]
+    fn a_moving_cursor_is_found_without_walking_the_whole_document() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("lines.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n")?;
+        let doc = Document::open(path, true)?;
+        // The cursor sits in front of "three".
+        let cursor = "one\ntwo\n".chars().count();
+        assert_eq!(doc.cursor_line_column(cursor), (3, 1));
+        // Moving the cursor forward keeps the answer.
+        assert_eq!(doc.cursor_line_column(cursor + 2), (3, 3));
+        // Moving it back as well.
+        assert_eq!(doc.cursor_line_column(cursor - 1), (2, 4));
+        // A long move is found as well.
+        assert_eq!(doc.cursor_line_column(0), (1, 1));
+        Ok(())
+    }
+
+    #[test]
+    fn the_cached_buffer_hash_follows_every_edit() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("watched.txt");
+        std::fs::write(&path, "one\n")?;
+        let mut doc = Document::open(path, true)?;
+        assert!(!doc.can_reload());
+        // The answer is asked again on the same revision and stays the same.
+        assert!(!doc.can_reload());
+        if let Content::Text(text) = &mut doc.content {
+            text.push_str("two\n");
+        }
+        doc.mark_changed();
+        doc.dirty = true;
+        assert!(doc.can_reload(), "the buffer no longer matches the disk");
+        if let Content::Text(text) = &mut doc.content {
+            text.truncate(4);
+        }
+        doc.mark_changed();
+        assert!(!doc.can_reload(), "the buffer matches the disk again");
         Ok(())
     }
 

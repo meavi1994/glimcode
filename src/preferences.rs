@@ -303,7 +303,7 @@ mod tests {
                 for job in [
                     crate::highlighting::highlight(ui, "fn main() {}", "rs"),
                     crate::highlighting::highlight(ui, "{\"key\":true}", "json"),
-                    preview.line_for_ui(ui, 0, ""),
+                    std::sync::Arc::new(preview.line_for_ui(ui, 0, "")),
                 ] {
                     assert!(
                         job.sections

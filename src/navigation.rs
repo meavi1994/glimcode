@@ -19,6 +19,42 @@ use tree_sitter::{Language, Node, Parser};
 pub const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_RESULTS: usize = 2_000;
 
+/// The start of every line of a text.
+///
+/// Looking a line up by walking the text from the start is linear, and the
+/// line is asked for once per match and once per candidate. The index turns
+/// that into a lookup.
+pub struct LineIndex {
+    starts: Vec<usize>,
+}
+
+impl LineIndex {
+    pub fn new(source: &str) -> Self {
+        let mut starts = vec![0];
+        starts.extend(source.match_indices('\n').map(|(index, _)| index + 1));
+        Self { starts }
+    }
+
+    /// The text of a one-based line.
+    pub fn line<'a>(&self, source: &'a str, line: usize) -> &'a str {
+        let Some(start) = self.starts.get(line.saturating_sub(1)).copied() else {
+            return "";
+        };
+        let end = self
+            .starts
+            .get(line)
+            .copied()
+            .unwrap_or(source.len())
+            .min(source.len());
+        source[start..end].trim_end_matches(['\n', '\r'])
+    }
+
+    /// The number of lines.
+    pub fn line_count(&self) -> usize {
+        self.starts.len()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Symbol {
     pub name: String,
@@ -565,6 +601,7 @@ pub fn search_buffer(
         return vec![];
     }
     if kind == SearchKind::Definitions {
+        let lines = LineIndex::new(source);
         return symbols(path, source)
             .into_iter()
             .filter(|s| s.name == query)
@@ -573,12 +610,7 @@ pub fn search_buffer(
                 path: path.to_path_buf(),
                 line: s.line,
                 column: s.column,
-                preview: source
-                    .lines()
-                    .nth(s.line - 1)
-                    .unwrap_or("")
-                    .trim_end()
-                    .to_owned(),
+                preview: lines.line(source, s.line).trim_end().to_owned(),
                 category: MatchCategory::Declaration,
             })
             .collect();
@@ -586,7 +618,10 @@ pub fn search_buffer(
     static WORD: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let word = WORD.get_or_init(|| regex::Regex::new(r"\w").unwrap());
     let word_character = |character: char| word.is_match(character.encode_utf8(&mut [0; 4]));
-    let classifier = Classifier::new(path, source);
+    // The file is only parsed when it holds a match at all. Most files of a
+    // search do not, and a tree-sitter parse of every one of them is the
+    // most expensive part of a search.
+    let mut classifier: Option<Option<Classifier>> = None;
     let mut locations = vec![];
     let mut offset = 0;
     for (line, text) in source.split_inclusive('\n').enumerate() {
@@ -604,14 +639,24 @@ pub fn search_buffer(
             {
                 continue;
             }
+            let category = match &classifier {
+                Some(Some(parsed)) => parsed.category(offset + column, offset + end),
+                Some(None) => MatchCategory::Other,
+                None => {
+                    let parsed = Classifier::new(path, source);
+                    let category = parsed.as_ref().map_or(MatchCategory::Other, |parsed| {
+                        parsed.category(offset + column, offset + end)
+                    });
+                    classifier = Some(parsed);
+                    category
+                }
+            };
             locations.push(Location {
                 path: path.to_path_buf(),
                 line: line + 1,
                 column: column + 1,
                 preview: text.trim_end().to_owned(),
-                category: classifier.as_ref().map_or(MatchCategory::Other, |c| {
-                    c.category(offset + column, offset + end)
-                }),
+                category,
             });
             if locations.len() == MAX_RESULTS {
                 return locations;
@@ -627,7 +672,7 @@ pub fn search_workspace(
     query: &str,
     kind: SearchKind,
     exclude_tests: bool,
-    buffers: &[(PathBuf, String)],
+    buffers: Vec<(PathBuf, Option<String>)>,
     priority_paths: Vec<PathBuf>,
     cancelled: Arc<AtomicBool>,
     mut emit: impl FnMut(SearchUpdate),
@@ -643,11 +688,22 @@ pub fn search_workspace(
             return;
         }
         if !excluded.insert(path.clone())
-            || (exclude_tests && is_test_search_path(root, &canonical_root, path))
+            || (exclude_tests && is_test_search_path(root, &canonical_root, &path))
         {
             continue;
         }
-        let mut locations = search_buffer(path, source, query, kind, &cancelled);
+        // A file that was not changed is read here, so the interface does not
+        // have to copy every open file to start a search.
+        let source = match source {
+            Some(source) => source,
+            None => {
+                let Ok(source) = read_text(&path) else {
+                    continue;
+                };
+                source
+            }
+        };
+        let mut locations = search_buffer(&path, &source, query, kind, &cancelled);
         locations.truncate(remaining);
         remaining -= locations.len();
         if !locations.is_empty() {
@@ -772,6 +828,8 @@ fn search_file(
     let mut first_batch = true;
     // Keep at most one syntax tree per worker, and only parse files with matches.
     let classifier = std::cell::OnceCell::new();
+    // The file is read and parsed once, not once per matched line.
+    let definitions = std::cell::OnceCell::new();
     let reader = SearchReader {
         file: std::fs::File::open(path)?,
         cancellation,
@@ -784,26 +842,25 @@ fn search_file(
                 return Ok(false);
             }
             if kind == SearchKind::Definitions {
-                if let Ok(source) = read_text(path) {
-                    for symbol in symbols(path, &source)
-                        .into_iter()
-                        .filter(|s| s.name == query)
-                    {
-                        batch.push(Location {
-                            path: path.to_path_buf(),
-                            line: symbol.line,
-                            column: symbol.column,
-                            category: MatchCategory::Declaration,
-                            preview: source
-                                .lines()
-                                .nth(symbol.line - 1)
-                                .unwrap_or("")
-                                .trim()
-                                .to_owned(),
-                        });
-                        if batch.len() == 64 && !emit(std::mem::take(&mut batch)) {
-                            return Ok(false);
-                        }
+                let Some((source, symbols)) = definitions.get_or_init(|| {
+                    read_text(path).ok().map(|source| {
+                        let symbols = symbols(path, &source);
+                        (source, symbols)
+                    })
+                }) else {
+                    return Ok(false);
+                };
+                let lines = LineIndex::new(source);
+                for symbol in symbols.iter().filter(|s| s.name == query) {
+                    batch.push(Location {
+                        path: path.to_path_buf(),
+                        line: symbol.line,
+                        column: symbol.column,
+                        category: MatchCategory::Declaration,
+                        preview: lines.line(source, symbol.line).trim().to_owned(),
+                    });
+                    if batch.len() == 64 && !emit(std::mem::take(&mut batch)) {
+                        return Ok(false);
                     }
                 }
                 return Ok(false);
@@ -1004,20 +1061,22 @@ pub fn char_offset(text: &str, line: usize, column: usize) -> usize {
     offset
 }
 
-pub fn word_at(text: &str, position: usize) -> String {
+/// The word around a character position.
+///
+/// The text is walked once, so a click in a large file does not scan it
+/// again for every part of the answer.
+fn word_bounds(text: &str, position: usize) -> Option<(usize, usize, char)> {
     let ident = |c: char| c.is_alphanumeric() || c == '_';
     // Byte offset of the character at `position`, without copying the text.
-    let mut start = None;
-    for (index, (byte, _)) in text.char_indices().enumerate() {
+    let mut found = None;
+    for (index, (byte, character)) in text.char_indices().enumerate() {
         if index == position {
-            start = Some(byte);
+            found = Some((byte, character));
             break;
         }
     }
-    let Some(mut start) = start else {
-        return String::new();
-    };
-    let mut end = start + text[start..].chars().next().map_or(0, char::len_utf8);
+    let (mut start, character) = found?;
+    let mut end = start + character.len_utf8();
     let mut tail = end;
     while let Some(character) = text[tail..].chars().next() {
         if !ident(character) {
@@ -1032,16 +1091,20 @@ pub fn word_at(text: &str, position: usize) -> String {
         }
         start -= character.len_utf8();
     }
-    text[start..end].to_owned()
+    Some((start, end, character))
+}
+
+pub fn word_at(text: &str, position: usize) -> String {
+    word_bounds(text, position).map_or(String::new(), |(start, end, _)| text[start..end].to_owned())
 }
 
 /// Unlike keyboard navigation, a click on whitespace must not select the preceding token.
 pub fn token_at(text: &str, position: usize) -> Option<String> {
-    let character = text.chars().nth(position)?;
+    let (start, end, character) = word_bounds(text, position)?;
     if !character.is_alphanumeric() && character != '_' {
         return None;
     }
-    Some(word_at(text, position))
+    Some(text[start..end].to_owned())
 }
 
 #[cfg(test)]
@@ -1140,9 +1203,9 @@ mod tests {
                     "needle",
                     kind,
                     exclude_tests,
-                    &[
-                        (opened.clone(), source.into()),
-                        (unsaved.clone(), source.into()),
+                    vec![
+                        (opened.clone(), Some(source.into())),
+                        (unsaved.clone(), Some(source.into())),
                     ],
                     vec![changed.clone(), opened.clone()],
                     Arc::new(AtomicBool::new(false)),
@@ -1191,7 +1254,7 @@ mod tests {
             "needle",
             SearchKind::Text,
             true,
-            &[],
+            vec![],
             vec![test],
             Arc::new(AtomicBool::new(false)),
             |update| updates.borrow_mut().push(update),
@@ -1227,7 +1290,7 @@ mod tests {
             "needle",
             SearchKind::References,
             false,
-            &[(open.clone(), "fn needle() {} // unsaved\n".into())],
+            vec![(open.clone(), Some("fn needle() {} // unsaved\n".into()))],
             vec![],
             Arc::new(AtomicBool::new(false)),
             |update| recorded.borrow_mut().push(update),
@@ -1274,7 +1337,7 @@ mod tests {
             "needle",
             SearchKind::Text,
             false,
-            &[(open.clone(), "// needle unsaved\n".into())],
+            vec![(open.clone(), Some("// needle unsaved\n".into()))],
             vec![
                 open.clone(),
                 changed.clone(),
@@ -1531,7 +1594,7 @@ mod tests {
             "needle",
             SearchKind::Text,
             false,
-            &[],
+            vec![],
             vec![],
             Arc::new(AtomicBool::new(true)),
             |_| panic!("cancelled search published an update"),

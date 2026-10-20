@@ -1,6 +1,6 @@
 //! Folding changes row geometry only: the editor retains the complete source buffer.
 use crate::editor_structure::Structure;
-use eframe::egui::{self, Galley, Rect};
+use eframe::egui::{Galley, Rect};
 use std::{collections::BTreeSet, sync::Arc};
 
 #[derive(Clone, Debug)]
@@ -47,14 +47,6 @@ impl State {
             }
         }
         result
-    }
-}
-
-#[derive(Default)]
-pub struct Computer;
-impl egui::cache::ComputerMut<(&egui::text::LayoutJob, &str), Vec<Region>> for Computer {
-    fn compute(&mut self, (job, extension): (&egui::text::LayoutJob, &str)) -> Vec<Region> {
-        regions(&job.text, &Structure::build(job), extension)
     }
 }
 
@@ -203,6 +195,7 @@ pub fn layout(original: Arc<Galley>, active: &[&Region]) -> Arc<Galley> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eframe::egui;
     #[test]
     fn nested_regions_ignore_strings_and_reveal_parent_and_child() {
         let source =
@@ -264,7 +257,7 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let job = crate::highlighting::highlight(ui, source, "json");
                 let regions = regions(source, &Structure::build(&job), "json");
-                let original = ui.fonts_mut(|f| f.layout_job(job));
+                let original = ui.fonts_mut(|f| f.layout_job(job.as_ref().clone()));
                 let folded = layout(original.clone(), &[&regions[0]]);
                 assert_eq!(original.job.text, folded.job.text);
                 assert_eq!(original.end().index, folded.end().index);

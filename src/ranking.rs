@@ -41,7 +41,10 @@ pub enum NameShape {
 pub struct ClickContext {
     pub root: PathBuf,
     pub path: PathBuf,
-    pub source: String,
+    /// The length of the clicked file. The text itself is not kept: the
+    /// context only needs the line starts, and a copy of a large file for
+    /// every click is memory the editor does not have to hold.
+    source_len: usize,
     pub token: String,
     /// Byte offset of the token in `source`.
     pub byte: usize,
@@ -62,10 +65,17 @@ pub struct ClickContext {
     /// Byte offset of the start of every line of `source`.
     line_starts: Vec<usize>,
     pub category: MatchCategory,
-    pub imports: Vec<Import>,
+    /// The imports of the clicked file, prepared for matching a path.
+    matchers: Vec<ImportMatcher>,
     pub package: Option<String>,
     pub open_paths: HashSet<PathBuf>,
     pub recent_paths: HashSet<PathBuf>,
+    /// The token in lower case without separators, prepared once.
+    token_normalized: String,
+    /// The words of the token, prepared once.
+    token_words: Vec<String>,
+    /// The noise the clicked file is in, if any.
+    noise: Option<&'static str>,
 }
 
 impl ClickContext {
@@ -131,15 +141,20 @@ impl ClickContext {
             }
         };
         let extension = extension(path);
-        let imports = parse_imports(source, extension);
+        let matchers = parse_imports(source, extension)
+            .iter()
+            .map(|import| ImportMatcher::new(import, path))
+            .collect();
         let qualifier = qualifier_before(source, start);
         let receiver_type = qualifier
             .as_deref()
             .and_then(|qualifier| receiver_type(source, qualifier, start, extension));
+        let token_normalized = normalized(&token);
+        let token_words = words(&token);
         Some(Self {
             root: root.to_path_buf(),
             path: path.to_path_buf(),
-            source: source.to_owned(),
+            source_len: source.len(),
             token,
             byte: start,
             line,
@@ -152,10 +167,13 @@ impl ClickContext {
             owner: analysis.owner,
             line_starts: line_starts(source),
             category: analysis.category,
-            imports,
+            matchers,
             package: parse_package(source, extension),
             open_paths,
             recent_paths,
+            token_normalized,
+            token_words,
+            noise: noise_class(path, root),
         })
     }
 
@@ -187,6 +205,7 @@ pub struct Weights {
     pub owner: f32,
     pub file_stem: f32,
     pub path_overlap: f32,
+    pub sibling: f32,
     pub visibility: f32,
     pub top_level: f32,
     pub doc_comment: f32,
@@ -213,6 +232,7 @@ impl Default for Weights {
             owner: 0.40,
             file_stem: 0.12,
             path_overlap: 0.08,
+            sibling: 0.08,
             visibility: 0.08,
             top_level: 0.10,
             doc_comment: 0.06,
@@ -220,7 +240,7 @@ impl Default for Weights {
             uniqueness: 0.15,
             specificity: 0.08,
             proximity: 0.10,
-            anchored: 0.04,
+            anchored: 0.12,
             recent: 0.07,
             focus: 0.05,
             noise: 0.30,
@@ -298,7 +318,10 @@ pub fn rank(
 struct FileInfo<'a> {
     text: Cow<'a, str>,
     symbols: Vec<Symbol>,
-    imports: Vec<Import>,
+    /// The imports of the file, prepared for matching a path.
+    matchers: Vec<ImportMatcher>,
+    /// The start of every line, so a line is found without walking the file.
+    lines: navigation::LineIndex,
     package: Option<String>,
 }
 
@@ -346,12 +369,17 @@ impl<'a> FileCache<'a> {
 impl<'a> FileInfo<'a> {
     fn new(path: &Path, source: Cow<'a, str>) -> Self {
         let symbols = navigation::symbols(path, &source);
-        let imports = parse_imports(&source, extension(path));
+        let matchers = parse_imports(&source, extension(path))
+            .iter()
+            .map(|import| ImportMatcher::new(import, path))
+            .collect();
         let package = parse_package(&source, extension(path));
+        let lines = navigation::LineIndex::new(&source);
         Self {
             text: source,
             symbols,
-            imports,
+            matchers,
+            lines,
             package,
         }
     }
@@ -376,7 +404,7 @@ impl<'a> FileInfo<'a> {
     }
 
     fn line(&self, line: usize) -> &str {
-        self.text.lines().nth(line.saturating_sub(1)).unwrap_or("")
+        self.lines.line(&self.text, line)
     }
 }
 
@@ -464,9 +492,11 @@ fn kind_prior(kind: KindClass) -> f32 {
 }
 
 fn uniqueness(_token: &str, locations: &[Location]) -> f32 {
-    let mut seen = HashSet::new();
+    // The paths are borrowed, so a search with thousands of hits does not
+    // copy a path for every one of them.
+    let mut seen: HashSet<(&Path, usize, usize)> = HashSet::new();
     for location in locations {
-        seen.insert((location.path.clone(), location.line, location.column));
+        seen.insert((location.path.as_path(), location.line, location.column));
     }
     match seen.len() {
         0 | 1 => 1.0,
@@ -485,13 +515,13 @@ fn cheap_score(context: &ClickContext, location: &Location) -> f32 {
         score += 0.4;
     }
     let imported = context
-        .imports
+        .matchers
         .iter()
-        .any(|import| import_matches_path(import, &context.path, &location.path, &context.root));
+        .any(|import| import.matches(&location.path, &context.root));
     if imported {
         score += 1.0;
     }
-    if is_noise(&location.path, &context.root) {
+    if context.noise.is_none() && noise_class(&location.path, &context.root).is_some() {
         score -= 1.2;
     }
     // The file that holds the receiver's type is the likely home of the
@@ -508,11 +538,10 @@ fn cheap_score(context: &ClickContext, location: &Location) -> f32 {
 }
 
 /// The stem of a path, without the extension.
-fn file_stem(path: &Path) -> String {
+fn file_stem(path: &Path) -> &str {
     path.file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("")
-        .to_owned()
 }
 
 fn rich_score(
@@ -525,9 +554,9 @@ fn rich_score(
     let mut score = Score::default();
     let same_file = location.path == context.path;
     let imported = context
-        .imports
+        .matchers
         .iter()
-        .any(|import| import_matches_path(import, &context.path, &location.path, &context.root));
+        .any(|import| import.matches(&location.path, &context.root));
     let info = cache.info(&location.path);
     let same_package = context.same_package(
         &location.path,
@@ -565,10 +594,9 @@ fn rich_score(
         if imported {
             file_scope = file_scope.max(1.0);
         }
-        if context.imports.iter().any(|import| {
-            import_matches_path(import, &context.path, &location.path, &context.root)
-                && (import.alias.as_deref() == Some(context.token.as_str())
-                    || context.qualifier.as_deref() == import.alias.as_deref())
+        if context.matchers.iter().any(|import| {
+            import.matches(&location.path, &context.root)
+                && import.names(&context.token, context.qualifier.as_deref())
         }) {
             file_scope = file_scope.max(0.95);
         }
@@ -582,9 +610,10 @@ fn rich_score(
             file_scope = file_scope.max(0.9);
         }
         if let Some(info) = info
-            && info.imports.iter().any(|import| {
-                import_matches_path(import, &location.path, &context.path, &context.root)
-            })
+            && info
+                .matchers
+                .iter()
+                .any(|import| import.matches(&context.path, &context.root))
         {
             file_scope = file_scope.max(0.75);
         }
@@ -647,7 +676,7 @@ fn rich_score(
     score.add(
         "doc",
         weights.doc_comment,
-        if has_doc_comment(info.map(|info| info.text.as_ref()), location.line) {
+        if has_doc_comment(info, location.line) {
             1.0
         } else {
             0.0
@@ -672,7 +701,17 @@ fn rich_score(
     if same_file {
         let above = location.line < context.line
             || (location.line == context.line && location.column <= context.column);
-        score.add("above", weights.anchored, if above { 1.0 } else { 0.0 });
+        if above {
+            // A declaration above the click is the one the code around it
+            // uses. The closer it is, the stronger the evidence.
+            let distance = context.line.saturating_sub(location.line) as f32;
+            let closeness = 1.0 / (1.0 + distance / 150.0);
+            score.add("above", weights.anchored, closeness);
+        }
+    } else if location.path.parent() == context.path.parent() {
+        // A file next to the clicked one belongs to the same part of the
+        // project.
+        score.add("dir", weights.sibling, 1.0);
     }
     score.add(
         "recent",
@@ -702,7 +741,8 @@ fn rich_score(
     score.add(
         "noise",
         -weights.noise,
-        if is_noise(&location.path, &context.root) {
+        // Noise is only noise when the user is not working in it themselves.
+        if context.noise.is_none() && noise_class(&location.path, &context.root).is_some() {
             1.0
         } else {
             0.0
@@ -711,8 +751,7 @@ fn rich_score(
     score.add(
         "size",
         -weights.huge_file,
-        if info
-            .is_some_and(|info| info.text.len() > 512 * 1024 || info.text.lines().count() > 5_000)
+        if info.is_some_and(|info| info.text.len() > 512 * 1024 || info.lines.line_count() > 5_000)
         {
             1.0
         } else {
@@ -768,12 +807,12 @@ fn file_stem_affinity(context: &ClickContext, candidate: &Path) -> f32 {
             .and_then(|stem| stem.to_str())
             .unwrap_or(""),
     );
-    let token = normalized(&context.token);
+    let token = &context.token_normalized;
     if stem.is_empty() || token.is_empty() {
         0.0
-    } else if stem == token {
+    } else if stem == *token {
         1.0
-    } else if stem.contains(&token) || token.contains(&stem) {
+    } else if stem.contains(token.as_str()) || token.contains(stem.as_str()) {
         0.5
     } else {
         0.0
@@ -781,7 +820,7 @@ fn file_stem_affinity(context: &ClickContext, candidate: &Path) -> f32 {
 }
 
 fn path_overlap(context: &ClickContext, candidate: &Path) -> f32 {
-    let words = words(&context.token);
+    let words = &context.token_words;
     if words.is_empty() {
         return 0.0;
     }
@@ -832,17 +871,14 @@ fn words(value: &str) -> Vec<String> {
     words
 }
 
-fn has_doc_comment(source: Option<&str>, line: usize) -> bool {
-    let Some(source) = source else {
+fn has_doc_comment(info: Option<&FileInfo<'_>>, line: usize) -> bool {
+    let Some(info) = info else {
         return false;
     };
-    let Some(previous) = line
-        .checked_sub(2)
-        .and_then(|line| source.lines().nth(line))
-    else {
+    if line < 2 {
         return false;
-    };
-    let previous = previous.trim_start();
+    }
+    let previous = info.line(line - 1).trim_start();
     previous.starts_with("//")
         || previous.starts_with("/*")
         || previous.starts_with('*')
@@ -864,29 +900,39 @@ fn is_exported(line: &str, extension: &str, token: &str) -> bool {
     }
 }
 
-fn is_noise(path: &Path, root: &Path) -> bool {
+/// The directories that hold code the user did not write.
+const NOISE_DIRECTORIES: &[&str] = &[
+    "vendor",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "generated",
+    "gen",
+    "testdata",
+    "tests",
+    "test",
+    "spec",
+    "__tests__",
+    "docs",
+    "examples",
+    "third_party",
+];
+
+/// The kind of noise a path is, if any.
+///
+/// The class decides how a candidate is treated: code that is noise for the
+/// project is noise for the user too, but a user who works in the tests of a
+/// project is not looking for the production copy of a name.
+fn noise_class(path: &Path, root: &Path) -> Option<&'static str> {
     let relative = path.strip_prefix(root).unwrap_or(path);
     for component in relative.components() {
         let component = component.as_os_str().to_string_lossy().to_lowercase();
-        if matches!(
-            component.as_str(),
-            "vendor"
-                | "node_modules"
-                | "target"
-                | "dist"
-                | "build"
-                | "generated"
-                | "gen"
-                | "testdata"
-                | "tests"
-                | "test"
-                | "spec"
-                | "__tests__"
-                | "docs"
-                | "examples"
-                | "third_party"
-        ) {
-            return true;
+        if let Some(noise) = NOISE_DIRECTORIES
+            .iter()
+            .find(|noise| **noise == component.as_str())
+        {
+            return Some(noise);
         }
     }
     let name = path
@@ -894,19 +940,29 @@ fn is_noise(path: &Path, root: &Path) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or("")
         .to_lowercase();
-    name.ends_with("_test.go")
-        || name.ends_with("_test.rs")
-        || name.ends_with(".test.js")
-        || name.ends_with(".test.jsx")
-        || name.ends_with(".test.ts")
-        || name.ends_with(".test.tsx")
-        || name.ends_with(".spec.js")
-        || name.ends_with(".spec.ts")
-        || name.ends_with(".min.js")
-        || name.ends_with(".min.css")
-        || name.ends_with(".generated.ts")
-        || name == "cargo.lock"
-        || name == "package-lock.json"
+    let test = [
+        "_test.go",
+        "_test.rs",
+        ".test.js",
+        ".test.jsx",
+        ".test.ts",
+        ".test.tsx",
+        ".spec.js",
+        ".spec.ts",
+    ];
+    if test.iter().any(|suffix| name.ends_with(suffix)) {
+        return Some("test");
+    }
+    if name.ends_with(".min.js") || name.ends_with(".min.css") {
+        return Some("minified");
+    }
+    if name.ends_with(".generated.ts") {
+        return Some("generated");
+    }
+    if name == "cargo.lock" || name == "package-lock.json" {
+        return Some("lockfile");
+    }
+    None
 }
 
 fn common_prefix(a: &Path, b: &Path) -> usize {
@@ -929,7 +985,7 @@ fn location_byte(context: &ClickContext, location: &Location) -> Option<usize> {
         .line_starts
         .get(location.line)
         .copied()
-        .unwrap_or(context.source.len());
+        .unwrap_or(context.source_len);
     // Columns from search are one-based UTF-8 byte offsets.
     let column = location
         .column
@@ -1297,62 +1353,152 @@ fn parse_rust_use(rest: &str, imports: &mut Vec<Import>) {
     });
 }
 
-fn import_matches_path(import: &Import, importer: &Path, candidate: &Path, root: &Path) -> bool {
-    let module = import
-        .module
-        .trim()
-        .trim_matches(['"', '\'', '`'])
-        .trim_end_matches(';');
-    if module.is_empty() {
-        return false;
-    }
-    if module.starts_with("./") || module.starts_with("../") {
-        let base = normalize(&importer.parent().unwrap_or(Path::new("")).join(module));
-        let candidate = normalize(candidate);
-        if candidate == base {
-            return true;
+/// An import of the clicked file, prepared for matching a candidate path.
+///
+/// The module path is split once per click instead of once per candidate, so
+/// the matching itself does not allocate.
+#[derive(Clone, Debug)]
+struct ImportMatcher {
+    /// The directory a relative import points at.
+    base: Option<PathBuf>,
+    /// The name of the imported item, in lower case.
+    item: String,
+    /// The directories of the module path, in lower case.
+    directories: Vec<String>,
+    /// The name the import is known by in the clicked file.
+    alias: Option<String>,
+}
+
+impl ImportMatcher {
+    fn new(import: &Import, importer: &Path) -> Self {
+        let module = import
+            .module
+            .trim()
+            .trim_matches(['"', '\'', '`'])
+            .trim_end_matches(';');
+        let alias = import.alias.clone();
+        if module.is_empty() {
+            return Self {
+                base: None,
+                item: String::new(),
+                directories: Vec::new(),
+                alias,
+            };
         }
-        if let Ok(rest) = candidate.strip_prefix(&base)
+        if module.starts_with("./") || module.starts_with("../") {
+            let base = normalize(&importer.parent().unwrap_or(Path::new("")).join(module));
+            return Self {
+                base: Some(base),
+                item: String::new(),
+                directories: Vec::new(),
+                alias,
+            };
+        }
+        let cleaned = module
+            .trim_start_matches("crate::")
+            .trim_start_matches("self::")
+            .trim_start_matches("super::");
+        let raw: Vec<&str> = cleaned
+            .split(['.', '/', ':'])
+            .filter(|part| {
+                !part.is_empty() && *part != "crate" && *part != "self" && *part != "super"
+            })
+            .collect();
+        let Some(last) = raw.last().copied() else {
+            return Self {
+                base: None,
+                item: String::new(),
+                directories: Vec::new(),
+                alias,
+            };
+        };
+        // A name that starts with a capital is the type of the module, so the
+        // directories are the module path itself.
+        let last_is_type = last.chars().next().is_some_and(char::is_uppercase);
+        let directories = raw[..raw.len() - usize::from(last_is_type)]
+            .iter()
+            .map(|part| part.to_lowercase())
+            .collect();
+        Self {
+            base: None,
+            item: last.to_lowercase(),
+            directories,
+            alias,
+        }
+    }
+
+    /// Whether the import can be the source of the candidate file.
+    fn matches(&self, candidate: &Path, root: &Path) -> bool {
+        if let Some(base) = &self.base {
+            return self.matches_relative(candidate, base);
+        }
+        if self.item.is_empty() {
+            return false;
+        }
+        if self.directories.is_empty() {
+            // A bare module name points at the file of the same name.
+            return candidate
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.eq_ignore_ascii_case(&self.item));
+        }
+        directory_ends_with(candidate, root, &self.directories)
+    }
+
+    fn matches_relative(&self, candidate: &Path, base: &Path) -> bool {
+        if let Ok(rest) = candidate.strip_prefix(base)
             && rest.components().count() <= 2
         {
             return true;
         }
-        return candidate.file_stem() == base.file_stem()
-            && candidate.parent().map(normalize) == base.parent().map(normalize);
+        let candidate = normalize(candidate);
+        if candidate == *base {
+            return true;
+        }
+        if let Ok(rest) = candidate.strip_prefix(base)
+            && rest.components().count() <= 2
+        {
+            return true;
+        }
+        candidate.file_stem() == base.file_stem()
+            && candidate.parent().map(normalize) == base.parent().map(normalize)
     }
-    let cleaned = module
-        .trim_start_matches("crate::")
-        .trim_start_matches("self::")
-        .trim_start_matches("super::");
-    let raw: Vec<&str> = cleaned
-        .split(['.', '/', ':'])
-        .filter(|part| !part.is_empty() && *part != "crate" && *part != "self" && *part != "super")
-        .collect();
-    if raw.is_empty() {
-        return false;
+
+    /// Whether the clicked file knows the imported name under another one.
+    fn names(&self, token: &str, qualifier: Option<&str>) -> bool {
+        let Some(alias) = self.alias.as_deref() else {
+            return false;
+        };
+        alias == token || qualifier == Some(alias)
     }
-    let last = *raw.last().unwrap();
-    let last_is_type = last.chars().next().is_some_and(char::is_uppercase);
-    let directories = &raw[..raw.len() - usize::from(last_is_type)];
-    let relative = candidate.strip_prefix(root).unwrap_or(candidate);
-    let components: Vec<String> = relative
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
-        .collect();
-    if directories.is_empty() {
-        return candidate
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|stem| stem.eq_ignore_ascii_case(last));
-    }
-    let directories = directories
-        .iter()
-        .map(|part| part.to_lowercase())
-        .collect::<Vec<_>>();
-    for take in (1..=directories.len().min(3)).rev() {
-        let suffix = &directories[directories.len() - take..];
-        let directory_components = &components[..components.len().saturating_sub(1)];
-        if directory_components.ends_with(suffix) {
+}
+
+/// Whether the directories of a path end with the given directory names.
+///
+/// The comparison is done without building a list of the path, because it
+/// runs for every candidate of every import.
+fn directory_ends_with(path: &Path, root: &Path, suffix: &[String]) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let components: Vec<_> = relative.components().collect();
+    let directories = &components[..components.len().saturating_sub(1)];
+    // The last parts of the module path are what identify the package, so
+    // the shortest tail that fits is tried first.
+    for take in (1..=suffix.len().min(3)).rev() {
+        let tail = &suffix[suffix.len() - take..];
+        if directories.len() < tail.len() {
+            continue;
+        }
+        let start = directories.len() - tail.len();
+        if directories[start..]
+            .iter()
+            .zip(tail.iter())
+            .all(|(component, name)| {
+                component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(name)
+            })
+        {
             return true;
         }
     }
@@ -1703,5 +1849,77 @@ mod tests {
             &cancelled,
         );
         assert!(ranked.is_empty());
+    }
+
+    #[test]
+    fn a_test_file_is_not_noise_for_a_click_inside_a_test_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let test = write(root, "src/thing.test.ts", "export function helper() {}\n");
+        let source = write(root, "src/thing.ts", "export function helper() {}\n");
+        let text = fs::read_to_string(&test).unwrap();
+        let context = click(root, &test, &text, "helper");
+        let ranked = rank(
+            &context,
+            vec![
+                location(&source, 1, 17, "export function helper() {}"),
+                location(&test, 1, 17, "export function helper() {}"),
+            ],
+            &[],
+            &AtomicBool::new(false),
+        );
+        // The copy in the file the user is working in is the one they mean.
+        assert_eq!(ranked[0].location.path, test);
+    }
+
+    #[test]
+    fn a_declaration_above_the_click_beats_a_farther_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = write(
+            root,
+            "src/lib.rs",
+            "fn helper() {}\n\nfn other() {}\n\nfn main() {\n    helper();\n}\n",
+        );
+        let source = fs::read_to_string(&path).unwrap();
+        let byte = source.find("helper();").unwrap();
+        let index = source[..byte].chars().count();
+        let context =
+            ClickContext::new(root, &path, &source, index, HashSet::new(), HashSet::new()).unwrap();
+        let ranked = rank(
+            &context,
+            vec![
+                location(&path, 3, 4, "fn other() {}"),
+                location(&path, 1, 4, "fn helper() {}"),
+            ],
+            &[],
+            &AtomicBool::new(false),
+        );
+        assert_eq!(ranked[0].location.line, 1);
+    }
+
+    #[test]
+    fn a_file_next_to_the_clicked_one_is_preferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let near = write(root, "src/model/store.ts", "export class Store {}\n");
+        let far = write(root, "other/store.ts", "export class Store {}\n");
+        let app = write(
+            root,
+            "src/app.ts",
+            "import { Store } from './model/store';\n",
+        );
+        let source = fs::read_to_string(&app).unwrap();
+        let context = click(root, &app, &source, "Store");
+        let ranked = rank(
+            &context,
+            vec![
+                location(&far, 1, 14, "export class Store {}"),
+                location(&near, 1, 14, "export class Store {}"),
+            ],
+            &[],
+            &AtomicBool::new(false),
+        );
+        assert_eq!(ranked[0].location.path, near);
     }
 }
