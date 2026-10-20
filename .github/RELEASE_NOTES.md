@@ -1,14 +1,20 @@
-## Changes in v0.1.2
+## Changes in v0.1.3
 
-- Search results are syntax colored. Every file behind the visible rows is highlighted once on a background worker, and each row shows the colors of the line it came from with the match marked. Rows use the monospaced editor font, so a hit reads as code instead of as plain text.
-- Click-to-navigate now ranks by the type you are calling through. A method of the receiver's type wins over a same-named method elsewhere, `self.` calls prefer the type around the click, and mentions inside comments and strings never win. The ranking is recomputed on every click and follows the code as it changes.
-- Fixed a right aligned shell prompt, such as a clock in the corner, appearing behind the prompt instead of at the right edge of the terminal. The shell now starts with the size of the terminal, so it builds its prompt for the width it actually has.
-- The editor keeps one copy of a document in memory instead of three, the undo history of a large file is capped near a megabyte and released when the tab closes, and the files read for a click stay inside a fixed byte budget.
-- The terminal paints one text run per row instead of one per cell, the status bar no longer walks the whole document on every frame, and the document is fingerprinted once per frame instead of three times.
-- Fixed the search dialog and the file picker keeping the keyboard after they closed: the editor now gets the focus back, so typing and the editing shortcuts work again.
-- Fixed deleting a file leaving the wrong tab active.
-- The status bar reports the real line ending of a file instead of always claiming LF.
-- Removed the theme buttons from the View menu. The workspace chrome is built for a single dark theme, and the light option left the panels unreadable.
+- Fixed the case-insensitive file and value filter. A term with overlapping prefixes, such as `aab`, was not found in `aaab`, so the explorer filter and the CSV value filter hid rows that do match.
+- Fixed background terminal tabs being resized on every frame. The command queue filled up, the hidden shell redrew in a loop, and the user's own input was pushed to the back of the line.
+- Fixed copying a terminal selection that reaches past the last column of the screen, which crashed the editor.
+- Fixed a search that started while a click was still being ranked: the status bar reported the old token and the selection jumped to an unrelated row.
+- Fixed the results of the previous search staying on screen after the search term was cleared.
+- Fixed a crash when a tab was closed and a queued action still referred to it.
+- Fixed the Markdown preview aborting the editor for a document whose path could not be resolved to an absolute path.
+- Fixed grid edits in a CSV being reported as a change on disk, and the whole file being copied on every frame.
+- Click-to-navigate now ranks vendored, generated and test files last only when the click does not happen inside such a file. The declaration above the click is weighted by its distance, and a file next to the clicked one is preferred.
+- The syntax colors of a document are computed once per change and shared by the editor, the Structure panel and the folding, instead of being copied and hashed several times per frame.
+- A search hands over only the buffers that changed, and the worker reads the rest, so a search no longer freezes the interface on large open files. A click does not copy the file it happens in either.
+- The Go highlighter walks the tree with a cursor instead of recursion, which could abort the editor on a deeply nested generated file, and looks up shadowed names by name.
+- Files without a match are no longer parsed for the search classification.
+- The file picker marks the part of the search term that is in the row, so a path such as `src/app` marks the file name it found, and the highlight now matches the case-insensitive filter.
+- Find in Files fits into a small viewport instead of hanging off the window, Enter no longer reaches the editor behind an empty result list, and the duplicated Alt+F12 shortcut is resolved.
 
 ## Installation
 
