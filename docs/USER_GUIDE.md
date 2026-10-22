@@ -165,6 +165,8 @@ Rust UI: [eframe / egui](https://github.com/emilk/egui). Parsing: [Tree-sitter](
 
 Right-click a project file to copy its name, absolute path, or path from the content root, rename it, or delete it after confirmation. Right-click a folder (including the project root) to create a named file. Folders can also be renamed. Existing names are never overwritten.
 
-**Reload from disk** replaces the active editor buffer with the saved file and is disabled when the contents match. Disk changes are checked twice a second. Unsaved edits prompt before reloading.
+The Project tree refreshes in the background about every two seconds, so files and folders created, renamed, or removed by other tools appear automatically. Existing folder expansion is preserved, and project ignore rules still apply.
+
+Disk changes to the active file are checked twice a second. When there are no unsaved edits, the editor automatically reloads the changed file while preserving the cursor and Source / Split / Preview mode. Unsaved edits are kept. **Reload from disk** lets you reload manually and asks before discarding unsaved edits. If a disk file cannot be loaded, the existing buffer is kept.
 
 The file toolbar keeps the breadcrumb on the left and groups save status, Blame, branch diff, and reload controls on the right. It switches to icon controls in narrow editors. Right-click the breadcrumb to copy its name or path, or reveal it in Project. External disk changes have a distinct status.

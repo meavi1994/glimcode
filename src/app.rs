@@ -101,6 +101,7 @@ struct TextClick {
 
 /// How many navigation steps are remembered.
 const MAX_HISTORY: usize = 200;
+const PROJECT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct Coder {
     root: PathBuf,
@@ -112,6 +113,7 @@ pub struct Coder {
     result_scope: crate::search_view::Scope,
     file_filter: String,
     files_rx: Option<Receiver<anyhow::Result<navigation::WorkspacePaths>>>,
+    files_checked: Instant,
     documents: Vec<Document>,
     active: usize,
     query: String,
@@ -399,6 +401,7 @@ impl Coder {
             result_scope: Default::default(),
             file_filter: String::new(),
             files_rx: None,
+            files_checked: Instant::now(),
             documents: vec![],
             active: 0,
             query: String::new(),
@@ -520,6 +523,11 @@ impl Coder {
     }
 
     fn refresh_files(&mut self) {
+        // Never overlap workspace walks, including manual refreshes.
+        if self.files_rx.is_some() {
+            return;
+        }
+        self.files_checked = Instant::now();
         let root = self.root.clone();
         let (tx, rx) = mpsc::channel();
         self.files_rx = Some(rx);
@@ -760,13 +768,33 @@ impl Coder {
         {
             match result {
                 Ok(paths) => {
-                    self.tree = crate::explorer::FileTree::build(&self.root, &paths.files);
-                    self.files = paths.files;
-                    self.folders = paths.folders;
+                    if self.files != paths.files || self.folders != paths.folders {
+                        self.tree.refresh(&self.root, &paths.files);
+                        self.files = paths.files;
+                        self.folders = paths.folders;
+                    }
                 }
                 Err(error) => self.error = Some(format!("{error:#}")),
             }
             self.files_rx = None;
+        }
+        if self.files_rx.is_none() && self.files_checked.elapsed() >= PROJECT_REFRESH_INTERVAL {
+            self.refresh_files();
+        }
+        // Keep checking even when the editor is idle or no file is open.
+        ctx.request_repaint_after(Duration::from_millis(500));
+        if let Some(doc) = self.documents.get_mut(self.active) {
+            match doc.reload_if_clean(self.csv_headers) {
+                Ok(true) => {
+                    self.status = format!("Reloaded {} from disk", doc.path.display());
+                    self.preview.clear();
+                    self.search_highlight.clear();
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.status = format!("Could not reload {}: {error}", doc.path.display())
+                }
+            }
         }
         let updates: Vec<_> = self
             .search_rx
@@ -4908,6 +4936,64 @@ fn edit_line(text: &mut String, cursor: usize, path: &Path, duplicate: bool) {
 mod tests {
     use super::*;
     use crate::search_view::{extension, result_visible};
+    #[test]
+    fn project_timer_tracks_external_creates_renames_and_deletes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        std::fs::create_dir(root.join("src"))?;
+        std::fs::write(root.join("src/old.rs"), "fn old() {}")?;
+        let mut app = Coder::empty(root.clone());
+        let ctx = egui::Context::default();
+        let refresh = |app: &mut Coder| {
+            app.files_checked = Instant::now() - PROJECT_REFRESH_INTERVAL;
+            app.poll(&ctx);
+            assert!(app.files_rx.is_some());
+            let started = app.files_checked;
+            app.refresh_files();
+            assert_eq!(app.files_checked, started, "an in-flight scan is reused");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while app.files_rx.is_some() {
+                app.poll(&ctx);
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        refresh(&mut app);
+        std::fs::create_dir(root.join("src/nested"))?;
+        let new = root.join("src/nested/external.rs");
+        std::fs::write(&new, "fn external() {}")?;
+        refresh(&mut app);
+        assert!(app.files.contains(&new));
+        assert!(app.folders.contains(&root.join("src/nested")));
+        app.tree.expand_all(true);
+        let mut output = None;
+        for _ in 0..3 {
+            output = Some(ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.tree.show(ui, &root, None, "", &Default::default());
+                });
+            }));
+        }
+        assert!(
+            output
+                .unwrap()
+                .shapes
+                .iter()
+                .any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "external.rs"))
+        );
+        let renamed = new.with_file_name("renamed.rs");
+        std::fs::rename(&new, &renamed)?;
+        refresh(&mut app);
+        assert!(!app.files.contains(&new));
+        assert!(app.files.contains(&renamed));
+        std::fs::remove_file(&renamed)?;
+        refresh(&mut app);
+        assert!(!app.files.contains(&renamed));
+        assert!(app.error.is_none());
+        Ok(())
+    }
+
     #[test]
     fn the_picker_marks_the_part_of_the_term_that_is_in_the_row() {
         // The term is in the name.

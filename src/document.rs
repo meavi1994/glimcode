@@ -119,6 +119,8 @@ pub struct Document {
     /// document holds one copy less.
     disk_hash: Option<u64>,
     disk_checked: Instant,
+    /// Avoid retrying an invalid disk revision on every UI frame.
+    auto_reload_stamp: Option<DiskStamp>,
     /// Hash of the buffer as it is now: (revision, hash). The status bar asks
     /// whether the file changed on disk every frame, and hashing the whole
     /// text again each time is expensive in a large file.
@@ -210,6 +212,7 @@ impl Document {
             disk_stamp: disk_stamp(&source_path),
             disk_hash: Some(content_hash(&source)),
             disk_checked: Instant::now(),
+            auto_reload_stamp: None,
             buffer_hash: std::cell::Cell::new(None),
             original_hash: std::cell::Cell::new(Some(content_hash(&source))),
             original: source,
@@ -368,6 +371,17 @@ impl Document {
             return self.original_hash() != disk;
         }
         self.buffer_hash() != disk
+    }
+
+    /// Adopt external edits only while the editor buffer is clean. Failed loads
+    /// retain the existing document and are retried when the disk changes again.
+    pub fn reload_if_clean(&mut self, headers: bool) -> Result<bool> {
+        if self.dirty || !self.can_reload() || self.auto_reload_stamp == self.disk_stamp {
+            return Ok(false);
+        }
+        self.auto_reload_stamp = self.disk_stamp;
+        self.reload(headers)?;
+        Ok(true)
     }
 
     /// The hash of the text as it was loaded or saved.
@@ -691,6 +705,79 @@ mod tests {
         doc.reload(false)?;
         assert!(doc.csv_is_source());
         assert!(!doc.dirty);
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_reload_updates_clean_text_and_preserves_position() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("auto.md");
+        std::fs::write(&path, "old\n")?;
+        let mut doc = Document::open(path.clone(), true)?;
+        doc.cursor = 2;
+        doc.markdown = MarkdownMode::Preview;
+        doc.editor_id = Some(eframe::egui::Id::new("editor"));
+        let revision = doc.revision();
+        std::fs::write(&path, "updated from outside\n")?;
+        doc.disk_checked = Instant::now() - Duration::from_secs(1);
+        assert!(doc.reload_if_clean(true)?);
+        assert_eq!(doc.source_text()?, "updated from outside\n");
+        assert_eq!(doc.cursor, 2);
+        assert!(matches!(doc.markdown, MarkdownMode::Preview));
+        assert_eq!(doc.editor_id, Some(eframe::egui::Id::new("editor")));
+        assert_ne!(doc.revision(), revision);
+        assert!(!doc.dirty);
+        assert!(!doc.reload_if_clean(true)?);
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_reload_preserves_unsaved_edits_and_missing_files() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("auto.rs");
+        std::fs::write(&path, "original")?;
+        let mut doc = Document::open(path.clone(), true)?;
+        doc.content = Content::Text("my unsaved edits".into());
+        doc.mark_changed();
+        doc.dirty = true;
+        std::fs::write(&path, "external changes")?;
+        doc.disk_checked = Instant::now() - Duration::from_secs(1);
+        assert!(!doc.reload_if_clean(true)?);
+        assert_eq!(doc.source_text()?, "my unsaved edits");
+        assert_eq!(std::fs::read_to_string(&path)?, "external changes");
+        doc.reload(true)?;
+        std::fs::remove_file(path)?;
+        doc.disk_checked = Instant::now() - Duration::from_secs(1);
+        assert!(!doc.reload_if_clean(true)?);
+        assert_eq!(doc.source_text()?, "external changes");
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_csv_reload_keeps_source_mode_and_recovers_from_invalid_disk_data() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("auto.csv");
+        std::fs::write(&path, "name,value\nAlice,1\n")?;
+        let mut doc = Document::open(path.clone(), true)?;
+        doc.set_csv_source(true)?;
+        std::fs::write(&path, "name,value\nBob,2\n")?;
+        doc.disk_checked = Instant::now() - Duration::from_secs(1);
+        assert!(doc.reload_if_clean(true)?);
+        assert!(doc.csv_is_source());
+        assert_eq!(doc.source_text()?, "name,value\nBob,2\n");
+        std::fs::write(&path, "name,value\ninvalid,row,extra\n")?;
+        doc.disk_checked = Instant::now() - Duration::from_secs(1);
+        assert!(doc.reload_if_clean(true).is_err());
+        assert_eq!(doc.source_text()?, "name,value\nBob,2\n");
+        assert!(
+            !doc.reload_if_clean(true)?,
+            "do not retry the same bad disk revision every frame"
+        );
+        std::fs::write(&path, "name,value\nCarol,30\n")?;
+        doc.disk_checked = Instant::now() - Duration::from_secs(1);
+        assert!(doc.reload_if_clean(true)?);
+        assert_eq!(doc.source_text()?, "name,value\nCarol,30\n");
+        assert!(doc.csv_is_source());
         Ok(())
     }
 

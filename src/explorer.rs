@@ -117,6 +117,26 @@ impl FileTree {
         tree
     }
 
+    /// Refresh entries while retaining reveal commands. Folder expansion is
+    /// persisted by egui under path-based IDs, so it survives this rebuild.
+    pub fn refresh(&mut self, root: &Path, files: &[PathBuf]) {
+        let mut fresh = Self::build(root, files);
+        fresh.last_active = self.last_active.take();
+        fresh.reveal_requested = self.reveal_requested;
+        fresh.reveal_target = self.reveal_target.take();
+        fresh.action = self.action.take();
+        fn keep_commands(fresh: &mut FileTree, old: &mut FileTree) {
+            fresh.open_override = old.open_override.take();
+            for (name, child) in &mut fresh.children {
+                if let Some(previous) = old.children.get_mut(name) {
+                    keep_commands(child, previous);
+                }
+            }
+        }
+        keep_commands(&mut fresh, self);
+        *self = fresh;
+    }
+
     fn matches(&self, root: &Path, filter: &crate::chrome::CaseFilter) -> bool {
         self.file.as_ref().is_some_and(|path| {
             filter.matches(
@@ -274,6 +294,26 @@ impl FileTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn refresh_keeps_reveal_and_expansion_commands_but_removes_stale_entries() {
+        let root = Path::new("/project");
+        let active = root.join("src/main.rs");
+        let removed = root.join("src/old.rs");
+        let added = root.join("src/new.rs");
+        let mut tree = FileTree::build(root, &[active.clone(), removed]);
+        tree.last_active = Some(active.clone());
+        tree.expand_all(false);
+        tree.reveal_path(root, &active);
+        tree.refresh(root, &[active.clone(), added]);
+        assert_eq!(tree.last_active, Some(active.clone()));
+        assert_eq!(tree.reveal_target, Some(active));
+        assert!(tree.reveal_pending());
+        let src = &tree.children[&OsString::from("src")];
+        assert_eq!(src.open_override, Some(false));
+        assert!(src.children.contains_key(&OsString::from("new.rs")));
+        assert!(!src.children.contains_key(&OsString::from("old.rs")));
+    }
+
     #[test]
     fn expand_and_collapse_commands_reach_hidden_descendants() {
         let root = Path::new("/project");
