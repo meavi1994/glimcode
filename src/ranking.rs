@@ -20,8 +20,6 @@ use std::{
 
 /// Candidate files allowed to be read and parsed during one click.
 const MAX_FILE_READS: usize = 60;
-/// Candidates that survive the cheap path-only pass and get a full read.
-const MAX_RICH_CANDIDATES: usize = 60;
 /// Largest candidate file that is read for one click.
 const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 /// Total candidate source kept in memory for one click.
@@ -274,13 +272,13 @@ pub fn rank(
         .map(|(path, source)| (path.as_path(), source.as_str()))
         .collect();
 
-    // Cheap pass: path-only signals, so we only read the files that could win.
+    // Read the most promising files first, but score every occurrence. A file
+    // with many overloads must not crowd other files out of the candidate list.
     let mut pre: Vec<(f32, Location)> = locations
         .into_iter()
         .map(|location| (cheap_score(context, &location), location))
         .collect();
     pre.sort_by(|a, b| b.0.total_cmp(&a.0));
-    pre.truncate(MAX_RICH_CANDIDATES);
 
     let mut cache = FileCache::new(snapshot);
     let mut ranked: Vec<Ranked> = pre
@@ -346,20 +344,24 @@ impl<'a> FileCache<'a> {
         if self.files.contains_key(path) {
             return self.files.get(path).and_then(|info| info.as_ref());
         }
-        let info = if let Some(source) = self.snapshot.get(path) {
-            // The editor already holds this text, so it is borrowed.
-            Some(FileInfo::new(path, Cow::Borrowed(source)))
-        } else if self.reads >= MAX_FILE_READS || self.bytes >= MAX_CACHE_BYTES {
+        let remaining = MAX_CACHE_BYTES.saturating_sub(self.bytes);
+        let limit = MAX_FILE_BYTES.min(remaining);
+        let info = if self.reads >= MAX_FILE_READS || limit == 0 {
             None
         } else {
+            // Count unique files, including snapshots, and bound parsing as well as I/O.
             self.reads += 1;
-            match navigation::read_text(path) {
-                Ok(source) if source.len() <= MAX_FILE_BYTES => {
-                    self.bytes += source.len();
-                    Some(FileInfo::new(path, Cow::Owned(source)))
-                }
-                _ => None,
-            }
+            let source = if let Some(source) = self.snapshot.get(path) {
+                (source.len() <= limit).then_some(Cow::Borrowed(*source))
+            } else {
+                navigation::read_text_bounded(path, limit)
+                    .ok()
+                    .map(Cow::Owned)
+            };
+            source.map(|source| {
+                self.bytes += source.len();
+                FileInfo::new(path, source)
+            })
         };
         self.files.insert(path.to_path_buf(), info);
         self.files.get(path).and_then(|info| info.as_ref())
@@ -533,7 +535,7 @@ fn cheap_score(context: &ClickContext, location: &Location) -> f32 {
     }
     score += file_stem_affinity(context, &location.path);
     score += path_overlap(context, &location.path);
-    score -= 0.02 * common_prefix(&context.path, &location.path) as f32;
+    score += 0.02 * common_prefix(&context.path, &location.path) as f32;
     score
 }
 
@@ -1545,6 +1547,78 @@ mod tests {
         let byte = source.find(token).unwrap();
         let index = source[..byte].chars().count();
         ClickContext::new(root, path, source, index, HashSet::new(), HashSet::new()).unwrap()
+    }
+
+    #[test]
+    fn overloads_in_one_file_do_not_crowd_out_the_receiver_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut source = "import { Store } from './model/store';\n".to_owned();
+        let mut candidates = Vec::new();
+        let app = root.join("app.ts");
+        for index in 0..65 {
+            source.push_str(&format!("class Other{index} {{ open() {{}} }}\n"));
+            candidates.push(location(
+                &app,
+                index + 2,
+                18 + index.to_string().len(),
+                "open() {}",
+            ));
+        }
+        source.push_str("function run() { const store = new Store(); store.open(); }\n");
+        fs::write(&app, &source).unwrap();
+        let model = write(root, "model/store.ts", "export class Store { open() {} }\n");
+        candidates.push(location(&model, 1, 22, "export class Store { open() {} }"));
+        let byte = source.rfind("open()").unwrap();
+        let context = ClickContext::new(
+            root,
+            &app,
+            &source,
+            source[..byte].chars().count(),
+            HashSet::new(),
+            HashSet::new(),
+        )
+        .unwrap();
+        let ranked = rank(&context, candidates, &[], &AtomicBool::new(false));
+        assert_eq!(ranked.len(), 66, "all occurrences remain eligible");
+        assert_eq!(ranked[0].location.path, model);
+    }
+
+    #[test]
+    fn ranking_respects_remaining_bytes_and_snapshot_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "small.txt", "123456789");
+        let mut cache = FileCache::new(HashMap::new());
+        cache.bytes = MAX_CACHE_BYTES - 8;
+        assert!(cache.info(&path).is_none());
+        assert_eq!(cache.bytes, MAX_CACHE_BYTES - 8);
+        let oversized = "x".repeat(MAX_FILE_BYTES + 1);
+        let snapshot = [(path.as_path(), oversized.as_str())].into();
+        let mut cache = FileCache::new(snapshot);
+        assert!(cache.info(&path).is_none());
+        assert_eq!(cache.bytes, 0);
+        fs::write(&path, &oversized).unwrap();
+        let mut cache = FileCache::new(HashMap::new());
+        assert!(cache.info(&path).is_none());
+        assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn snapshots_share_the_unique_file_parse_budget() {
+        let paths: Vec<_> = (0..MAX_FILE_READS + 1)
+            .map(|n| PathBuf::from(format!("{n}.txt")))
+            .collect();
+        let snapshot = paths.iter().map(|path| (path.as_path(), "text")).collect();
+        let mut cache = FileCache::new(snapshot);
+        for path in &paths[..MAX_FILE_READS] {
+            assert!(cache.info(path).is_some());
+            assert!(
+                cache.info(path).is_some(),
+                "a repeat uses no additional budget"
+            );
+        }
+        assert!(cache.info(&paths[MAX_FILE_READS]).is_none());
+        assert_eq!(cache.bytes, MAX_FILE_READS * 4);
     }
 
     #[test]

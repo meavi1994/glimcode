@@ -526,12 +526,21 @@ fn collect_symbol(node: Node<'_>, source: &[u8], result: &mut Vec<Symbol>) {
 }
 
 pub fn read_text(path: &Path) -> Result<String> {
+    read_text_bounded(path, MAX_FILE_BYTES as usize)
+}
+
+/// Reject oversized input before allocating it; the bounded read also handles files
+/// that grow after the metadata check.
+pub fn read_text_bounded(path: &Path, limit: usize) -> Result<String> {
     let file =
         std::fs::File::open(path).with_context(|| format!("Cannot open {}", path.display()))?;
+    if file.metadata()?.len() > limit as u64 {
+        bail!("File exceeds the {} byte read limit", limit);
+    }
     let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_FILE_BYTES {
-        bail!("File exceeds the 20 MiB editor limit");
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        bail!("File exceeds the {} byte read limit", limit);
     }
     if bytes.contains(&0) {
         bail!("Binary files cannot be edited");

@@ -139,7 +139,10 @@ impl Default for SearchHighlight {
                     }
                     let source = match request.source {
                         Some(source) => source,
-                        None => match crate::navigation::read_text(&request.path) {
+                        None => match crate::navigation::read_text_bounded(
+                            &request.path,
+                            MAX_FILE_BYTES,
+                        ) {
                             Ok(source) => source,
                             Err(_) => continue,
                         },

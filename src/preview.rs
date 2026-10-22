@@ -13,10 +13,31 @@ use std::{
     },
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SourceVersion {
+    Buffer(u64),
+    Disk(Option<(std::time::SystemTime, u64)>),
+}
+
+impl SourceVersion {
+    fn for_path(path: &std::path::Path, revision: Option<u64>) -> Self {
+        revision.map_or_else(
+            || {
+                let stamp = std::fs::metadata(path)
+                    .ok()
+                    .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+                Self::Disk(stamp)
+            },
+            Self::Buffer,
+        )
+    }
+}
+
 /// Keep the full source and its syntax styles, while laying out only visible lines.
 pub struct SourcePreview {
     pub path: PathBuf,
     source: String,
+    source_version: SourceVersion,
     lines: Vec<Range<usize>>,
     syntax: LayoutJob,
     pub dark: bool,
@@ -53,6 +74,7 @@ impl SourcePreview {
             cancelled,
         )?;
         Some(Self {
+            source_version: SourceVersion::for_path(&path, None),
             path,
             source,
             lines,
@@ -126,6 +148,7 @@ impl SourcePreview {
 
 struct Request {
     version: u64,
+    source_version: SourceVersion,
     path: PathBuf,
     source: Option<String>,
     dark: bool,
@@ -136,7 +159,7 @@ pub struct PreviewService {
     tx: Sender<Request>,
     rx: Receiver<(u64, SourcePreview)>,
     version: Arc<AtomicU64>,
-    pending: Option<(PathBuf, bool)>,
+    pending: Option<(PathBuf, bool, SourceVersion)>,
     pub current: Option<SourcePreview>,
     cache: VecDeque<SourcePreview>,
 }
@@ -160,12 +183,14 @@ impl Default for PreviewService {
                     crate::navigation::read_text(&request.path)
                         .unwrap_or_else(|error| format!("Preview unavailable: {error}"))
                 });
-                if let Some(preview) =
+                if let Some(mut preview) =
                     SourcePreview::build(request.path, source, request.dark, &cancelled)
                     && !cancelled()
-                    && results.send((request.version, preview)).is_err()
                 {
-                    break;
+                    preview.source_version = request.source_version;
+                    if results.send((request.version, preview)).is_err() {
+                        break;
+                    }
                 }
             }
         });
@@ -181,15 +206,16 @@ impl Default for PreviewService {
 }
 
 impl PreviewService {
-    pub fn needs(&self, path: &std::path::Path, dark: bool) -> bool {
+    pub fn needs(&self, path: &std::path::Path, dark: bool, revision: Option<u64>) -> bool {
+        let source_version = SourceVersion::for_path(path, revision);
         !self
             .current
             .as_ref()
-            .is_some_and(|p| p.path == path && p.dark == dark)
+            .is_some_and(|p| p.path == path && p.dark == dark && p.source_version == source_version)
             && !self
                 .pending
                 .as_ref()
-                .is_some_and(|(p, d)| p == path && *d == dark)
+                .is_some_and(|(p, d, v)| p == path && *d == dark && *v == source_version)
     }
 
     fn keep(&mut self, preview: SourcePreview) {
@@ -201,12 +227,19 @@ impl PreviewService {
         }
     }
 
-    pub fn request(&mut self, path: PathBuf, source: Option<String>, dark: bool) {
+    pub fn request(
+        &mut self,
+        path: PathBuf,
+        source: Option<String>,
+        dark: bool,
+        revision: Option<u64>,
+    ) {
+        let source_version = SourceVersion::for_path(&path, revision);
         let version = self.version.fetch_add(1, Ordering::Relaxed) + 1;
         let cached = self
             .cache
             .iter()
-            .position(|p| p.path == path && p.dark == dark)
+            .position(|p| p.path == path && p.dark == dark && p.source_version == source_version)
             .and_then(|i| self.cache.remove(i));
         if let Some(current) = self.current.take() {
             self.keep(current);
@@ -216,9 +249,10 @@ impl PreviewService {
             self.current = Some(preview);
             self.pending = None;
         } else {
-            self.pending = Some((path.clone(), dark));
+            self.pending = Some((path.clone(), dark, source_version.clone()));
             let _ = self.tx.send(Request {
                 version,
+                source_version,
                 path,
                 source,
                 dark,
@@ -272,15 +306,69 @@ mod tests {
     }
 
     #[test]
+    fn edited_buffers_invalidate_current_and_cached_previews() {
+        let mut service = PreviewService::default();
+        let path = PathBuf::from("buffer.rs");
+        service.request(path.clone(), Some("fn old() {}".into()), true, Some(1));
+        wait(&mut service);
+        assert!(!service.needs(&path, true, Some(1)));
+        assert!(service.needs(&path, true, Some(2)));
+        service.request(
+            PathBuf::from("other.rs"),
+            Some("fn other() {}".into()),
+            true,
+            Some(3),
+        );
+        wait(&mut service);
+        service.request(path.clone(), Some("fn fresh() {}".into()), true, Some(2));
+        wait(&mut service);
+        assert_eq!(
+            service.current.as_ref().unwrap().line_text(0),
+            "fn fresh() {}"
+        );
+        assert!(!service.needs(&path, true, Some(2)));
+        assert!(service.needs(&path, false, Some(2)));
+    }
+
+    #[test]
+    fn disk_changes_invalidate_previews_including_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.rs");
+        let mut service = PreviewService::default();
+        service.request(path.clone(), None, true, None);
+        wait(&mut service);
+        std::fs::write(&path, "fn old() {}\n").unwrap();
+        assert!(service.needs(&path, true, None));
+        service.request(path.clone(), None, true, None);
+        wait(&mut service);
+        assert!(!service.needs(&path, true, None));
+        std::fs::write(&path, "fn changed_on_disk() {}\n").unwrap();
+        assert!(service.needs(&path, true, None));
+        service.request(
+            PathBuf::from("other.rs"),
+            Some("fn other() {}".into()),
+            true,
+            Some(1),
+        );
+        wait(&mut service);
+        service.request(path, None, true, None);
+        wait(&mut service);
+        assert_eq!(
+            service.current.as_ref().unwrap().line_text(0),
+            "fn changed_on_disk() {}"
+        );
+    }
+
+    #[test]
     fn preview_cache_returns_previous_files_without_reloading() {
         let mut service = PreviewService::default();
         let a = PathBuf::from("a.rs");
         let b = PathBuf::from("b.rs");
-        service.request(a.clone(), Some("fn a() {}".into()), true);
+        service.request(a.clone(), Some("fn a() {}".into()), true, Some(1));
         wait(&mut service);
-        service.request(b, Some("fn b() {}".into()), true);
+        service.request(b, Some("fn b() {}".into()), true, Some(2));
         wait(&mut service);
-        service.request(a.clone(), None, true);
+        service.request(a.clone(), None, true, Some(1));
         assert!(
             !service.loading(),
             "cached previews must be available synchronously"
@@ -299,11 +387,13 @@ mod tests {
             PathBuf::from("slow.rs"),
             Some("let old = 1;\n".repeat(50_000)),
             true,
+            Some(1),
         );
         service.request(
             PathBuf::from("latest.rs"),
             Some("fn latest() {}".into()),
             true,
+            Some(2),
         );
         wait(&mut service);
         assert_eq!(

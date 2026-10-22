@@ -6,12 +6,75 @@ use anyhow::{Result, bail};
 use std::{
     io::Write,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver},
+    },
     time::{Duration, Instant},
 };
 
+/// The editable text and saved baseline share their allocation until an edit.
+/// TextEdit only requests mutable storage when it inserts or removes text.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SharedText(Arc<String>);
+
+impl From<String> for SharedText {
+    fn from(text: String) -> Self {
+        Self(Arc::new(text))
+    }
+}
+
+impl From<&str> for SharedText {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
+impl std::ops::Deref for SharedText {
+    type Target = String;
+    fn deref(&self) -> &String {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SharedText {
+    fn deref_mut(&mut self) -> &mut String {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl eframe::egui::TextBuffer for SharedText {
+    fn is_mutable(&self) -> bool {
+        true
+    }
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+    fn insert_text(&mut self, text: &str, char_index: usize) -> usize {
+        if text.is_empty() {
+            return 0;
+        }
+        eframe::egui::TextBuffer::insert_text(Arc::make_mut(&mut self.0), text, char_index)
+    }
+    fn delete_char_range(&mut self, range: std::ops::Range<usize>) {
+        if !range.is_empty() {
+            eframe::egui::TextBuffer::delete_char_range(Arc::make_mut(&mut self.0), range);
+        }
+    }
+    fn type_id(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<Self>()
+    }
+}
+
+// A revision also identifies a newly opened or reloaded document at the same path.
+fn next_revision() -> u64 {
+    static REVISION: AtomicU64 = AtomicU64::new(1);
+    REVISION.fetch_add(1, Ordering::Relaxed)
+}
+
 pub enum Content {
-    Text(String),
+    Text(SharedText),
     Csv(Box<Sheet>),
 }
 
@@ -44,7 +107,7 @@ pub struct Document {
     pub editor_id: Option<eframe::egui::Id>,
     /// The line ending of the file, shown in the status bar.
     pub line_ending: &'static str,
-    pub(crate) original: String,
+    pub(crate) original: SharedText,
     /// Bumped whenever the text changes, so the cached cursor position is
     /// refreshed.
     revision: u64,
@@ -92,7 +155,7 @@ impl Document {
     pub fn open(path: PathBuf, headers: bool) -> Result<Self> {
         // Resolve symlinks so atomic saves update the target, not the symlink itself.
         let path = path.canonicalize()?;
-        let source = navigation::read_text(&path)?;
+        let source: SharedText = navigation::read_text(&path)?.into();
         let extension = path
             .extension()
             .and_then(|s| s.to_str())
@@ -112,7 +175,7 @@ impl Document {
             Some(CsvState {
                 delimiter: sheet.delimiter(),
                 has_headers: headers,
-                source: source.clone(),
+                source: source.to_string(),
                 grid_snapshot: sheet.serialize()?,
             })
         } else {
@@ -142,7 +205,7 @@ impl Document {
             } else {
                 "LF"
             },
-            revision: 0,
+            revision: next_revision(),
             cursor_position: std::cell::Cell::new(None),
             disk_stamp: disk_stamp(&source_path),
             disk_hash: Some(content_hash(&source)),
@@ -177,7 +240,7 @@ impl Document {
             self.outline_refresh = None;
             if let Content::Text(text) = &self.content {
                 let key = eframe::egui::util::hash((&self.path, text.as_str()));
-                let text = text.clone();
+                let text = text.to_string();
                 let path = self.path.clone();
                 let ctx = ctx.clone();
                 let (tx, rx) = mpsc::channel();
@@ -197,7 +260,11 @@ impl Document {
 
     /// Note that the text changed, so cached positions are dropped.
     pub fn mark_changed(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
+        self.revision = next_revision();
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// The one-based line and column of the cursor.
@@ -362,7 +429,7 @@ impl Document {
     /// Use the exact source until the grid has actually changed its field values.
     pub fn source_text(&self) -> Result<String> {
         match &self.content {
-            Content::Text(text) => Ok(text.clone()),
+            Content::Text(text) => Ok(text.to_string()),
             Content::Csv(sheet) => {
                 let text = sheet.serialize()?;
                 match self.csv.as_ref() {
@@ -379,19 +446,19 @@ impl Document {
         }
         if source {
             let text = self.source_text()?;
-            self.content = Content::Text(text);
+            self.content = Content::Text(text.into());
         } else if let Content::Text(text) = &self.content {
             let csv = self.csv.as_ref().unwrap();
             // Parse before replacing anything: malformed source remains fully editable.
             let sheet = Sheet::parse(text, csv.delimiter, csv.has_headers)?;
             let grid_snapshot = sheet.serialize()?;
             let csv = self.csv.as_mut().unwrap();
-            csv.source = text.clone();
+            csv.source = text.to_string();
             csv.grid_snapshot = grid_snapshot;
             self.content = Content::Csv(Box::new(sheet));
         }
         self.csv_error = None;
-        self.dirty = self.source_text()? != self.original;
+        self.dirty = self.source_text()?.as_str() != self.original.as_str();
         self.mark_changed();
         Ok(())
     }
@@ -405,7 +472,7 @@ impl Document {
 
     pub fn save(&mut self) -> Result<()> {
         let disk = navigation::read_text(&self.path)?;
-        if disk != self.original {
+        if disk.as_str() != self.original.as_str() {
             bail!(
                 "The file changed on disk. Save was stopped to protect those changes. Open the disk version separately or copy your edits before reloading."
             );
@@ -416,7 +483,10 @@ impl Document {
         self.disk_hash = Some(content_hash(&text));
         self.disk_checked = Instant::now();
         self.original_hash.set(Some(content_hash(&text)));
-        self.original = text;
+        self.original = match &self.content {
+            Content::Text(buffer) => buffer.clone(),
+            Content::Csv(_) => text.into(),
+        };
         self.dirty = false;
         Ok(())
     }
@@ -435,6 +505,64 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn saved_text_is_shared_until_an_actual_edit() -> Result<()> {
+        use eframe::egui::TextBuffer;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("shared.txt");
+        std::fs::write(&path, "猫 hello")?;
+        let mut doc = Document::open(path.clone(), true)?;
+        let Content::Text(text) = &mut doc.content else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(&text.0, &doc.original.0));
+        let ctx = eframe::egui::Context::default();
+        for _ in 0..3 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add(eframe::egui::TextEdit::multiline(text));
+                });
+            });
+            assert!(
+                Arc::ptr_eq(&text.0, &doc.original.0),
+                "idle UI retains shared storage"
+            );
+        }
+        text.insert_text("", 0);
+        text.delete_char_range(0..0);
+        assert!(Arc::ptr_eq(&text.0, &doc.original.0));
+        text.insert_text("!", 1);
+        assert_eq!(text.as_str(), "猫! hello");
+        assert_eq!(doc.original.as_str(), "猫 hello");
+        assert!(!Arc::ptr_eq(&text.0, &doc.original.0));
+        text.delete_char_range(0..1);
+        assert_eq!(text.as_str(), "! hello");
+        doc.save()?;
+        let Content::Text(text) = &doc.content else {
+            unreachable!()
+        };
+        assert!(
+            Arc::ptr_eq(&text.0, &doc.original.0),
+            "saving shares the new baseline"
+        );
+        assert_eq!(std::fs::read_to_string(path)?, "! hello");
+        Ok(())
+    }
+
+    #[test]
+    fn reopening_and_reloading_have_distinct_revisions() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "first")?;
+        let mut doc = Document::open(path.clone(), true)?;
+        let initial = doc.revision();
+        assert_ne!(Document::open(path.clone(), true)?.revision(), initial);
+        std::fs::write(&path, "second")?;
+        doc.reload(true)?;
+        assert_ne!(doc.revision(), initial);
+        Ok(())
+    }
+
     #[test]
     fn the_status_bar_reports_the_line_ending_of_the_file() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -517,7 +645,7 @@ mod tests {
         std::fs::write(&path, original)?;
         let mut doc = Document::open(path.clone(), true)?;
         doc.set_csv_source(true)?;
-        assert!(matches!(&doc.content, Content::Text(text) if text == original));
+        assert!(matches!(&doc.content, Content::Text(text) if text.as_str() == original));
         doc.set_csv_source(false)?;
         assert!(!doc.dirty);
         doc.save()?;
@@ -537,7 +665,7 @@ mod tests {
         doc.save()?;
         assert_eq!(std::fs::read_to_string(&path)?, edited);
         doc.set_csv_source(true)?;
-        assert!(matches!(&doc.content, Content::Text(text) if text == edited));
+        assert!(matches!(&doc.content, Content::Text(text) if text.as_str() == edited));
         assert!(!doc.dirty);
         Ok(())
     }
@@ -582,7 +710,7 @@ mod tests {
         doc.reload(true)?;
         assert!(!doc.dirty);
         assert!(!doc.can_reload());
-        assert!(matches!(&doc.content, Content::Text(text) if text == "fn fresh() {}\n"));
+        assert!(matches!(&doc.content, Content::Text(text) if text.as_str() == "fn fresh() {}\n"));
         assert_eq!(doc.outline[0].name, "fresh");
         doc.save()?;
         Ok(())

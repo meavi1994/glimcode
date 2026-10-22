@@ -716,7 +716,7 @@ impl Coder {
             .filter_map(|index| self.documents.get(index))
             .map(|doc| {
                 let source = match &doc.content {
-                    Content::Text(text) if doc.dirty => Some(text.clone()),
+                    Content::Text(text) if doc.dirty => Some(text.to_string()),
                     Content::Text(_) => None,
                     Content::Csv(sheet) => Some(sheet.serialize().unwrap_or_default()),
                 };
@@ -897,7 +897,7 @@ impl Coder {
             .filter(|doc| doc.dirty)
             .map(|doc| {
                 let source = match &doc.content {
-                    Content::Text(text) => text.clone(),
+                    Content::Text(text) => text.to_string(),
                     Content::Csv(sheet) => sheet.serialize().unwrap_or_default(),
                 };
                 (doc.path.clone(), source)
@@ -1452,7 +1452,7 @@ impl Coder {
                             .iter()
                             .find(|doc| doc.path == path && doc.dirty)
                             .and_then(|doc| match &doc.content {
-                                Content::Text(text) => Some(text.clone()),
+                                Content::Text(text) => Some(text.to_string()),
                                 Content::Csv(sheet) => sheet.serialize().ok(),
                             });
                         self.git.open_review(path, buffer, ctx);
@@ -1877,8 +1877,10 @@ impl Coder {
             if visible.is_empty() {
                 ui.weak(if self.search_rx.is_some() {
                     "Searching…"
+                } else if self.results.is_empty() {
+                    "No matches found. Try a different search."
                 } else {
-                    "No matching results"
+                    "No results match these filters. Clear a category or file-type filter."
                 });
             }
             for index in range {
@@ -1899,20 +1901,14 @@ impl Coder {
                         },
                     );
                 }
-                let suffix = format!(
-                    "{}{} :{}",
-                    if visible[index] < self.open_matches {
-                        "Open · "
-                    } else {
-                        ""
-                    },
-                    location
-                        .path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
-                    location.line
-                );
+                let response = response.on_hover_text(format!(
+                    "{}:{}:{}\nDouble-click or press Enter to open",
+                    location.path.display(),
+                    location.line,
+                    location.column
+                ));
+                let suffix =
+                    search_result_label(location, &self.root, visible[index] < self.open_matches);
                 let mut metadata = egui::text::LayoutJob::simple_singleline(
                     suffix,
                     FontId::proportional(result_size),
@@ -1922,7 +1918,7 @@ impl Coder {
                         chrome::MUTED
                     },
                 );
-                metadata.wrap.max_width = (rect.width() * 0.42).max(60.0);
+                metadata.wrap.max_width = (rect.width() * 0.42).max(0.0);
                 metadata.wrap.max_rows = 1;
                 metadata.wrap.break_anywhere = true;
                 let galley = ui.fonts_mut(|fonts| fonts.layout_job(metadata));
@@ -1988,7 +1984,7 @@ impl Coder {
                     .iter()
                     .find(|doc| doc.path == path)
                     .and_then(|doc| match &doc.content {
-                        Content::Text(text) => Some(text.clone()),
+                        Content::Text(text) => Some(text.to_string()),
                         Content::Csv(_) => None,
                     })
             });
@@ -2066,19 +2062,22 @@ impl Coder {
 
     fn search_preview(&mut self, ui: &mut egui::Ui, location: &Location, height: f32) {
         let dark = ui.visuals().dark_mode;
-        if self.preview.needs(&location.path, dark) {
-            let source = self
-                .documents
-                .iter()
-                .find(|doc| doc.path == location.path)
-                .and_then(|doc| {
-                    if let Content::Text(text) = &doc.content {
-                        Some(text.clone())
-                    } else {
-                        None
-                    }
-                });
-            self.preview.request(location.path.clone(), source, dark);
+        let document = self
+            .documents
+            .iter()
+            .find(|doc| doc.path == location.path && matches!(doc.content, Content::Text(_)));
+        let revision = document.map(Document::revision);
+        if self.preview.needs(&location.path, dark, revision) {
+            let source = document.and_then(|doc| match &doc.content {
+                Content::Text(text) => Some(text.to_string()),
+                Content::Csv(_) => None,
+            });
+            self.preview
+                .request(location.path.clone(), source, dark, revision);
+        }
+        // Watch disk versions even when the search panel is otherwise idle.
+        if revision.is_none() {
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
         }
         let Some(preview) = self
             .preview
@@ -2151,16 +2150,21 @@ impl Coder {
 
     fn refresh_file_find(&mut self) -> bool {
         let Some(doc) = self.documents.get(self.active) else {
-            return self.file_find.refresh(Path::new(""), "", &self.find, 0);
+            return self
+                .file_find
+                .refresh(Path::new(""), "", &self.find, 0, || 0);
         };
         let Content::Text(text) = &doc.content else {
-            return self.file_find.refresh(&doc.path, "", &self.find, 0);
+            return self
+                .file_find
+                .refresh(&doc.path, "", &self.find, doc.revision(), || 0);
         };
-        let caret = text
-            .char_indices()
-            .nth(doc.cursor)
-            .map_or(text.len(), |(byte, _)| byte);
-        self.file_find.refresh(&doc.path, text, &self.find, caret)
+        self.file_find
+            .refresh(&doc.path, text, &self.find, doc.revision(), || {
+                text.char_indices()
+                    .nth(doc.cursor)
+                    .map_or(text.len(), |(byte, _)| byte)
+            })
     }
 
     fn find_bar(&mut self, ui: &mut egui::Ui) -> bool {
@@ -2241,7 +2245,7 @@ impl Coder {
                             if let Some(doc) = self.documents.get_mut(self.active)
                                 && let Content::Text(text) = &mut doc.content
                             {
-                                *text = text.replace(&self.find, &self.replacement);
+                                *text = text.replace(&self.find, &self.replacement).into();
                                 doc.dirty = *text != doc.original;
                                 doc.mark_changed();
                                 doc.outline_refresh = Some(Instant::now());
@@ -3266,7 +3270,7 @@ impl Coder {
                     };
                     let buffer = if doc.dirty {
                         match &doc.content {
-                            Content::Text(text) => Some(text.clone()),
+                            Content::Text(text) => Some(text.to_string()),
                             Content::Csv(sheet) => sheet.serialize().ok(),
                         }
                     } else {
@@ -3786,6 +3790,19 @@ fn blame_date(date: &str) -> String {
     date.to_owned()
 }
 
+fn search_result_label(location: &Location, root: &Path, open: bool) -> String {
+    let path = location.path.strip_prefix(root).unwrap_or(&location.path);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    format!(
+        "{}{}:{}{}",
+        if open { "Open · " } else { "" },
+        name,
+        location.line,
+        parent.map_or_else(String::new, |parent| format!(" · {}", parent.display()))
+    )
+}
+
 fn relative(path: &Path, root: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -4086,7 +4103,7 @@ fn syntax_cache(
 
 fn text_editor(
     ui: &mut egui::Ui,
-    text: &mut String,
+    text: &mut dyn egui::TextBuffer,
     path: &Path,
     cursor: &mut usize,
     jump: &mut Option<(usize, usize)>,
@@ -4096,12 +4113,16 @@ fn text_editor(
     let id = ui.make_persistent_id("source-editor");
     let font_size = crate::preferences::editor_font_size(ui.ctx());
     *editor_id = Some(id);
-    apply_undo_budget(ui, id, text.len());
+    apply_undo_budget(ui, id, text.as_str().len());
     let find_offset = find
         .active
         .as_ref()
         .filter(|_| find.scroll && !find.query.is_empty())
-        .map(|range| text[..range.start.min(text.len())].chars().count());
+        .map(|range| {
+            text.as_str()[..range.start.min(text.as_str().len())]
+                .chars()
+                .count()
+        });
     if let Some(offset) = find_offset {
         let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
         state
@@ -4114,7 +4135,7 @@ fn text_editor(
     }
     let jump_offset = jump
         .take()
-        .map(|(line, column)| navigation::char_offset(text, line, column));
+        .map(|(line, column)| navigation::char_offset(text.as_str(), line, column));
     if let Some(offset) = jump_offset {
         let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
         state
@@ -4131,7 +4152,8 @@ fn text_editor(
         .filter(|range| !range.is_empty())
         .map(|range| {
             let indices = range.as_sorted_char_range();
-            text.chars()
+            text.as_str()
+                .chars()
                 .skip(indices.start)
                 .take(indices.len())
                 .collect::<String>()
@@ -4152,14 +4174,14 @@ fn text_editor(
     // and the layout cache.
     let source_hash = egui::util::hash(text.as_str());
     folds.sync(source_hash);
-    let large = crate::editor_analysis::is_large(text);
+    let large = crate::editor_analysis::is_large(text.as_str());
     let analysis = large
-        .then(|| crate::editor_analysis::get(ui, text, path))
+        .then(|| crate::editor_analysis::get(ui, text.as_str(), path))
         .flatten();
     let small_regions: Arc<Vec<crate::folding::Region>> = if large {
         Arc::new(Vec::new())
     } else {
-        syntax_cache(ui, path, text, extension, source_hash).regions
+        syntax_cache(ui, path, text.as_str(), extension, source_hash).regions
     };
     let fold_regions = analysis
         .as_ref()
@@ -4286,7 +4308,7 @@ fn text_editor(
                 let guide_layer = ui.painter().add(egui::Shape::Noop);
                 let git_layer = ui.painter().add(egui::Shape::Noop);
                 let blame_hover_layer = ui.painter().add(egui::Shape::Noop);
-                let output = egui::TextEdit::multiline(text)
+                let output = egui::TextEdit::multiline(&mut *text)
                     .id(id)
                     .font(FontId::monospace(font_size))
                     .code_editor()
@@ -4302,7 +4324,7 @@ fn text_editor(
                     && ui.input(|i| i.modifiers.command)
                     && let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
                     && let Some((range, token)) =
-                        hovered_token(text, &output.galley, pointer - output.galley_pos)
+                        hovered_token(text.as_str(), &output.galley, pointer - output.galley_pos)
                 {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     let left = output
@@ -4519,7 +4541,7 @@ fn text_editor(
                 }
                 let data = find
                     .git
-                    .filter(|data| data.path == path && data.text == *text);
+                    .filter(|data| data.path == path && data.text == text.as_str());
                 let mut git_shapes = vec![];
                 let mut marks = data.map(|data| data.marks.iter().peekable());
                 let mut previous_blame: Option<&crate::git::BlameLine> = None;
@@ -4899,6 +4921,56 @@ mod tests {
         assert_eq!(highlight_term("main.go", ""), "");
     }
     #[test]
+    fn search_rows_disambiguate_names_and_explain_empty_filters() {
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let mut app = Coder::empty(PathBuf::from("/project"));
+        app.query = "needle".into();
+        for parent in ["src/client", "src/server"] {
+            app.results.push(Location {
+                path: PathBuf::from(format!("/project/{parent}/index.ts")),
+                line: 7,
+                column: 1,
+                preview: "needle()".into(),
+                category: navigation::MatchCategory::Declaration,
+            });
+        }
+        app.results_revision = 1;
+        let frame = |app: &mut Coder| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(850.0, 650.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.search_contents(ui, true));
+                },
+            )
+        };
+        frame(&mut app);
+        let output = frame(&mut app);
+        for expected in ["index.ts:7 · src/client", "index.ts:7 · src/server"] {
+            assert!(
+                output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == expected)),
+                "missing {expected}"
+            );
+        }
+        app.selected_category = Some(navigation::MatchCategory::Comment);
+        let output = frame(&mut app);
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text().contains("No results match these filters"))));
+        app.results.clear();
+        app.results_revision += 1;
+        let output = frame(&mut app);
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text().contains("No matches found"))));
+    }
+
+    #[test]
     fn search_results_and_filter_fonts_update_independently_in_both_layouts() {
         let ctx = egui::Context::default();
         chrome::install(&ctx);
@@ -4951,7 +5023,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("missing label: {label}"))
             };
             assert_eq!(size("needle value"), results);
-            assert_eq!(size("sample.ts :7"), results);
+            assert_eq!(size("sample.ts:7"), results);
             assert_eq!(size("All 1"), filters);
             assert_eq!(size("Declarations 1"), filters);
             assert_eq!(size("Opened"), filters);
@@ -6815,7 +6887,7 @@ mod tests {
         frame(&mut app, vec![egui::Event::Text("z".into())]);
         assert_eq!(app.file_find.counter(), "0/0");
         if let Content::Text(text) = &app.documents[0].content {
-            assert_eq!(text, &source);
+            assert_eq!(text.as_str(), source.as_str());
         }
         frame(&mut app, key(Key::Escape));
         assert!(!app.find_open);
