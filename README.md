@@ -14,7 +14,7 @@
 
 </div>
 
-Glimcode is a native desktop code editor written in Rust. It brings familiar IntelliJ-style navigation, built-in syntax highlighting, Git review, a terminal, CSV editing, and Markdown preview into a focused workspace.
+Glimcode is a native desktop code editor written in Rust. It brings familiar IntelliJ-style navigation, built-in syntax highlighting, Git review, worktree management, tabbed terminals, CSV editing, and Markdown preview into a focused workspace.
 
 If an AI agent handles much of your typing, you still need to find the right file, understand the surrounding code, and inspect every change. Glimcode is built for that workflow: an IntelliJ alternative for developers who want familiar navigation with a smaller architectural footprint.
 
@@ -26,6 +26,7 @@ If an AI agent handles much of your typing, you still need to find the right fil
 - **Navigation without language servers.** Embedded ripgrep libraries handle project search; Tree-sitter supplies file structure and syntax-based definition candidates. No LSP setup, background language-server processes, or separate `rg` installation.
 - **Familiar shortcuts.** Double Shift for files, Cmd/Ctrl-click for symbol search, Find in Files, a structure panel, and navigation history.
 - **Highlighting built in.** Language-aware colors, folding, matching brackets, indentation guides, and a full-file search preview.
+- **Multiple worktrees, one workspace.** Create, switch, and safely remove Git worktrees from the left panel, keeping each folder’s open files and live terminals when switching.
 - **The tools beside your code.** Git diffs and blame, a native terminal, editable CSV/TSV grids, and Markdown previews.
 
 Search uses the official `grep` library and `ignore` walker directly, with up to four background search workers, bounded result queues, and cancellation. It does not launch an external search process or parse command-line JSON output.
@@ -43,6 +44,7 @@ The architecture is designed to keep memory overhead low. **We do not yet publis
 | Find your way through a repository | Fast file search, recent files, outlines, syntax-based definition candidates, and text-based usage search |
 | Read and understand changes | Syntax highlighting, folding, search previews, and navigation history |
 | Review an agent’s work | Branch diffs, changed-file navigation, line change markers, and Git blame |
+| Work on parallel branches | Create and switch Git worktrees with separate editor tabs, unsaved buffers, and terminal sessions |
 | Run your tools | Integrated pseudo-terminal with tabs, shell selection, clipboard support, and scrollback |
 | Inspect generated data | CSV/TSV grid with sort menus, selectable unique values, counts, and Data / Source switching |
 | Read project notes | Markdown Source, Split, and Preview modes with tables, images, and highlighted code blocks |
@@ -56,6 +58,21 @@ Tree-sitter navigation supports **Java, Kotlin, Go, Rust, Python, JavaScript/JSX
 Result rows in **Find in Files** carry the syntax colors of the file they come from, so a hit reads as code instead of as plain text. Cmd-click ranks the candidates: the same file and scope come first, then the type you are calling through, then imports and package, and never a mention inside a comment or a string. Code the user is not working in — vendored, generated or test files — comes last, unless the click happens inside such a file.
 
 Definition jumps are syntax candidates and usages are text matches. Glimcode currently does **not** provide type-aware symbol resolution, code completion, semantic refactoring, debugging, or compiler diagnostics. Choose it for reading, navigating, editing, and reviewing code; use a full language IDE when you need those deeper capabilities.
+
+### Git worktrees and saved workspaces
+
+![Glimcode with the Worktrees panel, code editor, integrated terminal, and Files panel](docs/images/worktrees.png)
+
+Use the left **Worktrees** panel to work on multiple branches in separate folders without repeatedly checking out branches in one directory. Each worktree keeps its open files, unsaved edits, navigation history, and running terminals while you switch within the app.
+
+- **Create:** Click **New worktree** and enter a name. The branch defaults to that name, and the folder defaults to a sibling of the current project, such as `~/projects/my-feature` beside `~/projects/my-project`. Review or override the branch and folder before creating it.
+- **Switch:** Click a worktree card to open its workspace. The right **Files** panel shows that folder’s files and Git changes; **Structure** shows the current file’s outline.
+- **Remove:** Use a worktree’s `···` menu or right-click it to request deletion. Deletion requires confirmation; the main, active, locked, modified, and unsaved worktrees are protected.
+- **Make room:** Collapse the Worktrees panel using its header arrow. Reopen it with the branch icon on the left rail or **View → Worktrees tool window**.
+
+Folder sessions are saved under `~/.glimcode/projects/`. Reopening a folder restores its file tabs, active tab, cursor locations, panel visibility, and terminal tab metadata. After restarting the app, restored terminals start fresh shells on demand in their saved working directories. Unsaved file contents, terminal scrollback, and running processes are not restored after quitting.
+
+See the [workspace panel guide](docs/USER_GUIDE.md#workspace-panels) and [session restore details](docs/USER_GUIDE.md#project-session-restore).
 
 ### GitHub-style branch review
 
@@ -206,7 +223,7 @@ GitHub pull-request links and commit-to-PR lookup optionally use an authenticate
 | Save | Cmd S | Ctrl S |
 | Terminal | Option F12 | Alt F12 |
 
-See the [full user guide](docs/USER_GUIDE.md) for shortcuts, Git tools, terminal behavior, preferences, and file limits. Preferences currently retain the original development location, `~/.coder/settings.json`.
+See the [full user guide](docs/USER_GUIDE.md) for shortcuts, Git tools, terminal behavior, preferences, and file limits. Preferences are stored in `~/.glimcode/settings.json`; existing `~/.coder/settings.json` preferences migrate automatically.
 
 ## Help build Glimcode
 
