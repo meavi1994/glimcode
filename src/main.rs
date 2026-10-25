@@ -18,9 +18,11 @@ mod preview;
 mod ranking;
 mod search_highlight;
 mod search_view;
+mod session;
 mod sheet;
 mod terminal;
 mod test_files;
+mod worktrees;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

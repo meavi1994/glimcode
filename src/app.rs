@@ -32,6 +32,7 @@ enum FrameAction {
     Reload(usize),
     GitDiff(usize),
     SwitchProject(PathBuf),
+    SwitchWorktree(PathBuf),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -103,7 +104,17 @@ struct TextClick {
 const MAX_HISTORY: usize = 200;
 const PROJECT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
+struct WorktreeSession {
+    documents: Vec<Document>,
+    active: usize,
+    terminal: crate::terminal::Terminal,
+    history: Vec<Location>,
+}
+
 pub struct Coder {
+    worktrees: crate::worktrees::Manager,
+    session_store: Option<crate::session::Store>,
+    worktree_sessions: std::collections::BTreeMap<PathBuf, WorktreeSession>,
     root: PathBuf,
     files: Vec<PathBuf>,
     folders: Vec<PathBuf>,
@@ -148,7 +159,9 @@ pub struct Coder {
     replace_open: bool,
     defer_actions: bool,
     actions: Vec<FrameAction>,
+    show_worktrees: bool,
     show_project: bool,
+    files_changed_only: bool,
     show_structure: bool,
     git: crate::git_view::GitTool,
     terminal: crate::terminal::Terminal,
@@ -180,6 +193,10 @@ impl Coder {
         cc.egui_ctx
             .add_image_loader(Arc::new(crate::markdown_images::BadgeLoader::default()));
         let argument = std::env::args_os().nth(1).map(PathBuf::from);
+        #[cfg(feature = "ui-capture")]
+        let argument = std::env::var_os("GLIMCODE_PREVIEW_FILE")
+            .map(PathBuf::from)
+            .or(argument);
         let root = argument
             .as_ref()
             .filter(|p| p.is_dir())
@@ -189,10 +206,16 @@ impl Coder {
                     .as_ref()
                     .and_then(|p| p.parent().map(Path::to_path_buf))
             })
+            .or_else(crate::session::last_project)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let mut app = Self::empty(root.canonicalize().unwrap_or(root));
         app.terminal.load_settings();
         app.terminal.settings.apply(&cc.egui_ctx);
+        app.session_store = crate::preferences::path().and_then(|path| {
+            path.parent()
+                .map(|parent| crate::session::Store::new(parent.join("projects")))
+        });
+        app.restore_session();
         app.refresh_files();
         if let Some(file) = argument.filter(|p| p.is_file()) {
             app.open(file, None);
@@ -392,6 +415,9 @@ impl Coder {
 
     fn empty(root: PathBuf) -> Self {
         Self {
+            worktrees: Default::default(),
+            session_store: None,
+            worktree_sessions: Default::default(),
             root,
             files: vec![],
             folders: vec![],
@@ -436,7 +462,9 @@ impl Coder {
             replace_open: false,
             defer_actions: false,
             actions: vec![],
+            show_worktrees: true,
             show_project: true,
+            files_changed_only: false,
             show_structure: false,
             git: Default::default(),
             terminal: Default::default(),
@@ -481,7 +509,82 @@ impl Coder {
         }
     }
 
+    fn session_snapshot(
+        &self,
+        documents: &[Document],
+        active: usize,
+        terminal: &crate::terminal::Terminal,
+    ) -> serde_json::Value {
+        let tabs: Vec<_> = documents.iter().map(|doc| {
+            let (line, column) = doc.jump.unwrap_or_else(|| doc.cursor_line_column(doc.cursor));
+            serde_json::json!({"path": doc.path.to_string_lossy(), "line": line, "column": column})
+        }).collect();
+        serde_json::json!({"tabs": tabs, "active_path": documents.get(active).map(|doc| doc.path.to_string_lossy()),
+            "terminal": terminal.snapshot(), "worktrees": self.show_worktrees, "files": self.show_project,
+            "structure": self.show_structure, "changed_only": self.files_changed_only})
+    }
+
+    fn save_session(&self) {
+        let Some(store) = &self.session_store else {
+            return;
+        };
+        let value = if let Some(session) = self.worktree_sessions.get(&self.root) {
+            self.session_snapshot(&session.documents, session.active, &session.terminal)
+        } else {
+            self.session_snapshot(&self.documents, self.active, &self.terminal)
+        };
+        if let Err(error) = store.save(&self.root, value) {
+            eprintln!("Could not save workspace session: {error}");
+        }
+    }
+
+    fn restore_session(&mut self) {
+        if self.worktree_sessions.contains_key(&self.root) {
+            return;
+        }
+        let Some(value) = self
+            .session_store
+            .as_ref()
+            .and_then(|store| store.load(&self.root))
+        else {
+            return;
+        };
+        for tab in value["tabs"].as_array().into_iter().flatten().take(256) {
+            let Some(path) = tab["path"]
+                .as_str()
+                .map(PathBuf::from)
+                .filter(|path| path.is_file())
+            else {
+                continue;
+            };
+            if self.documents.iter().any(|doc| doc.path == path) {
+                continue;
+            }
+            if let Ok(mut doc) = Document::open(path, self.csv_headers) {
+                doc.jump = Some((
+                    tab["line"].as_u64().unwrap_or(1).max(1) as usize,
+                    tab["column"].as_u64().unwrap_or(1).max(1) as usize,
+                ));
+                self.documents.push(doc);
+            }
+        }
+        self.active = value["active_path"]
+            .as_str()
+            .and_then(|path| {
+                self.documents
+                    .iter()
+                    .position(|doc| doc.path == Path::new(path))
+            })
+            .unwrap_or(0);
+        self.show_worktrees = value["worktrees"].as_bool().unwrap_or(true);
+        self.show_project = value["files"].as_bool().unwrap_or(true);
+        self.show_structure = value["structure"].as_bool().unwrap_or(false);
+        self.files_changed_only = value["changed_only"].as_bool().unwrap_or(false);
+        self.terminal.restore(&value["terminal"]);
+    }
+
     fn switch_project(&mut self, root: PathBuf) {
+        self.save_session();
         self.search_cancel.store(true, Ordering::Relaxed);
         self.search_rx = None;
         self.files_rx = None;
@@ -518,8 +621,34 @@ impl Coder {
         }
         self.file_action = None;
         self.git = Default::default();
+        self.restore_session();
         self.status = "Project opened".into();
         self.refresh_files();
+    }
+
+    fn switch_worktree(&mut self, root: PathBuf) {
+        if self.defer_actions {
+            self.queue_action(FrameAction::SwitchWorktree(root));
+            return;
+        }
+        self.commit_current_sheet();
+        let mut terminal = crate::terminal::Terminal::default();
+        terminal.settings = self.terminal.settings.clone();
+        let session = WorktreeSession {
+            documents: std::mem::take(&mut self.documents),
+            active: self.active,
+            terminal: std::mem::replace(&mut self.terminal, terminal),
+            history: std::mem::take(&mut self.history),
+        };
+        self.worktree_sessions.insert(self.root.clone(), session);
+        self.switch_project(root);
+        if let Some(session) = self.worktree_sessions.remove(&self.root) {
+            self.documents = session.documents;
+            self.active = session.active;
+            self.terminal = session.terminal;
+            self.history = session.history;
+        }
+        self.focus_editor = true;
     }
 
     fn refresh_files(&mut self) {
@@ -560,6 +689,44 @@ impl Coder {
             self.documents[self.active].jump = Some(target);
             if self.documents[self.active].is_markdown() {
                 self.documents[self.active].markdown = MarkdownMode::Split;
+            }
+        }
+    }
+
+    fn apply_review_revert(&mut self, revert: crate::git_view::RevertHunk, ctx: &egui::Context) {
+        self.open(revert.path.clone(), None);
+        if let Some(doc) = self
+            .documents
+            .get_mut(self.active)
+            .filter(|doc| doc.path == revert.path)
+        {
+            if doc.source_text().ok().as_deref() != Some(revert.expected.as_str()) {
+                self.error = Some("The file changed since this diff was opened. Reopen the diff before copying a hunk from the base.".into());
+            } else {
+                if let Err(error) = doc.set_csv_source(true) {
+                    self.error = Some(error.to_string());
+                    return;
+                }
+                if let Some(id) = doc.editor_id {
+                    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+                    let mut undoer = state.undoer();
+                    let cursor = state.cursor.char_range().unwrap_or_default();
+                    undoer.add_undo(&(cursor, revert.expected.clone()));
+                    undoer.add_undo(&(cursor, revert.replacement.clone()));
+                    state.set_undoer(undoer);
+                    state.store(ctx, id);
+                }
+                let Content::Text(text) = &mut doc.content else {
+                    return;
+                };
+                *text = revert.replacement.into();
+                doc.dirty = true;
+                doc.mark_changed();
+                doc.outline_refresh = Some(Instant::now());
+                doc.jump = Some((revert.line, 0));
+                if doc.is_markdown() {
+                    doc.markdown = MarkdownMode::Edit;
+                }
             }
         }
     }
@@ -1088,11 +1255,11 @@ impl Coder {
 
     fn toolbar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("toolbar")
-            .exact_height(42.0)
+            .exact_height(44.0)
             .frame(
                 egui::Frame::new()
                     .fill(chrome::PANEL)
-                    .inner_margin(egui::Margin::symmetric(12, 5)),
+                    .inner_margin(egui::Margin::symmetric(12, 6)),
             )
             .show(ctx, |ui| {
                 ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
@@ -1106,16 +1273,19 @@ impl Coder {
                         .to_string();
                     let (mark, _) =
                         ui.allocate_exact_size(egui::vec2(25.0, 25.0), egui::Sense::hover());
-                    ui.painter()
-                        .rect_filled(mark, 7, Color32::from_rgb(105, 79, 161));
+                    ui.painter().rect_filled(mark, 7, chrome::SELECTED);
                     ui.painter().text(
                         mark.center(),
                         egui::Align2::CENTER_CENTER,
-                        "C",
+                        "G",
                         FontId::proportional(16.0),
                         Color32::WHITE,
                     );
-                    ui.label(RichText::new(name).strong());
+                    ui.add_sized(
+                        [140.0_f32.min(ui.available_width() * 0.18), 28.0],
+                        egui::Label::new(RichText::new(name).strong()).truncate(),
+                    )
+                    .on_hover_text(self.root.display().to_string());
                     ui.add_space(12.0);
                     ui.menu_button("File", |ui| {
                         if ui.button("Open folder…").clicked()
@@ -1142,6 +1312,7 @@ impl Coder {
                         }
                         if ui.button("Refresh project").clicked() {
                             self.refresh_files();
+                            self.git.refresh(&self.root, ctx);
                             ui.close();
                         }
                         ui.separator();
@@ -1182,20 +1353,22 @@ impl Coder {
                         }
                     });
                     ui.menu_button("View", |ui| {
-                        ui.checkbox(&mut self.show_project, "Project tool window");
+                        ui.checkbox(&mut self.show_worktrees, "Worktrees tool window");
+                        if ui
+                            .checkbox(&mut self.show_project, "Files tool window")
+                            .changed()
+                            && self.show_project
+                        {
+                            self.show_structure = false;
+                            self.git.visible = false;
+                        }
                         if ui
                             .checkbox(&mut self.show_structure, "Structure tool window")
                             .changed()
                             && self.show_structure
                         {
                             self.git.visible = false;
-                        }
-                        if ui
-                            .checkbox(&mut self.git.visible, "Changes tool window")
-                            .changed()
-                            && self.git.visible
-                        {
-                            self.show_structure = false;
+                            self.show_project = false;
                         }
                         ui.separator();
                         if ui.button("Terminal    Alt F12 / ⌘/Ctrl `").clicked() {
@@ -1213,11 +1386,12 @@ impl Coder {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new("Go to File  ·  Double Shift")
+                                    RichText::new("Search files…    Double Shift")
                                         .color(chrome::TEXT),
                                 )
                                 .fill(chrome::EDITOR)
-                                .corner_radius(6),
+                                .stroke(egui::Stroke::new(1.0_f32, chrome::BORDER))
+                                .corner_radius(8),
                             )
                             .clicked()
                         {
@@ -1244,11 +1418,15 @@ impl Coder {
             .frame(egui::Frame::new().fill(chrome::PANEL).inner_margin(5))
             .show(ctx, |ui| {
                 ui.add_space(7.0);
-                if chrome::tool_button(ui, 0, self.show_project)
-                    .on_hover_text("Project")
-                    .clicked()
+                if chrome::navigation_button(
+                    ui,
+                    chrome::Icon::Branch,
+                    self.show_worktrees,
+                    "Show / hide Worktrees",
+                )
+                .clicked()
                 {
-                    self.show_project = !self.show_project;
+                    self.show_worktrees = !self.show_worktrees;
                 }
                 ui.add_space(10.0);
                 if chrome::tool_button(ui, 1, self.search_open)
@@ -1267,9 +1445,46 @@ impl Coder {
             });
     }
 
+    fn worktrees_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("worktrees-panel")
+            .default_width(255.0)
+            .width_range(200.0..=450.0)
+            .frame(egui::Frame::new().fill(chrome::PANEL).inner_margin(10))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    chrome::heading_icon(ui, chrome::Icon::Branch, chrome::BLUE);
+                    ui.strong("Worktrees");
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if chrome::icon_button(ui, chrome::Icon::HideLeft, "Hide Worktrees")
+                            .clicked()
+                        {
+                            self.show_worktrees = false;
+                        }
+                    });
+                });
+                ui.separator();
+                let mut dirty: Vec<_> = self
+                    .worktree_sessions
+                    .iter()
+                    .filter(|(_, session)| session.documents.iter().any(|doc| doc.dirty))
+                    .map(|(path, _)| path.clone())
+                    .collect();
+                if self.documents.iter().any(|doc| doc.dirty) {
+                    dirty.push(self.root.clone());
+                }
+                if let Some(root) = self.worktrees.content(ui, &self.root, &dirty) {
+                    self.switch_worktree(root);
+                }
+            });
+    }
+
     fn sidebar(&mut self, ctx: &egui::Context) {
         let mut open = None;
+        let mut git_action = None;
         let mut force_root = self.tree.reveal_pending();
+        if force_root {
+            self.files_changed_only = false;
+        }
         // The colors of the changed files are kept until the repository or the
         // edited documents change, so the tree is not rebuilt every frame.
         let dirty: Vec<PathBuf> = self
@@ -1299,7 +1514,7 @@ impl Coder {
             self.git_colors = (colors_key, Arc::new(colors));
         }
         let colors = self.git_colors.1.clone();
-        egui::SidePanel::left("explorer")
+        egui::SidePanel::right("explorer")
             .default_width(285.0)
             .width_range(160.0..=500.0)
             .frame(
@@ -1309,22 +1524,44 @@ impl Coder {
             )
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                ui.spacing_mut().interact_size.y = 23.0;
+                ui.spacing_mut().interact_size.y = 26.0;
                 ui.horizontal(|ui| {
-                    ui.menu_button(RichText::new("Project").strong(), |ui| {
+                    ui.menu_button(RichText::new("Files").strong(), |ui| {
                         ui.checkbox(&mut self.show_file_filter, "Filter project files");
                         if ui.button("Refresh project").clicked() {
                             self.refresh_files();
+                            self.git.refresh(&self.root, ctx);
                             ui.close();
                         }
                     });
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        if chrome::icon_button(ui, chrome::Icon::HideLeft, "Hide Project").clicked()
+                        if chrome::icon_button(ui, chrome::Icon::HideRight, "Hide Files").clicked()
                         {
                             self.show_project = false;
                         }
                     });
                 });
+                let changed_count = self
+                    .git
+                    .repo
+                    .as_ref()
+                    .map(|repo| crate::git_view::tree_files(repo, &dirty).len())
+                    .unwrap_or(0);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.files_changed_only, false, "All files");
+                    ui.selectable_value(
+                        &mut self.files_changed_only,
+                        true,
+                        format!("Changed ({changed_count})"),
+                    );
+                });
+                ui.separator();
+                git_action = self
+                    .git
+                    .content(ui, &self.root, &dirty, self.files_changed_only);
+                if self.files_changed_only {
+                    return;
+                }
                 ui.horizontal(|ui| {
                     for action in [0, 1, 2] {
                         if chrome::tree_button(ui, action).clicked() {
@@ -1391,6 +1628,12 @@ impl Coder {
                             });
                     });
             });
+        if let Some(path) = self.tree.diff.take() {
+            git_action = Some(crate::git_view::ChangeAction::Diff(path));
+        }
+        if let Some(action) = git_action {
+            self.apply_file_panel_action(action, ctx);
+        }
         if let Some(action) = self.tree.action.take() {
             self.file_action_name = match &action {
                 crate::explorer::FileAction::Rename(path) => path
@@ -1408,6 +1651,27 @@ impl Coder {
         }
     }
 
+    fn apply_file_panel_action(
+        &mut self,
+        action: crate::git_view::ChangeAction,
+        ctx: &egui::Context,
+    ) {
+        match action {
+            crate::git_view::ChangeAction::Open(path) => self.open(path, None),
+            crate::git_view::ChangeAction::Diff(path) => {
+                let buffer = self
+                    .documents
+                    .iter()
+                    .find(|doc| doc.path == path && doc.dirty)
+                    .and_then(|doc| match &doc.content {
+                        Content::Text(text) => Some(text.to_string()),
+                        Content::Csv(sheet) => sheet.serialize().ok(),
+                    });
+                self.git.open_review(path, buffer, ctx);
+            }
+        }
+    }
+
     fn structure_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::right("right-tool-rail")
             .exact_width(32.0)
@@ -1415,11 +1679,14 @@ impl Coder {
             .frame(egui::Frame::new().fill(chrome::PANEL).inner_margin(2))
             .show(ctx, |ui| {
                 for (name, active) in [
+                    (
+                        "Files",
+                        (self.show_project || self.git.visible) && !self.show_structure,
+                    ),
                     ("Structure", self.show_structure),
-                    ("Changes", self.git.visible),
                 ] {
                     let (rect, response) =
-                        ui.allocate_exact_size(egui::vec2(28.0, 105.0), egui::Sense::click());
+                        ui.allocate_exact_size(egui::vec2(28.0, 84.0), egui::Sense::click());
                     if active || response.hovered() {
                         ui.painter().rect_filled(
                             rect,
@@ -1454,42 +1721,23 @@ impl Coder {
                         .on_hover_text(format!("Show / hide {name}"))
                         .clicked()
                     {
-                        if name == "Structure" {
-                            self.show_structure = !self.show_structure;
-                            self.git.visible = false;
-                        } else {
-                            self.git.visible = !self.git.visible;
-                            self.show_structure = false;
-                        }
+                        let open = !active;
+                        self.show_project = name == "Files" && open;
+                        self.show_structure = name == "Structure" && open;
+                        self.git.visible = false;
                     }
                 }
             });
         if self.git.visible {
-            let dirty: Vec<_> = self
-                .documents
-                .iter()
-                .filter(|doc| doc.dirty)
-                .map(|doc| doc.path.clone())
-                .collect();
-            if let Some(action) = self.git.panel(ctx, &self.root, &dirty) {
-                match action {
-                    crate::git_view::ChangeAction::Open(path) => self.open(path, None),
-                    crate::git_view::ChangeAction::Diff(path) => {
-                        let buffer = self
-                            .documents
-                            .iter()
-                            .find(|doc| doc.path == path && doc.dirty)
-                            .and_then(|doc| match &doc.content {
-                                Content::Text(text) => Some(text.to_string()),
-                                Content::Csv(sheet) => sheet.serialize().ok(),
-                            });
-                        self.git.open_review(path, buffer, ctx);
-                    }
-                }
-            }
-            return;
+            self.git.visible = false;
+            self.show_project = true;
+            self.show_structure = false;
+            self.files_changed_only = true;
         }
         if !self.show_structure {
+            if self.show_project {
+                self.sidebar(ctx);
+            }
             return;
         }
         let mut target = None;
@@ -2154,7 +2402,7 @@ impl Coder {
                                     egui::vec2(ui.available_width(), row_height),
                                 ),
                                 0.0,
-                                Color32::from_rgb(38, 40, 44),
+                                chrome::HEADER.gamma_multiply(0.6),
                             );
                         }
                         ui.horizontal(|ui| {
@@ -2378,39 +2626,46 @@ impl Coder {
                         Content::Csv(_) => None,
                     });
                 let Some(doc) = self.documents.get_mut(self.active) else {
+                    ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()).shrink(8.0));
+                    egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: false, ..Default::default() }).id_salt("welcome").show(ui, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.add_space(100.0);
-                        ui.label(
-                            RichText::new("Your workspace is ready")
-                                .size(25.0)
-                                .strong()
-                                .color(chrome::TEXT),
-                        );
-                        ui.add_space(8.0);
-                        ui.label("Open a file from Project, or start with a different folder.");
-                        ui.add_space(20.0);
-                        ui.horizontal(|ui| {
-                            let width = 260.0;
-                            ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
-                            if chrome::dialog_button(ui, "Open file…", Some(chrome::BLUE)).clicked()
-                                && let Some(path) = rfd::FileDialog::new().pick_file()
-                            {
-                                self.open(path, None);
-                            }
-                            if chrome::dialog_button(ui, "Open folder…", None).clicked()
-                                && let Some(root) = rfd::FileDialog::new().pick_folder()
-                            {
-                                self.request_project(root);
+                        ui.add_space((ui.available_height() * 0.16).clamp(24.0, 100.0));
+                        let (mark, _) = ui.allocate_exact_size(egui::vec2(64.0, 64.0), egui::Sense::hover());
+                        ui.painter().rect_filled(mark, 18, chrome::SELECTED);
+                        ui.painter().text(mark.center(), egui::Align2::CENTER_CENTER, "G", FontId::proportional(34.0), chrome::BLUE);
+                        ui.add_space(18.0);
+                        ui.label(RichText::new("Make room for your next idea.").size(26.0).strong());
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Find a file, explore a branch, or pick up where you left off.").color(chrome::MUTED));
+                        ui.add_space(24.0);
+                        let width = 350.0_f32.min(ui.available_width());
+                        ui.scope(|ui| {
+                            ui.set_max_width(width);
+                            for (title, shortcut, action) in [
+                                ("Search files", "Double Shift", 0),
+                                ("Find in project", "⌘/Ctrl Shift F", 1),
+                                ("Recent files", "⌘/Ctrl E", 2),
+                                ("Open folder…", "Browse", 3),
+                            ] {
+                                let button = egui::Button::new(format!("{title}     ·     {shortcut}"))
+                                    .fill(chrome::PANEL)
+                                    .stroke(egui::Stroke::new(1.0_f32, chrome::BORDER))
+                                    .corner_radius(8)
+                                    .min_size(egui::vec2(width, 42.0));
+                                if ui.add(button).clicked() {
+                                    match action {
+                                        0 => self.show_picker(Picker::Everywhere),
+                                        1 => self.open_search(),
+                                        2 => self.show_picker(Picker::Recent),
+                                        _ => if let Some(root) = rfd::FileDialog::new().pick_folder() { self.request_project(root); },
+                                    }
+                                }
+                                ui.add_space(5.0);
                             }
                         });
-                        ui.add_space(24.0);
-                        ui.label(
-                            RichText::new(
-                                "Double Shift  ·  Go to file     ⌘/Ctrl Shift F  ·  Find in files",
-                            )
-                            .size(12.0)
-                            .color(chrome::MUTED),
-                        );
+                        ui.add_space(22.0);
+                        ui.label(RichText::new("WORKTREES  /  CODE  /  REVIEW  /  TERMINAL").size(10.0).color(chrome::MUTED));
+                    });
                     });
                     return;
                 };
@@ -2433,6 +2688,9 @@ impl Coder {
                 );
                 if file_actions.reveal {
                     self.show_project = true;
+                    self.files_changed_only = false;
+                    self.show_structure = false;
+                    self.git.visible = false;
                     self.tree.reveal_active();
                 }
                 if file_actions.blame {
@@ -2710,8 +2968,16 @@ impl Coder {
                             }
                         }
                         _ => {
-                            let dirty: Vec<_> =
-                                self.documents.iter().filter(|doc| doc.dirty).collect();
+                            let dirty: Vec<_> = self
+                                .documents
+                                .iter()
+                                .chain(
+                                    self.worktree_sessions
+                                        .values()
+                                        .flat_map(|session| session.documents.iter()),
+                                )
+                                .filter(|doc| doc.dirty)
+                                .collect();
                             chrome::dialog_card(ui, |ui| {
                                 ui.label(
                                     RichText::new(format!(
@@ -2777,6 +3043,18 @@ impl Coder {
                                 if self.documents[i].dirty && !self.save(i) {
                                     success = false;
                                     break;
+                                }
+                            }
+                            if matches!(self.pending, Some(Pending::Exit)) {
+                                for session in self.worktree_sessions.values_mut() {
+                                    for doc in &mut session.documents {
+                                        if doc.dirty
+                                            && let Err(error) = doc.save()
+                                        {
+                                            self.error = Some(format!("{error:#}"));
+                                            success = false;
+                                        }
+                                    }
                                 }
                             }
                             success
@@ -3189,6 +3467,9 @@ impl Coder {
             }
             if location.path.is_dir() {
                 self.show_project = true;
+                self.files_changed_only = false;
+                self.show_structure = false;
+                self.git.visible = false;
                 self.file_filter.clear();
                 self.tree.reveal_path(&self.root, &location.path);
             } else {
@@ -3205,8 +3486,10 @@ impl Coder {
     fn draw(&mut self, ctx: &egui::Context) {
         self.defer_actions = true;
         self.poll(ctx);
+        self.worktrees.poll();
         let blocked = self.pending.is_some()
             || self.terminal.modal()
+            || self.worktrees.modal()
             || self.file_action.is_some()
             || self.error.is_some()
             || self.picker.is_some()
@@ -3235,44 +3518,70 @@ impl Coder {
         }
         if ctx.input(|i| i.viewport().close_requested())
             && !self.allow_exit
-            && self.documents.iter().any(|d| d.dirty)
+            && (self.documents.iter().any(|d| d.dirty)
+                || self
+                    .worktree_sessions
+                    .values()
+                    .any(|session| session.documents.iter().any(|d| d.dirty)))
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.ask(Pending::Exit);
             self.commit_current_sheet();
         }
         self.toolbar(ctx);
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.small(&self.status);
-                ui.separator();
-                ui.small("UTF-8");
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    if let Some(location) = self.current_location() {
-                        ui.small(format!("{}:{}", location.line, location.column));
+        egui::TopBottomPanel::bottom("status")
+            .frame(
+                egui::Frame::new()
+                    .fill(chrome::TABS)
+                    .inner_margin(egui::Margin::symmetric(12, 5)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(chrome::GREEN, "●");
+                    if let Some(repo) = &self.git.repo {
+                        chrome::heading_icon(ui, chrome::Icon::Branch, chrome::BLUE);
+                        ui.label(RichText::new(&repo.branch).size(11.0).color(chrome::BLUE));
+                        ui.separator();
                     }
-                    ui.small(
-                        self.documents
-                            .get(self.active)
-                            .map_or("LF", |doc| doc.line_ending),
-                    );
+                    ui.label(RichText::new(&self.status).size(11.0).color(chrome::MUTED));
+                    ui.separator();
+                    ui.small("UTF-8");
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(location) = self.current_location() {
+                            ui.small(format!("{}:{}", location.line, location.column));
+                        }
+                        ui.small(
+                            self.documents
+                                .get(self.active)
+                                .map_or("LF", |doc| doc.line_ending),
+                        );
+                    });
                 });
             });
-        });
         self.tool_rail(ctx);
+        // Keep the right tools full height; the terminal extends under Worktrees.
         self.structure_panel(ctx);
-        self.terminal.panel(ctx, &self.root, !blocked);
+        // Keep this frame's placement stable when a header button toggles it.
+        let terminal_maximized = self.terminal.visible && self.terminal.maximized;
+        if !terminal_maximized {
+            self.terminal.panel(ctx, &self.root, !blocked);
+        }
+        if self.show_worktrees {
+            self.worktrees_panel(ctx);
+        }
         if self.search_docked {
             self.results_panel(ctx);
         }
-        if self.show_project {
-            self.sidebar(ctx);
-        }
+
         if self.picker.is_some() {
             chrome::clear_resize_cursor(ctx);
         }
         self.picker_ui(ctx);
-        self.editor(ctx);
+        if terminal_maximized {
+            self.terminal.central_panel(ctx, &self.root, !blocked);
+        } else {
+            self.editor(ctx);
+        }
         if !self.search_docked {
             self.results_panel(ctx);
         }
@@ -3281,6 +3590,7 @@ impl Coder {
             match action {
                 FrameAction::Open(path, target) => self.open(path, target),
                 FrameAction::SwitchProject(root) => self.switch_project(root),
+                FrameAction::SwitchWorktree(root) => self.switch_worktree(root),
                 FrameAction::Save(index) => {
                     self.save(index);
                 }
@@ -3321,8 +3631,12 @@ impl Coder {
         if let Some(path) = self.git.windows(ctx) {
             self.open(path, None);
         }
+        if let Some(revert) = self.git.pending_revert.take() {
+            self.apply_review_revert(revert, ctx);
+        }
         if self.pending.is_some()
             || self.terminal.modal()
+            || self.worktrees.modal()
             || self.file_action.is_some()
             || self.error.is_some()
             || self.picker.is_some()
@@ -3331,17 +3645,18 @@ impl Coder {
         }
         self.dialogs(ctx);
         self.terminal.windows(ctx);
+        self.worktrees.dialog(ctx);
         let mut panels = Vec::new();
-        if self.show_project {
+        if self.show_worktrees {
+            panels.push(("worktrees-panel", true));
+        }
+        if self.show_project && !self.show_structure && !self.git.visible {
             panels.push(("explorer", true));
         }
         if self.show_structure {
             panels.push(("structure", true));
         }
-        if self.git.visible {
-            panels.push(("git-changes-panel", true));
-        }
-        if self.terminal.visible {
+        if self.terminal.visible && !terminal_maximized {
             panels.push(("terminal-panel", false));
         }
         if self.search_open && self.search_docked {
@@ -3353,6 +3668,7 @@ impl Coder {
         }
         let modal = self.pending.is_some()
             || self.terminal.modal()
+            || self.worktrees.modal()
             || self.file_action.is_some()
             || self.error.is_some()
             || self.picker.is_some();
@@ -3400,6 +3716,7 @@ impl eframe::App for Coder {
 
 impl Drop for Coder {
     fn drop(&mut self) {
+        self.save_session();
         self.search_cancel.store(true, Ordering::Relaxed);
     }
 }
@@ -3564,18 +3881,55 @@ fn file_candidates(
     root: &Path,
     query: &str,
 ) -> Vec<PathBuf> {
-    let mut seen = std::collections::HashSet::new();
-    recent
+    // Borrow candidate paths; retain at most the visible result limit even for
+    // very large repositories. Source order breaks ties in favor of recents.
+    let query = query.to_lowercase().replace('\\', "/");
+    let mut best: Vec<((u8, usize), &PathBuf)> = Vec::with_capacity(100);
+    for (order, path) in recent
         .iter()
         .chain(open)
         .chain(folders)
         .chain(files)
-        .filter(|path| path.starts_with(root))
-        .filter(|path| relative(path, root).to_lowercase().contains(query))
-        .filter(|path| seen.insert((*path).clone()))
-        .take(100)
-        .cloned()
-        .collect()
+        .enumerate()
+    {
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let score = if query.is_empty() {
+            0
+        } else {
+            let relative = relative.to_string_lossy().to_lowercase().replace('\\', "/");
+            let name = relative.rsplit('/').next().unwrap_or(&relative);
+            if name == query || relative == query {
+                0
+            } else if Path::new(name)
+                .file_stem()
+                .is_some_and(|stem| stem == query.as_str())
+            {
+                1
+            } else if name.starts_with(&query) {
+                2
+            } else if name.contains(&query) {
+                3
+            } else if relative.contains(&query) {
+                4
+            } else {
+                continue;
+            }
+        };
+        let key = (score, order);
+        let index = best.partition_point(|(existing, _)| *existing <= key);
+        if index < 100 && !best.iter().any(|(_, existing)| *existing == path) {
+            if best.len() == 100 {
+                best.pop();
+            }
+            best.insert(index, (key, path));
+        }
+        if query.is_empty() && best.len() == 100 {
+            break;
+        }
+    }
+    best.into_iter().map(|(_, path)| path.clone()).collect()
 }
 
 struct FileToolbarState<'a> {
@@ -3668,9 +4022,10 @@ fn editor_diff_navigation(ui: &mut egui::Ui, targets: &[usize], line: usize) -> 
     }
     let mut target = None;
     egui::Frame::new()
-        .fill(chrome::TABS)
+        .fill(chrome::EDITOR)
         .inner_margin(egui::Margin::symmetric(10, 3))
         .show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 for (label, next) in [("↑ Previous", false), ("↓ Next", true)] {
                     if ui
@@ -4396,7 +4751,7 @@ fn text_editor(
                         line_rect,
                         0.0,
                         if ui.visuals().dark_mode {
-                            Color32::from_rgb(38, 40, 44)
+                            chrome::HEADER.gamma_multiply(0.6)
                         } else {
                             Color32::from_rgb(242, 247, 255)
                         },
@@ -4423,6 +4778,11 @@ fn text_editor(
                 };
                 let structure = analysis.as_ref().map_or(&small_structure, |a| &a.structure);
                 let active_pair = structure.matching(*cursor);
+                let caret_line = output
+                    .galley
+                    .layout_from_cursor(egui::text::CCursor::new(*cursor))
+                    .row;
+                let active_guide = structure.active_guide(caret_line);
                 for guide in &structure.guides {
                     if let (Some(start), Some(end)) = (
                         output.galley.rows.get(guide.start),
@@ -4433,7 +4793,10 @@ fn text_editor(
                         }
                         let top = (output.galley_pos.y + start.pos.y + start.size.y)
                             .max(ui.clip_rect().top());
-                        let bottom = (output.galley_pos.y + end.pos.y).min(ui.clip_rect().bottom());
+                        let bottom = (output.galley_pos.y
+                            + end.pos.y
+                            + if guide.inclusive_end { end.size.y } else { 0.0 })
+                        .min(ui.clip_rect().bottom());
                         if top < bottom {
                             let x = output
                                 .galley
@@ -4442,7 +4805,22 @@ fn text_editor(
                                 + output.galley_pos.x;
                             guides.push(egui::Shape::line_segment(
                                 [egui::pos2(x, top), egui::pos2(x, bottom)],
-                                egui::Stroke::new(1.0_f32, guide_color),
+                                egui::Stroke::new(
+                                    if active_guide
+                                        .is_some_and(|active| std::ptr::eq(active, guide))
+                                    {
+                                        2.0_f32
+                                    } else {
+                                        1.0_f32
+                                    },
+                                    if active_guide
+                                        .is_some_and(|active| std::ptr::eq(active, guide))
+                                    {
+                                        chrome::BLUE
+                                    } else {
+                                        guide_color
+                                    },
+                                ),
                             ));
                         }
                     }
@@ -4936,6 +5314,43 @@ fn edit_line(text: &mut String, cursor: usize, path: &Path, duplicate: bool) {
 mod tests {
     use super::*;
     use crate::search_view::{extension, result_visible};
+    #[test]
+    fn review_revert_updates_the_buffer_and_rejects_a_stale_diff() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("sample.rs");
+        std::fs::write(&path, "current\n")?;
+        let path = path.canonicalize()?;
+        let mut app = Coder::empty(dir.path().to_path_buf());
+        let ctx = egui::Context::default();
+        app.apply_review_revert(
+            crate::git_view::RevertHunk {
+                path: path.clone(),
+                expected: "current\n".into(),
+                replacement: "base\n".into(),
+                line: 0,
+            },
+            &ctx,
+        );
+        assert!(app.error.is_none());
+        assert!(app.documents[app.active].dirty);
+        assert_eq!(app.documents[app.active].source_text()?, "base\n");
+        assert_eq!(std::fs::read_to_string(&path)?, "current\n");
+        app.apply_review_revert(
+            crate::git_view::RevertHunk {
+                path: path.clone(),
+                expected: "current\n".into(),
+                replacement: "stale\n".into(),
+                line: 0,
+            },
+            &ctx,
+        );
+        assert!(app.error.as_deref().unwrap().contains("changed since"));
+        assert_eq!(app.documents[app.active].source_text()?, "base\n");
+        app.documents[app.active].save()?;
+        assert_eq!(std::fs::read_to_string(path)?, "base\n");
+        Ok(())
+    }
+
     #[test]
     fn project_timer_tracks_external_creates_renames_and_deletes() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -5536,6 +5951,52 @@ mod tests {
     }
 
     #[test]
+    fn maximized_terminal_replaces_editor_and_restores_docked_height() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("keep-open.rs");
+        std::fs::write(&path, "fn preserved() {}\n")?;
+        let mut app = Coder::empty(dir.path().to_path_buf());
+        let path = path.canonicalize()?;
+        app.open(path.clone(), None);
+        app.terminal.settings.shell = "/bin/sh".into();
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        app.terminal.new_tab(dir.path(), &ctx);
+        let frame = |app: &mut Coder| {
+            for _ in 0..3 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1400.0, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                );
+            }
+            ctx.read_response(egui::Id::new(("terminal-input", 1_u64)))
+                .unwrap()
+                .rect
+        };
+        let docked = frame(&mut app);
+        app.terminal.maximized = true;
+        let expanded = frame(&mut app);
+        assert!(expanded.height() > docked.height() + 200.0);
+        assert!(expanded.top() < docked.top());
+        assert_eq!(app.documents[app.active].path, path);
+        assert_eq!(
+            app.terminal.snapshot()["roots"].as_array().unwrap().len(),
+            1
+        );
+        app.terminal.maximized = false;
+        let restored = frame(&mut app);
+        assert!((restored.height() - docked.height()).abs() < 1.0);
+        assert_eq!(app.documents[app.active].path, path);
+        Ok(())
+    }
+
+    #[test]
     fn all_panel_borders_keep_idle_and_drag_cursors_and_yield_to_dialogs() -> anyhow::Result<()> {
         use egui::{CursorIcon as C, Event as E};
         let dir = tempfile::tempdir()?;
@@ -5558,9 +6019,9 @@ mod tests {
             )
         };
         for panel in [
+            "worktrees-panel",
             "explorer",
             "structure",
-            "git-changes-panel",
             "terminal-panel",
             "search-results",
         ] {
@@ -5573,7 +6034,10 @@ mod tests {
             }
             let id = egui::Id::new(panel).with("__resize");
             let handle = ctx.read_response(id).unwrap().rect;
-            let horizontal = matches!(panel, "explorer" | "structure" | "git-changes-panel");
+            let horizontal = matches!(
+                panel,
+                "worktrees-panel" | "explorer" | "structure" | "git-changes-panel"
+            );
             assert!(
                 (if horizontal {
                     handle.width()
@@ -5780,12 +6244,192 @@ mod tests {
     }
 
     #[test]
+    fn unified_files_panel_switches_scope_and_keeps_deleted_changes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let changed = root.join("changed.txt");
+        let normal = root.join("normal.txt");
+        std::fs::write(&changed, "changed")?;
+        std::fs::write(&normal, "normal")?;
+        let mut app = Coder::empty(root.clone());
+        app.files = vec![changed.clone(), normal];
+        app.tree = crate::explorer::FileTree::build(&root, &app.files);
+        app.git.repo = Some(crate::git::Repository {
+            root: root.clone(),
+            branch: "feature".into(),
+            head: "a".repeat(40),
+            base: "main".into(),
+            merge_base: None,
+            branches: vec!["main".into()],
+            remote: None,
+            files: vec![
+                crate::git::ChangedFile {
+                    path: "changed.txt".into(),
+                    uncommitted: true,
+                    ..Default::default()
+                },
+                crate::git::ChangedFile {
+                    path: "deleted.txt".into(),
+                    deleted: true,
+                    committed: true,
+                    ..Default::default()
+                },
+            ],
+        });
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let frame = |app: &mut Coder, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.sidebar(ctx),
+            )
+        };
+        for _ in 0..3 {
+            frame(&mut app, vec![]);
+        }
+        let output = frame(&mut app, vec![]);
+        let has = |output: &egui::FullOutput, label: &str| {
+            output.shapes.iter().any(|shape|
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label))
+        };
+        assert!(has(&output, "normal.txt"));
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Changed (2)" => {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                _ => None,
+            })
+            .expect("changed filter is visible");
+        for pressed in [true, false] {
+            frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(app.files_changed_only);
+        let output = frame(&mut app, vec![]);
+        assert!(!has(&output, "normal.txt"));
+        assert!(has(&output, "D  deleted.txt"));
+        assert!(
+            ctx.read_response(egui::Id::new("git-changes-panel").with("__resize"))
+                .is_none()
+        );
+        app.tree.reveal_active();
+        frame(&mut app, vec![]);
+        assert!(!app.files_changed_only, "reveal must restore all files");
+        Ok(())
+    }
+
+    #[test]
+    fn right_tool_tabs_and_left_worktree_toggle_are_independent() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = Coder::empty(dir.path().to_path_buf());
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let frame = |app: &mut Coder, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+        };
+        for _ in 0..4 {
+            frame(&mut app, vec![]);
+        }
+        let left = ctx
+            .read_response(egui::Id::new("worktrees-panel").with("__resize"))
+            .unwrap()
+            .rect;
+        let right = ctx
+            .read_response(egui::Id::new("explorer").with("__resize"))
+            .unwrap()
+            .rect;
+        assert!(left.center().x < 700.0 && right.center().x > 700.0);
+        let click = |app: &mut Coder, x, y| {
+            let pos = egui::pos2(x, y);
+            frame(
+                app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            frame(
+                app,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        };
+        click(&mut app, 1384.0, 175.0);
+        assert!(app.show_structure && !app.show_project && !app.git.visible);
+        click(&mut app, 1384.0, 70.0);
+        assert!(app.show_project && !app.show_structure && !app.git.visible);
+        click(&mut app, 20.0, 65.0);
+        assert!(!app.show_worktrees && app.show_project);
+        click(&mut app, 20.0, 65.0);
+        assert!(app.show_worktrees && app.show_project);
+        Ok(())
+    }
+
+    #[test]
     fn panel_resize_cursor_stays_stable() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut app = Coder::empty(dir.path().to_path_buf());
         let ctx = egui::Context::default();
         chrome::install(&ctx);
-        for x in 320..335 {
+        app.show_worktrees = false;
+        for _ in 0..4 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+        }
+        let edge = ctx
+            .read_response(egui::Id::new("explorer").with("__resize"))
+            .unwrap()
+            .rect
+            .center()
+            .x as i32;
+        for x in edge - 7..edge + 8 {
             let mut icons = vec![];
             for frame in 0..8 {
                 let output = ctx.run(
@@ -6232,6 +6876,26 @@ mod tests {
         );
         assert_eq!(found.len(), 100);
         assert_eq!(found[0], folder);
+    }
+
+    #[test]
+    fn file_search_ranks_exact_names_before_recent_and_path_only_matches() {
+        let root = Path::new("/project");
+        let mut files: Vec<_> = (0..500)
+            .map(|i| root.join(format!("main/archive/{i}.rs")))
+            .collect();
+        let exact = root.join("src/main.rs");
+        let prefix = root.join("src/main_test.rs");
+        files.extend([prefix.clone(), exact.clone()]);
+        let recent = files[0].clone();
+        let found = file_candidates(&[recent], &[], &files, &[], root, "main");
+        assert_eq!(found.len(), 100);
+        assert_eq!(found[0], exact);
+        assert_eq!(found[1], prefix);
+        assert_eq!(
+            file_candidates(&[], &[], &files, &[], root, "SRC\\MAIN.RS"),
+            vec![exact]
+        );
     }
 
     #[test]
@@ -6978,6 +7642,93 @@ mod tests {
         frame(&mut app, key(Key::Escape));
         assert!(!app.find_open);
         assert_eq!(ctx.memory(|m| m.focused()), app.documents[0].editor_id);
+        Ok(())
+    }
+
+    #[test]
+    fn project_sessions_restore_tabs_cursor_layout_and_skip_missing_files() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("project");
+        let other = dir.path().join("other");
+        let state = dir.path().join("sessions");
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&other)?;
+        let root = root.canonicalize()?;
+        let file = root.join("unicode.rs");
+        let deleted = root.join("deleted.rs");
+        std::fs::write(&file, "fn main() {\n    let 猫 = 1;\n}\n")?;
+        std::fs::write(&deleted, "temporary")?;
+        let mut app = Coder::empty(root.clone());
+        app.session_store = Some(crate::session::Store::new(state.clone()));
+        app.open(deleted.clone(), None);
+        app.open(file.clone(), Some((2, 9)));
+        app.show_worktrees = false;
+        app.show_structure = true;
+        app.show_project = false;
+        app.switch_project(other);
+        std::fs::remove_file(deleted)?;
+        app.switch_project(root.clone());
+        assert_eq!(app.documents.len(), 1);
+        assert_eq!(app.documents[app.active].path, file);
+        assert_eq!(app.documents[app.active].jump, Some((2, 9)));
+        assert!(!app.show_worktrees && app.show_structure && !app.show_project);
+        drop(app);
+        let mut reopened = Coder::empty(root);
+        reopened.session_store = Some(crate::session::Store::new(state));
+        reopened.restore_session();
+        assert_eq!(reopened.documents.len(), 1);
+        assert_eq!(reopened.documents[0].jump, Some((2, 9)));
+        Ok(())
+    }
+
+    #[test]
+    fn disk_sessions_keep_each_worktrees_tabs_when_buffers_move_into_memory() -> anyhow::Result<()>
+    {
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let a = first.path().join("one.rs");
+        let b = second.path().join("two.rs");
+        std::fs::write(&a, "one")?;
+        std::fs::write(&b, "two")?;
+        let first_root = first.path().canonicalize()?;
+        let second_root = second.path().canonicalize()?;
+        let mut app = Coder::empty(first_root.clone());
+        app.session_store = Some(crate::session::Store::new(state.path().join("projects")));
+        app.open(a.clone(), None);
+        app.switch_worktree(second_root.clone());
+        app.open(b.clone(), None);
+        app.switch_worktree(first_root.clone());
+        assert_eq!(app.documents.len(), 1);
+        assert_eq!(app.documents[0].path, a.canonicalize()?);
+        let store = crate::session::Store::new(state.path().join("projects"));
+        assert_eq!(
+            store.load(&first_root).unwrap()["tabs"][0]["path"],
+            a.canonicalize()?.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            store.load(&second_root).unwrap()["tabs"][0]["path"],
+            b.canonicalize()?.to_string_lossy().as_ref()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn switching_worktrees_preserves_unsaved_buffers_and_active_tabs() -> anyhow::Result<()> {
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        let file = first.path().join("main.rs");
+        std::fs::write(&file, "original")?;
+        let mut app = Coder::empty(first.path().canonicalize()?);
+        app.open(file, None);
+        app.documents[0].dirty = true;
+        app.switch_worktree(second.path().canonicalize()?);
+        assert!(app.documents.is_empty());
+        assert!(app.pending.is_none());
+        app.switch_worktree(first.path().canonicalize()?);
+        assert_eq!(app.documents.len(), 1);
+        assert!(app.documents[0].dirty);
+        assert_eq!(app.active, 0);
         Ok(())
     }
 

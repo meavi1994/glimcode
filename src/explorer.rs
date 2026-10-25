@@ -60,6 +60,7 @@ pub fn context_menu(
 #[derive(Default)]
 pub struct FileTree {
     pub action: Option<FileAction>,
+    pub diff: Option<PathBuf>,
     children: BTreeMap<OsString, FileTree>,
     file: Option<PathBuf>,
     directories_loaded: bool,
@@ -125,6 +126,7 @@ impl FileTree {
         fresh.reveal_requested = self.reveal_requested;
         fresh.reveal_target = self.reveal_target.take();
         fresh.action = self.action.take();
+        fresh.diff = self.diff.take();
         fn keep_commands(fresh: &mut FileTree, old: &mut FileTree) {
             fresh.open_override = old.open_override.take();
             for (name, child) in &mut fresh.children {
@@ -244,6 +246,10 @@ impl FileTree {
                         ui.scroll_to_rect(rect, Some(egui::Align::Center));
                     }
                     response.context_menu(|ui| {
+                        if colors.contains_key(file) && ui.button("View diff").clicked() {
+                            self.diff = Some(file.clone());
+                            ui.close();
+                        }
                         if let Some(action) = context_menu(ui, root, file, false) {
                             self.action = Some(action);
                         }
@@ -273,6 +279,9 @@ impl FileTree {
                             }
                         },
                     );
+                    if let Some(path) = child.diff.take() {
+                        self.diff = Some(path);
+                    }
                     if let Some(action) = child.action.take() {
                         self.action = Some(action);
                     }

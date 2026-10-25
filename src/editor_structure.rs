@@ -10,6 +10,7 @@ pub struct Guide {
     pub start: usize,
     pub end: usize,
     pub anchor: usize,
+    pub inclusive_end: bool,
 }
 #[derive(Default)]
 pub struct Computer;
@@ -81,6 +82,7 @@ impl Structure {
                         start,
                         end: line,
                         anchor,
+                        inclusive_end: false,
                     });
                 }
                 if indent > previous.0 {
@@ -95,10 +97,23 @@ impl Structure {
                 start,
                 end: last_line,
                 anchor,
+                inclusive_end: true,
             });
         }
         result
     }
+    /// Highlight only the innermost scope containing the caret line.
+    /// A dedent belongs to its parent scope, so the end line is exclusive.
+    pub fn active_guide(&self, line: usize) -> Option<&Guide> {
+        self.guides
+            .iter()
+            .filter(|guide| {
+                guide.start <= line
+                    && (line < guide.end || guide.inclusive_end && line == guide.end)
+            })
+            .min_by_key(|guide| (guide.end - guide.start, std::cmp::Reverse(guide.start)))
+    }
+
     pub fn matching(&self, caret: usize) -> Option<(usize, usize)> {
         self.pairs
             .iter()
@@ -130,5 +145,25 @@ mod tests {
         assert_eq!(structure.matching(end + 1), Some((brace, end)));
         assert_eq!(structure.pairs.len(), 4);
         assert!(structure.guides.iter().any(|g| g.start == 0 && g.end == 4));
+    }
+    #[test]
+    fn active_guide_tracks_nested_scopes_blank_lines_and_dedents() {
+        let source = "fn main() {\n    if ready {\n        run();\n\n    }\n    finish();\n}\n";
+        let job = crate::highlighting::background(source, "rs", true, &|| false).unwrap();
+        let structure = Structure::build(&job);
+        assert_eq!(structure.active_guide(0).map(|g| g.start), Some(0));
+        assert_eq!(structure.active_guide(2).map(|g| g.start), Some(1));
+        assert_eq!(structure.active_guide(3).map(|g| g.start), Some(1));
+        assert_eq!(structure.active_guide(4).map(|g| g.start), Some(0));
+        assert_eq!(structure.active_guide(5).map(|g| g.start), Some(0));
+        assert!(structure.active_guide(6).is_none());
+    }
+    #[test]
+    fn active_guide_includes_the_final_indented_line_without_a_newline() {
+        let source = "def run():\n    return 1";
+        let job = crate::highlighting::background(source, "py", true, &|| false).unwrap();
+        let structure = Structure::build(&job);
+        assert_eq!(structure.active_guide(1).map(|guide| guide.start), Some(0));
+        assert!(structure.active_guide(2).is_none());
     }
 }

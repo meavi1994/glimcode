@@ -61,6 +61,7 @@ pub struct GitTool {
     pub file_note: Option<String>,
     project: PathBuf,
     selected_base: Option<String>,
+    base_filter: String,
     repo_rx: Option<Job<Repository>>,
     last_refresh: Option<Instant>,
     pr: Option<PullRequest>,
@@ -73,6 +74,7 @@ pub struct GitTool {
     desired: Option<(u64, Instant)>,
     failed_file: Option<u64>,
     review: Option<Review>,
+    pub pending_revert: Option<RevertHunk>,
     review_mode: DiffMode,
     review_rx: Option<Job<Review>>,
     review_next: Option<(Repository, PathBuf, Option<String>, bool)>,
@@ -287,6 +289,9 @@ impl GitTool {
             return;
         };
         self.review_open = true;
+        ctx.data_mut(|data| {
+            data.remove::<DiffSelection>(egui::Id::new(("diff-selection", &path)));
+        });
         self.review = None;
         self.review_note = None;
         let dark = ctx.style().visuals.dark_mode;
@@ -306,6 +311,7 @@ impl GitTool {
         self.detail_rx = Some(worker(ctx, move || git::commit_detail(&repo, &blame)));
     }
     /// Returns an explicit editor or diff action for a repository-absolute file.
+    #[cfg(test)]
     pub fn panel(
         &mut self,
         ctx: &egui::Context,
@@ -315,149 +321,243 @@ impl GitTool {
         if !self.visible {
             return None;
         }
-        if self.last_refresh.is_none() {
-            self.refresh(project, ctx);
-        }
         let mut selected = None;
-        let mut refresh = false;
         egui::SidePanel::right("git-changes-panel")
             .default_width(320.0)
             .width_range(240.0..=650.0)
-            .frame(egui::Frame::new().fill(chrome::PANEL).inner_margin(10))
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    chrome::heading_icon(ui, chrome::Icon::Branch, chrome::GREEN);
-                    ui.strong("Changes");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if chrome::icon_button(ui, chrome::Icon::HideRight, "Hide Changes")
-                            .clicked()
-                        {
-                            self.visible = false;
+                selected = self.content(ui, project, dirty, true);
+            });
+        selected
+    }
+    pub fn content(
+        &mut self,
+        ui: &mut egui::Ui,
+        project: &Path,
+        dirty: &[PathBuf],
+        changes_only: bool,
+    ) -> Option<ChangeAction> {
+        let ctx = ui.ctx().clone();
+        if self.last_refresh.is_none() {
+            self.refresh(project, &ctx);
+        }
+        let mut selected = None;
+        let mut refresh = false;
+        if let Some(repo) = &self.repo {
+            let previous_base = self.selected_base.as_deref().unwrap_or(&repo.base);
+            let mut base = previous_base.to_owned();
+            egui::Frame::new()
+                .fill(chrome::EDITOR)
+                .stroke(egui::Stroke::new(1.0_f32, chrome::BORDER))
+                .corner_radius(7)
+                .inner_margin(egui::Margin::symmetric(10, 5))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 7.0;
+                    egui::CollapsingHeader::new(
+                        RichText::new("COMPARE CHANGES")
+                            .size(10.0)
+                            .strong()
+                            .color(chrome::MUTED),
+                    )
+                    .id_salt("git-comparison-card")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            chrome::heading_icon(ui, chrome::Icon::Branch, chrome::BLUE);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&repo.branch).strong().color(chrome::TEXT),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(format!("Current branch: {}", repo.branch));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if self.repo_rx.is_some() {
+                                        ui.spinner();
+                                    } else if chrome::icon_button(
+                                        ui,
+                                        chrome::Icon::Refresh,
+                                        "Refresh comparison",
+                                    )
+                                    .clicked()
+                                    {
+                                        refresh = true;
+                                    }
+                                },
+                            );
+                        });
+                        ui.label(
+                            RichText::new("Compare against")
+                                .size(11.0)
+                                .color(chrome::MUTED),
+                        );
+                        ui.add_enabled_ui(self.repo_rx.is_none(), |ui| {
+                            ui.spacing_mut().button_padding = egui::vec2(10.0, 8.0);
+                            egui::ComboBox::from_id_salt("git-base")
+                                .selected_text(RichText::new(&base).color(chrome::BLUE))
+                                .width(ui.available_width())
+                                .height(260.0)
+                                .wrap_mode(egui::TextWrapMode::Truncate)
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                .show_ui(ui, |ui| {
+                                    ui.set_max_width(ui.available_width());
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.base_filter)
+                                            .hint_text("Find a branch…")
+                                            .desired_width(ui.available_width()),
+                                    );
+                                    ui.separator();
+                                    let filter = chrome::CaseFilter::new(self.base_filter.trim());
+                                    let mut found = false;
+                                    for branch in &repo.branches {
+                                        if !filter.matches(branch) {
+                                            continue;
+                                        }
+                                        found = true;
+                                        let response = ui
+                                            .add(
+                                                egui::Button::selectable(
+                                                    base == *branch,
+                                                    RichText::new(branch).size(12.0),
+                                                )
+                                                .min_size(egui::vec2(ui.available_width(), 30.0))
+                                                .wrap_mode(egui::TextWrapMode::Truncate),
+                                            )
+                                            .on_hover_text(branch);
+                                        if response.clicked() {
+                                            base.clone_from(branch);
+                                            self.base_filter.clear();
+                                            ui.close();
+                                        }
+                                    }
+                                    if !found {
+                                        ui.label(
+                                            RichText::new("No matching branches")
+                                                .color(chrome::MUTED),
+                                        );
+                                    }
+                                })
+                                .response
+                                .on_hover_text(&base);
+                        });
+                        if let Some(pr) = &self.pr {
+                            ui.add(egui::Hyperlink::from_label_and_url(
+                                format!("PR #{} ↗", pr.number),
+                                &pr.url,
+                            ))
+                            .on_hover_text(&pr.title);
                         }
-                        if chrome::icon_button(
-                            ui,
-                            chrome::Icon::Refresh,
-                            "Refresh changes and pull request",
+                        egui::CollapsingHeader::new(
+                            RichText::new("Comparison details")
+                                .size(11.0)
+                                .color(chrome::MUTED),
                         )
-                        .clicked()
-                        {
-                            refresh = true;
-                        }
+                        .id_salt("files-git-comparison")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            if let Some(base) = &repo.merge_base {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Merge base {}",
+                                        &base[..base.len().min(10)]
+                                    ))
+                                    .size(11.0)
+                                    .color(chrome::MUTED),
+                                );
+                            }
+                            if let Some(note) = &self.pr_note {
+                                ui.weak("PR information unavailable").on_hover_text(note);
+                            } else if self.pr_rx.is_some() {
+                                ui.weak("Finding branch PR…");
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                ui.colored_label(committed(), "● Committed");
+                                ui.colored_label(working(), "● Uncommitted");
+                                ui.colored_label(deleted(), "● Deleted");
+                            });
+                        });
                     });
                 });
-                if let Some(repo) = &self.repo {
-                    ui.label(RichText::new(&repo.branch).color(chrome::BLUE));
-                    let previous_base = self
-                        .selected_base
-                        .as_deref()
-                        .unwrap_or(&repo.base)
-                        .to_owned();
-                    let mut base = previous_base.clone();
-                    ui.add_enabled_ui(self.repo_rx.is_none(), |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Base");
-                            egui::ComboBox::from_id_salt("git-base")
-                                .selected_text(&base)
-                                .width((ui.available_width() - 8.0).max(100.0))
-                                .show_ui(ui, |ui| {
-                                    for branch in &repo.branches {
-                                        ui.selectable_value(&mut base, branch.clone(), branch);
-                                    }
-                                });
-                        });
-                    });
-                    if base != previous_base {
-                        self.selected_base = Some(base);
-                        refresh = true;
-                        self.file = None;
-                        self.failed_file = None;
-                    }
-                    if let Some(base) = &repo.merge_base {
-                        ui.weak(format!("Merge base {}", &base[..base.len().min(10)]));
-                    }
-                    if let Some(pr) = &self.pr {
-                        ui.hyperlink_to(format!("PR #{} · {}", pr.number, pr.title), &pr.url);
-                    } else if self.pr_rx.is_some() {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.weak("Finding branch PR…");
-                        });
-                    } else if let Some(note) = &self.pr_note {
-                        ui.weak("PR information unavailable").on_hover_text(note);
-                    } else if self.pr_key.is_some() {
-                        ui.weak("No open PR found for this branch");
-                    }
-                    ui.checkbox(&mut self.show_blame, "Git blame annotations");
-                    ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(committed(), "● Committed");
-                        ui.colored_label(working(), "● Uncommitted");
-                        ui.colored_label(deleted(), "● Deleted");
-                    });
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.filter)
-                            .hint_text("Filter changed files…")
-                            .desired_width(f32::INFINITY),
+            ui.add_space(6.0);
+            if base != previous_base {
+                self.selected_base = Some(base);
+                refresh = true;
+                self.file = None;
+                self.failed_file = None;
+            }
+            if changes_only {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .hint_text("Filter changed files…")
+                        .desired_width(f32::INFINITY),
+                );
+                let mut hide_tests = !self.include_tests;
+                ui.checkbox(&mut hide_tests, RichText::new("Hide test files").size(12.0))
+                    .on_hover_text(
+                        "Hide files in test folders and files with common test naming conventions.",
                     );
-                    let mut hide_tests = !self.include_tests;
-                    egui::Frame::new()
-                        .fill(if hide_tests { chrome::SELECTED } else { chrome::HEADER })
-                        .stroke(egui::Stroke::new(1.0_f32, if hide_tests { chrome::BLUE } else { chrome::BORDER }))
-                        .corner_radius(5)
-                        .inner_margin(egui::Margin::symmetric(8, 4))
-                        .show(ui, |ui| {
-                            let visuals = &mut ui.visuals_mut().widgets.inactive;
-                            visuals.bg_fill = if hide_tests { chrome::BLUE } else { chrome::PANEL };
-                            visuals.fg_stroke = egui::Stroke::new(1.5_f32, Color32::WHITE);
-                            ui.add_sized(
-                                [ui.available_width(), 24.0],
-                                egui::Checkbox::new(&mut hide_tests, RichText::new("Hide test files").strong().color(chrome::TEXT)),
-                            ).on_hover_text("Hide files with common test folder or filename conventions. Includes test helpers and fixtures in test folders; mixed source files stay visible.");
-                        });
-                    self.include_tests = !hide_tests;
-                    let files = tree_files(repo, dirty);
-                    let total = files.len();
-                    let hidden_tests = if hide_tests {
-                        files.iter().filter(|file| crate::test_files::is_test_file(&file.path)).count()
+                self.include_tests = !hide_tests;
+                let files = tree_files(repo, dirty);
+                let total = files.len();
+                let hidden_tests = if hide_tests {
+                    files
+                        .iter()
+                        .filter(|file| crate::test_files::is_test_file(&file.path))
+                        .count()
+                } else {
+                    0
+                };
+                let tree = ChangeTree::build(&files, &self.filter, hide_tests);
+                let shown = tree.file_count();
+                if hide_tests || !self.filter.is_empty() {
+                    let detail = if hidden_tests > 0 {
+                        format!(
+                            " · {hidden_tests} test {} hidden",
+                            if hidden_tests == 1 { "file" } else { "files" }
+                        )
                     } else {
-                        0
+                        String::new()
                     };
-                    let tree = ChangeTree::build(&files, &self.filter, hide_tests);
-                    let shown = tree.file_count();
-                    if hide_tests || !self.filter.is_empty() {
-                        let noun = if hidden_tests == 1 { "file" } else { "files" };
-                        ui.weak(format!("{shown} of {total} changed files · {hidden_tests} test {noun} hidden"));
-                    } else {
-                        ui.weak(format!("{total} changed files · click to open"));
-                    }
-                    ui.separator();
-                    egui::ScrollArea::both()
-                        .id_salt("changed-file-tree")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            selected = tree
-                                .show(ui, &files, Path::new(""))
-                                .map(|action| action.absolute(&repo.root));
-                        });
-                    if files.is_empty() {
-                        ui.weak("No changes relative to the selected base.");
-                    } else if shown == 0 {
-                        ui.weak("No changed files match the current filters.");
-                    }
-                } else if self.repo_rx.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Reading repository…");
+                    ui.label(
+                        RichText::new(format!("{shown} of {total} changed files{detail}"))
+                            .size(11.0)
+                            .color(chrome::MUTED),
+                    );
+                } else {
+                    ui.weak(format!("{total} changed files · click to open"));
+                }
+                ui.separator();
+                egui::ScrollArea::both()
+                    .id_salt("changed-file-tree")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        selected = tree
+                            .show(ui, &files, Path::new(""))
+                            .map(|action| action.absolute(&repo.root));
                     });
+                if files.is_empty() {
+                    ui.weak("No changes relative to the selected base.");
+                } else if shown == 0 {
+                    ui.weak("No changed files match the current filters.");
                 }
-                if let Some(note) = &self.note {
-                    ui.label(RichText::new(note).color(working()));
-                }
+            }
+        } else if self.repo_rx.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Reading repository…");
             });
+        }
+        if let Some(note) = &self.note {
+            ui.label(RichText::new(note).color(working()));
+        }
         if refresh {
             self.pr_key = None;
             self.file = None;
             self.failed_file = None;
-            self.refresh(project, ctx);
+            self.refresh(project, &ctx);
         }
         selected
     }
@@ -546,6 +646,13 @@ impl GitTool {
                                 });
                             });
                         review.show(ui, &mut self.review_mode);
+                        let id = egui::Id::new(("revert-hunk", &review.path));
+                        if let Some(hunk) = ui.ctx().data_mut(|data| data.remove_temp::<usize>(id))
+                        {
+                            review.hunk = hunk;
+                            self.pending_revert = review.revert_hunk();
+                            close = true;
+                        }
                     } else if let Some(note) = &self.review_note {
                         ui.label(note);
                     } else {
@@ -825,6 +932,40 @@ enum DiffMode {
     Split,
 }
 
+pub struct RevertHunk {
+    pub path: PathBuf,
+    pub expected: String,
+    pub replacement: String,
+    pub line: usize,
+}
+
+#[derive(Clone, Default)]
+struct DiffSelection {
+    pane: usize,
+    anchor: (usize, usize),
+    end: (usize, usize),
+    active: bool,
+    dragging: bool,
+}
+impl DiffSelection {
+    fn range(&self, pane: usize, row: usize, len: usize) -> Option<std::ops::Range<usize>> {
+        if !self.active || self.pane != pane {
+            return None;
+        }
+        let (start, end) = (self.anchor.min(self.end), self.anchor.max(self.end));
+        if row < start.0 || row > end.0 {
+            return None;
+        }
+        Some(
+            (if row == start.0 { start.1.min(len) } else { 0 })..(if row == end.0 {
+                end.1.min(len)
+            } else {
+                len
+            }),
+        )
+    }
+}
+
 struct Review {
     path: PathBuf,
     relative_path: PathBuf,
@@ -918,6 +1059,105 @@ fn navigation_target(targets: &[usize], scroll_y: f32, height: f32, next: bool) 
 }
 
 impl Review {
+    fn revert_hunk(&self) -> Option<RevertHunk> {
+        let start = *self.changes.get(self.hunk)?;
+        let end = self
+            .changes
+            .get(self.hunk + 1)
+            .copied()
+            .unwrap_or(self.rows.len());
+        let end = start + self.rows[start..end].iter().rposition(|row| row.changed)? + 1;
+        let old_start = self.rows[..start]
+            .iter()
+            .filter(|row| row.disk.is_some())
+            .count();
+        let new_start = self.rows[..start]
+            .iter()
+            .filter(|row| row.editor.is_some())
+            .count();
+        let old_count = self.rows[start..end]
+            .iter()
+            .filter(|row| row.disk.is_some())
+            .count();
+        let new_count = self.rows[start..end]
+            .iter()
+            .filter(|row| row.editor.is_some())
+            .count();
+        let before = self.before.source();
+        let after = self.after.source();
+        let byte = |text: &str, line: usize| {
+            text.split_inclusive('\n')
+                .take(line)
+                .map(str::len)
+                .sum::<usize>()
+        };
+        let mut replacement = after.to_owned();
+        replacement.replace_range(
+            byte(after, new_start)..byte(after, new_start + new_count),
+            &before[byte(before, old_start)..byte(before, old_start + old_count)],
+        );
+        Some(RevertHunk {
+            path: self.path.clone(),
+            expected: after.to_owned(),
+            replacement,
+            line: new_start,
+        })
+    }
+
+    fn selected_text(&self, selection: &DiffSelection) -> String {
+        let lines: Vec<(usize, &str)> = if selection.pane == 0 {
+            self.visible
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| {
+                    let ReviewRow::Line(row) = row else {
+                        return None;
+                    };
+                    let row = &self.rows[*row];
+                    Some((
+                        index,
+                        if let Some(line) = row.editor {
+                            self.after.line_text(line)
+                        } else {
+                            self.before.line_text(row.disk?)
+                        },
+                    ))
+                })
+                .collect()
+        } else {
+            self.split
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| {
+                    let SplitRow::Line { before, after, .. } = row else {
+                        return None;
+                    };
+                    Some((
+                        index,
+                        if selection.pane == 1 {
+                            self.before.line_text((*before)?)
+                        } else {
+                            self.after.line_text((*after)?)
+                        },
+                    ))
+                })
+                .collect()
+        };
+        lines
+            .into_iter()
+            .filter_map(|(row, text)| {
+                let range = selection.range(selection.pane, row, text.chars().count())?;
+                Some(
+                    text.chars()
+                        .skip(range.start)
+                        .take(range.len())
+                        .collect::<String>(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Map stable changes to each layout, including expanded full context.
     fn target_rows(&self, mode: DiffMode) -> Vec<usize> {
         let mut positions = vec![None; self.changes.len()];
@@ -1015,6 +1255,16 @@ impl Review {
             .iter()
             .filter(|r| r.changed && r.disk.is_some())
             .count();
+        let selection_id = egui::Id::new(("diff-selection", &self.path));
+        ui.interact(
+            ui.available_rect_before_wrap(),
+            selection_id,
+            egui::Sense::focusable_noninteractive(),
+        );
+        let mut selection = ui
+            .ctx()
+            .data_mut(|data| data.get_temp::<DiffSelection>(selection_id))
+            .unwrap_or_default();
         let previous_mode = *mode;
         let height = crate::preferences::line_height(ui.ctx()).max(20.0);
         ui.horizontal_wrapped(|ui| {
@@ -1054,6 +1304,7 @@ impl Review {
             }
             ui.separator();
             if ui.checkbox(&mut self.full, "Full context").changed() {
+                selection.active = false;
                 self.visible = review_rows(&self.rows, self.full);
                 self.split = split_rows(&self.rows, &self.visible);
                 self.jump_requested = true;
@@ -1079,6 +1330,7 @@ impl Review {
         });
         if *mode != previous_mode {
             self.jump_requested = true;
+            selection.active = false;
         }
         let targets = self.target_rows(*mode);
         let jumped = std::mem::take(&mut self.jump_requested);
@@ -1101,6 +1353,10 @@ impl Review {
             DiffMode::Unified => {
                 let output = egui::ScrollArea::both()
                     .id_salt(("unified-diff", &self.path))
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: false,
+                        ..egui::scroll_area::ScrollSource::ALL
+                    })
                     .vertical_scroll_offset(self.scroll_y)
                     .auto_shrink([false, false])
                     .show_rows(
@@ -1110,7 +1366,7 @@ impl Review {
                         |ui, range| {
                             let width = ui.available_width().max(
                                 self.before.width.max(self.after.width) * scale
-                                    + 100.0
+                                    + 150.0
                                     + if self.before_newline && self.after_newline {
                                         0.0
                                     } else {
@@ -1118,6 +1374,7 @@ impl Review {
                                     },
                             );
                             ui.set_min_width(width);
+                            scroll_diff_selection(ui, &selection, 0);
                             for index in range.take_while(|&index| index < self.visible.len()) {
                                 match &self.visible[index] {
                                     ReviewRow::Hunk(header) => {
@@ -1152,6 +1409,14 @@ impl Review {
                                             width,
                                             height,
                                             None,
+                                            &mut selection,
+                                            0,
+                                            index,
+                                            selection_id,
+                                            targets
+                                                .binary_search(&index)
+                                                .ok()
+                                                .filter(|_| self.path.is_file()),
                                         );
                                     }
                                 }
@@ -1188,6 +1453,10 @@ impl Review {
                         );
                         let output = egui::ScrollArea::both()
                             .id_salt(("split-diff", &self.path, side))
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: false,
+                                ..egui::scroll_area::ScrollSource::ALL
+                            })
                             .scroll_bar_visibility(
                                 egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
                             )
@@ -1200,10 +1469,11 @@ impl Review {
                                 |ui, range| {
                                     let width = ui.available_width().max(
                                         preview.width * scale
-                                            + 36.0
+                                            + 110.0
                                             + if newline { 0.0 } else { 200.0 },
                                     );
                                     ui.set_min_width(width);
+                                    scroll_diff_selection(ui, &selection, side + 1);
                                     for index in range.take_while(|&index| index < self.split.len())
                                     {
                                         match &self.split[index] {
@@ -1243,6 +1513,13 @@ impl Review {
                                                     width,
                                                     height,
                                                     inline,
+                                                    &mut selection,
+                                                    side + 1,
+                                                    index,
+                                                    selection_id,
+                                                    targets.binary_search(&index).ok().filter(
+                                                        |_| side == 0 && self.path.is_file(),
+                                                    ),
                                                 );
                                             }
                                         }
@@ -1260,6 +1537,42 @@ impl Review {
                 self.scroll_y = next_y;
             }
         }
+        if let Some(hunk) = ui
+            .ctx()
+            .data_mut(|data| data.remove_temp::<usize>(selection_id.with("apply-hunk")))
+        {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(egui::Id::new(("revert-hunk", &self.path)), hunk)
+            });
+        }
+        if selection.dragging && !ui.input(|input| input.pointer.primary_down()) {
+            ui.memory_mut(|memory| memory.request_focus(selection_id));
+            selection.dragging = false;
+        }
+        if selection.active && ui.memory(|memory| memory.has_focus(selection_id)) {
+            if ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
+                selection.anchor = (0, 0);
+                selection.end = (usize::MAX, usize::MAX);
+            }
+            let copy = ui.input_mut(|input| {
+                let copy = input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Copy));
+                input
+                    .events
+                    .retain(|event| !matches!(event, egui::Event::Copy));
+                copy || input.consume_key(egui::Modifiers::COMMAND, egui::Key::C)
+            });
+            if copy {
+                ui.ctx().copy_text(self.selected_text(&selection));
+            }
+        }
+        if ui.input(|input| input.pointer.primary_down()) {
+            ui.ctx().request_repaint();
+        }
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(selection_id, selection));
         if !jumped && (self.scroll_y - requested_y).abs() > 0.5 && !targets.is_empty() {
             let current = targets
                 .partition_point(|&row| row as f32 * height <= self.scroll_y + 2.0 * height + 1.0)
@@ -1302,6 +1615,30 @@ fn paint_hunk(ui: &mut egui::Ui, header: &str, width: f32, height: f32) {
     );
 }
 
+/// Move the viewport while dragging at its edge; wheel scrolling remains independent.
+fn scroll_diff_selection(ui: &mut egui::Ui, selection: &DiffSelection, pane: usize) {
+    if !selection.dragging || selection.pane != pane || !ui.input(|i| i.pointer.primary_down()) {
+        return;
+    }
+    if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
+        let clip = ui.clip_rect();
+        if pointer.x < clip.left() || pointer.x > clip.right() {
+            return;
+        }
+        let delta = if pointer.y < clip.top() + 20.0 {
+            12.0
+        } else if pointer.y > clip.bottom() - 20.0 {
+            -12.0
+        } else {
+            0.0
+        };
+        if delta != 0.0 {
+            ui.scroll_with_delta(egui::vec2(0.0, delta));
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_diff_line(
     ui: &mut egui::Ui,
@@ -1313,8 +1650,14 @@ fn paint_diff_line(
     width: f32,
     height: f32,
     inline: Option<std::ops::Range<usize>>,
+    selection: &mut DiffSelection,
+    pane: usize,
+    row: usize,
+    selection_id: egui::Id,
+    apply_hunk: Option<usize>,
 ) {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
     let (background, gutter_bg, accent) = match mark {
         '+' => (
             Color32::from_rgb(25, 47, 36),
@@ -1329,8 +1672,45 @@ fn paint_diff_line(
         _ if line.is_none() => (Color32::from_rgb(29, 32, 38), chrome::TABS, chrome::MUTED),
         _ => (chrome::EDITOR, Color32::from_rgb(26, 29, 35), chrome::MUTED),
     };
-    let painter = ui.painter();
+    let action_gutter = pane != 2;
+    let edge = rect.right().min(ui.clip_rect().right());
+    let action_rect = egui::Rect::from_min_max(
+        egui::pos2(edge - 30.0, rect.top()),
+        egui::pos2(edge, rect.bottom()),
+    );
+    let text_clip = if action_gutter {
+        ui.clip_rect().intersect(egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(edge - 30.0, rect.bottom()),
+        ))
+    } else {
+        rect.intersect(ui.clip_rect())
+    };
+    let painter = ui.painter().with_clip_rect(text_clip);
     painter.rect_filled(rect, 0, background);
+    if action_gutter {
+        ui.painter().rect_filled(action_rect, 0, chrome::PANEL);
+        if let Some(hunk) = apply_hunk {
+            let mut actions = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(("apply-diff-hunk", pane, row))
+                    .max_rect(action_rect),
+            );
+            actions.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
+            if actions
+                .add_sized(
+                    action_rect.size(),
+                    egui::Button::new(RichText::new(">>").monospace().color(chrome::BLUE))
+                        .frame(false),
+                )
+                .on_hover_text("Copy this hunk from base → working file (unsaved; undo in editor)")
+                .clicked()
+            {
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(selection_id.with("apply-hunk"), hunk));
+            }
+        }
+    }
     let gutter_width = 44.0 * gutters.len() as f32;
     let gutter = egui::Rect::from_min_max(
         rect.min,
@@ -1400,7 +1780,84 @@ fn paint_diff_line(
         }
         job.sections = sections;
     }
-    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    let mut galley = ui.fonts_mut(|fonts| fonts.layout_job(job.clone()));
+    let text_pos = egui::pos2(
+        gutter.right() + 22.0,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    if let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
+        && text_clip.contains(pointer)
+    {
+        let column = galley.cursor_from_pos(pointer - text_pos).index;
+        if response.hovered() && ui.input(|input| input.pointer.primary_pressed()) {
+            *selection = DiffSelection {
+                pane,
+                anchor: (row, column),
+                end: (row, column),
+                active: true,
+                dragging: true,
+            };
+            ui.memory_mut(|memory| memory.request_focus(selection_id));
+        } else if selection.dragging
+            && selection.pane == pane
+            && ui.input(|input| input.pointer.primary_down())
+        {
+            selection.end = (row, column);
+        }
+        if response.clicked() || response.dragged() {
+            ui.memory_mut(|memory| memory.request_focus(selection_id));
+        }
+        if response.double_clicked() {
+            let chars: Vec<_> = job.text.chars().collect();
+            let mut start = column.min(chars.len());
+            let mut end = start;
+            let word = |c: char| c.is_alphanumeric() || c == '_';
+            while start > 0 && word(chars[start - 1]) {
+                start -= 1;
+            }
+            while end < chars.len() && word(chars[end]) {
+                end += 1;
+            }
+            selection.anchor = (row, start);
+            selection.end = (row, end);
+        }
+        if response.triple_clicked() {
+            selection.anchor = (row, 0);
+            selection.end = (row, job.text.chars().count());
+        }
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+    }
+    if let Some(range) = selection.range(pane, row, job.text.chars().count()) {
+        let byte = |column| {
+            job.text
+                .char_indices()
+                .nth(column)
+                .map_or(job.text.len(), |(byte, _)| byte)
+        };
+        let range = byte(range.start)..byte(range.end);
+        let mut sections = Vec::new();
+        for section in &job.sections {
+            let mut cuts = vec![section.byte_range.start, section.byte_range.end];
+            cuts.extend(
+                [range.start, range.end]
+                    .into_iter()
+                    .filter(|cut| section.byte_range.contains(cut)),
+            );
+            cuts.sort_unstable();
+            cuts.dedup();
+            for pair in cuts.windows(2) {
+                let mut part = section.clone();
+                part.byte_range = pair[0]..pair[1];
+                if pair[0] >= range.start && pair[1] <= range.end {
+                    part.format.background = ui.visuals().selection.bg_fill;
+                    part.format.color = ui.visuals().selection.stroke.color;
+                }
+                sections.push(part);
+            }
+        }
+        job.sections = sections;
+        galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    }
     let end = gutter.right() + 22.0 + galley.size().x;
     painter.galley(
         egui::pos2(
@@ -1420,6 +1877,11 @@ fn paint_diff_line(
         );
     }
     response.context_menu(|ui| {
+        if selection.active && ui.button("Copy selection").clicked() {
+            ui.memory_mut(|memory| memory.request_focus(selection_id));
+            ui.input_mut(|input| input.events.push(egui::Event::Copy));
+            ui.close();
+        }
         if ui.button("Copy line").clicked() {
             ui.ctx().copy_text(preview.line_text(line).to_owned());
             ui.close();
@@ -1477,6 +1939,228 @@ fn review_rows(rows: &[diff::Row], full: bool) -> Vec<ReviewRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn review_fixture(before: &str, after: &str) -> Review {
+        let path = PathBuf::from("sample.rs");
+        let rows = diff::compare(before, after);
+        let visible = review_rows(&rows, false);
+        let split = split_rows(&rows, &visible);
+        Review {
+            path: path.clone(),
+            relative_path: path.clone(),
+            base: "main".into(),
+            before: SourcePreview::build(path.clone(), before.into(), true, &|| false).unwrap(),
+            after: SourcePreview::build(path, after.into(), true, &|| false).unwrap(),
+            changes: change_targets(&rows),
+            rows,
+            visible,
+            split,
+            full: false,
+            scroll_y: 0.0,
+            hunk: 0,
+            jump_requested: false,
+            before_newline: before.ends_with('\n'),
+            after_newline: after.ends_with('\n'),
+        }
+    }
+
+    #[test]
+    fn revert_hunk_preserves_other_edits_unicode_and_line_endings() {
+        for (before, after) in [
+            ("", "猫\n"),
+            ("猫\n", ""),
+            ("a\nb", "a"),
+            ("a\n", "a"),
+            ("a", "a\n"),
+            ("a\r\n猫\r\n", "a\r\n犬\r\n"),
+            ("a\nb\nc\n", "a\nx\ny\nc\n"),
+        ] {
+            let review = review_fixture(before, after);
+            let revert = review.revert_hunk().unwrap();
+            assert_eq!(revert.expected, after);
+            assert_eq!(revert.replacement, before);
+        }
+        let before = (0..30).map(|i| format!("line {i}\n")).collect::<String>();
+        let after = before
+            .replace("line 2\n", "猫\n")
+            .replace("line 25\n", "犬\n");
+        let mut review = review_fixture(&before, &after);
+        assert_eq!(review.changes.len(), 2);
+        assert_eq!(
+            review.revert_hunk().unwrap().replacement,
+            before.replace("line 25\n", "犬\n")
+        );
+        review.hunk = 1;
+        assert_eq!(
+            review.revert_hunk().unwrap().replacement,
+            before.replace("line 2\n", "猫\n")
+        );
+    }
+
+    #[test]
+    fn inline_arrows_apply_the_clicked_hunk_in_both_layouts() {
+        for mut mode in [DiffMode::Unified, DiffMode::Split] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let middle = (0..12)
+                .map(|i| format!("context {i}\n"))
+                .collect::<String>();
+            let before = format!("old first\n{middle}old last\n");
+            let after = format!("new first\n{middle}new last\n");
+            let mut review = review_fixture(&before, &after);
+            review.path = file.path().to_path_buf();
+            let ctx = egui::Context::default();
+            chrome::install(&ctx);
+            let mut frame = |events, review: &mut Review| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1200.0, 900.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| review.show(ui, &mut mode));
+                    },
+                )
+            };
+            frame(vec![], &mut review);
+            let output = frame(vec![], &mut review);
+            let arrows: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == ">>" => {
+                        Some(text.pos + text.galley.size() / 2.0)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(arrows.len(), 2);
+            let point = arrows[1];
+            for pressed in [true, false] {
+                frame(
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    &mut review,
+                );
+            }
+            let hunk = ctx.data_mut(|data| {
+                data.remove_temp::<usize>(egui::Id::new(("revert-hunk", &review.path)))
+            });
+            assert_eq!(hunk, Some(1));
+            review.hunk = hunk.unwrap();
+            assert_eq!(
+                review.revert_hunk().unwrap().replacement,
+                format!("new first\n{middle}old last\n")
+            );
+        }
+    }
+
+    #[test]
+    fn diff_drag_selection_copies_across_lines_in_both_layouts() {
+        for mut mode in [DiffMode::Unified, DiffMode::Split] {
+            let ctx = egui::Context::default();
+            chrome::install(&ctx);
+            let mut review = review_fixture("old\nsecond\n", "猫 first\nsecond\n");
+            let mut time = 0.0;
+            let mut frame = |events, review: &mut Review| {
+                time += 0.1;
+                ctx.run(
+                    egui::RawInput {
+                        time: Some(time),
+                        events,
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1200.0, 500.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| review.show(ui, &mut mode));
+                    },
+                )
+            };
+            let mut output = frame(vec![], &mut review);
+            for _ in 0..2 {
+                output = frame(vec![], &mut review);
+            }
+            let locate = |text: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| {
+                        if let egui::Shape::Text(text_shape) = &shape.shape {
+                            if text_shape.galley.text() == text {
+                                return Some((text_shape.pos, text_shape.galley.size()));
+                            }
+                        }
+                        None
+                    })
+                    .last()
+                    .unwrap()
+            };
+            let (first, size) = locate("猫 first");
+            let (last, last_size) = locate("second");
+            let start = first + egui::vec2(0.1, size.y / 2.0);
+            let end = last + egui::vec2(last_size.x + 1.0, last_size.y / 2.0);
+            frame(
+                vec![
+                    egui::Event::PointerMoved(start),
+                    egui::Event::PointerButton {
+                        pos: start,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                &mut review,
+            );
+            frame(vec![egui::Event::PointerMoved(end)], &mut review);
+            frame(
+                vec![egui::Event::PointerButton {
+                    pos: end,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                &mut review,
+            );
+            let copied = frame(vec![egui::Event::Copy], &mut review);
+            assert!(copied.platform_output.commands.iter().any(|command|
+                matches!(command, egui::OutputCommand::CopyText(text) if text == "猫 first\nsecond")),
+                "selection must copy source without gutters or diff markers: {:?}", copied.platform_output.commands);
+            let selection = ctx
+                .data_mut(|data| {
+                    data.get_temp::<DiffSelection>(egui::Id::new(("diff-selection", &review.path)))
+                })
+                .unwrap();
+            assert!(
+                !selection.dragging,
+                "release must end the drag without clearing selection"
+            );
+            frame(
+                vec![egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                }],
+                &mut review,
+            );
+            let copied = frame(vec![egui::Event::Copy], &mut review);
+            assert!(copied.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(text) if text.ends_with("猫 first\nsecond"))));
+        }
+    }
+
     #[test]
     fn both_trees_render_matching_status_colors_and_unsaved_overrides() {
         let root = Path::new("/project");
@@ -1608,6 +2292,115 @@ mod tests {
             tool.file_rx.is_some(),
             "Git work starts once the buffer settles"
         );
+    }
+
+    #[test]
+    fn comparison_selector_fits_narrow_panels_and_branch_selection_updates_base() {
+        for width in [160.0_f32, 240.0, 360.0] {
+            let ctx = egui::Context::default();
+            chrome::install(&ctx);
+            let mut tool = GitTool {
+                repo: Some(Repository {
+                    root: "/project".into(),
+                    branch: "feature/a-very-long-current-branch-name".into(),
+                    head: String::new(),
+                    base: "origin/a-very-long-base-branch-name".into(),
+                    merge_base: None,
+                    branches: vec!["main".into(), "origin/a-very-long-base-branch-name".into()],
+                    remote: None,
+                    files: vec![],
+                }),
+                last_refresh: Some(Instant::now()),
+                ..Default::default()
+            };
+            let frame = |tool: &mut GitTool, events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 700.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            tool.content(ui, Path::new("/project"), &[], false);
+                        });
+                    },
+                )
+            };
+            let click = |tool: &mut GitTool, point| {
+                frame(
+                    tool,
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+                frame(
+                    tool,
+                    vec![egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                )
+            };
+            frame(&mut tool, vec![]);
+            let collapsed = frame(&mut tool, vec![]);
+            assert!(!collapsed.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().contains("origin/a-very-long-base"))));
+            let header = collapsed
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "COMPARE CHANGES" => {
+                        Some(text.pos + text.galley.size() / 2.0)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            click(&mut tool, header);
+            // Finish the disclosure animation before checking the dropdown.
+            ctx.style_mut(|style| style.animation_time = 0.0);
+            let expanded = frame(&mut tool, vec![]);
+            let point = expanded
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if text.galley.text().contains("origin/a-very-long-base") =>
+                    {
+                        assert!(
+                            text.pos.x + text.galley.size().x <= width,
+                            "base label overflows at {width}"
+                        );
+                        Some(text.pos + text.galley.size() / 2.0)
+                    }
+                    _ => None,
+                })
+                .expect("expanding comparison must show the branch selector");
+            click(&mut tool, point);
+            let output = frame(&mut tool, vec![]);
+            let branch = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "main" => {
+                        Some(text.pos + text.galley.size() / 2.0)
+                    }
+                    _ => None,
+                })
+                .expect("branch menu must open");
+            click(&mut tool, branch);
+            assert_eq!(tool.selected_base.as_deref(), Some("main"));
+        }
     }
 
     #[test]
@@ -1888,9 +2681,9 @@ mod tests {
             Some("fn main() {\n    first();\n    second();\n}\n".into()),
             true,
         )?;
-        let ctx = egui::Context::default();
-        chrome::install(&ctx);
         for mut mode in [DiffMode::Unified, DiffMode::Split] {
+            let ctx = egui::Context::default();
+            chrome::install(&ctx);
             let mut output = None;
             for _ in 0..3 {
                 output = Some(ctx.run(

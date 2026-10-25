@@ -47,7 +47,7 @@ impl Default for Settings {
 pub fn path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|home| PathBuf::from(home).join(".coder/settings.json"))
+        .map(|home| PathBuf::from(home).join(".glimcode/settings.json"))
 }
 fn legacy_path() -> Option<PathBuf> {
     let base = if cfg!(target_os = "macos") {
@@ -117,10 +117,13 @@ impl Settings {
         Ok(())
     }
     pub fn load_saved() -> Result<Self> {
-        Self::load_or_migrate(
-            &path().context("No home directory for preferences")?,
-            legacy_path().as_deref(),
-        )
+        let destination = path().context("No home directory for preferences")?;
+        let previous = destination
+            .parent()
+            .and_then(Path::parent)
+            .map(|home| home.join(".coder/settings.json"));
+        let legacy = previous.filter(|path| path.is_file()).or_else(legacy_path);
+        Self::load_or_migrate(&destination, legacy.as_deref())
     }
     fn load_or_migrate(path: &Path, legacy: Option<&Path>) -> Result<Self> {
         if path.exists() {
@@ -131,6 +134,14 @@ impl Settings {
         } else {
             Self::default()
         };
+        if let Some(legacy) = legacy.filter(|legacy| legacy.is_file()) {
+            let parent = path.parent().context("No preferences directory")?;
+            std::fs::create_dir_all(parent)?;
+            let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+            serde_json::to_writer_pretty(&mut temp, &json(legacy)?)?;
+            temp.flush()?;
+            temp.persist(path)?;
+        }
         settings.save(path)?;
         Ok(settings)
     }
@@ -260,8 +271,11 @@ mod tests {
     fn legacy_settings_migrate_once_and_defaults_are_saved() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let old = dir.path().join("terminal.json");
-        let path = dir.path().join(".coder/settings.json");
-        std::fs::write(&old, r#"{"shell":"/bin/sh","tab_name":"Local"}"#)?;
+        let path = dir.path().join(".glimcode/settings.json");
+        std::fs::write(
+            &old,
+            r#"{"shell":"/bin/sh","tab_name":"Local","future_setting":true}"#,
+        )?;
         let mut settings = Settings::load_or_migrate(&path, Some(&old))?;
         assert_eq!(settings.shell, "/bin/sh");
         assert_eq!(settings.tab_name, "Local");
@@ -271,6 +285,7 @@ mod tests {
         assert_eq!(settings.search_filters_font_size, 14.0);
         assert!(path.is_file());
         assert!(old.is_file());
+        assert_eq!(json(&path)?["future_setting"], true);
         settings.editor_font_size = 19.0;
         settings.save(&path)?;
         assert_eq!(

@@ -450,11 +450,14 @@ impl Drop for Session {
 #[derive(Default)]
 pub struct Terminal {
     pub visible: bool,
+    pub maximized: bool,
     pub settings_open: bool,
     pub settings: Settings,
     draft: Settings,
     settings_error: Option<String>,
     tabs: Vec<Session>,
+    restored_tabs: Vec<PathBuf>,
+    restored_active: usize,
     active: usize,
     /// The last size the panel reported, shared with the tabs in the
     /// background.
@@ -464,6 +467,60 @@ pub struct Terminal {
     pending_close: Option<u64>,
 }
 impl Terminal {
+    pub fn snapshot(&self) -> serde_json::Value {
+        let roots: Vec<_> = if self.restored_tabs.is_empty() {
+            self.tabs
+                .iter()
+                .map(|tab| {
+                    let screen = tab.screen.lock().unwrap();
+                    screen
+                        .parser
+                        .callbacks()
+                        .directory
+                        .as_deref()
+                        .unwrap_or(&tab.root)
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect()
+        } else {
+            self.restored_tabs
+                .iter()
+                .map(|root| root.to_string_lossy().into_owned())
+                .collect()
+        };
+        serde_json::json!({"roots": roots, "active": if self.restored_tabs.is_empty() { self.active } else { self.restored_active }, "visible": self.visible, "maximized": self.maximized})
+    }
+
+    pub fn restore(&mut self, value: &serde_json::Value) {
+        self.tabs.clear();
+        self.active = 0;
+        self.restored_tabs = value["roots"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(32)
+            .filter_map(|root| root.as_str().map(PathBuf::from))
+            .filter(|root| root.is_dir())
+            .collect();
+        self.restored_active = value["active"].as_u64().unwrap_or(0) as usize;
+        self.visible = value["visible"].as_bool().unwrap_or(false);
+        self.maximized = value["maximized"].as_bool().unwrap_or(false);
+    }
+
+    fn materialize_restored_tabs(&mut self, ctx: &egui::Context) {
+        if self.restored_tabs.is_empty() {
+            return;
+        }
+        let visible = self.visible;
+        for root in std::mem::take(&mut self.restored_tabs) {
+            self.new_tab(&root, ctx);
+        }
+        self.active = self.restored_active.min(self.tabs.len().saturating_sub(1));
+        self.visible = visible;
+        self.focus = false;
+    }
+
     pub fn load_settings(&mut self) {
         match Settings::load_saved() {
             Ok(settings) => self.settings = settings,
@@ -483,6 +540,7 @@ impl Terminal {
         self.settings_open = true;
     }
     pub fn new_tab(&mut self, root: &Path, ctx: &egui::Context) {
+        self.materialize_restored_tabs(ctx);
         self.next_id += 1;
         self.tabs.push(Session::spawn(
             self.next_id,
@@ -497,6 +555,7 @@ impl Terminal {
     pub fn toggle(&mut self, root: &Path, ctx: &egui::Context) {
         self.visible = !self.visible;
         if self.visible {
+            self.materialize_restored_tabs(ctx);
             if self.tabs.is_empty() {
                 self.new_tab(root, ctx);
             } else {
@@ -508,92 +567,121 @@ impl Terminal {
         if !self.visible {
             return;
         }
+        self.materialize_restored_tabs(ctx);
         if self.tabs.is_empty() {
             self.new_tab(root, ctx);
         }
-        let labels = self.labels();
-        let mut new = false;
-        let mut close = None;
         egui::TopBottomPanel::bottom("terminal-panel")
             .resizable(true)
             .default_height(290.0)
             .min_height(120.0)
             .frame(egui::Frame::new().fill(chrome::EDITOR))
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(chrome::PANEL)
-                    .inner_margin(egui::Margin::symmetric(8, 6))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            chrome::heading_icon(ui, chrome::Icon::Terminal, chrome::GREEN);
-                            ui.strong("Terminal");
-                            ui.add_space(4.0);
-                            egui::ScrollArea::horizontal()
-                                .id_salt("terminal-tabs")
-                                .max_width((ui.available_width() - 80.0).max(80.0))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                        for (index, tab) in self.tabs.iter().enumerate() {
-                                            let exited = tab.screen.lock().unwrap().exited;
-                                            let response = chrome::workspace_tab(
-                                                ui,
-                                                ui.make_persistent_id(("terminal-tab", tab.id)),
-                                                &labels[index],
-                                                chrome::TabKind::Terminal { exited },
-                                                self.active == index,
-                                                false,
-                                                &format!("{}\n{}", tab.root.display(), tab.shell),
-                                            );
-                                            if response.activate {
-                                                self.active = index;
-                                                self.focus = true;
-                                            }
-                                            if response.close {
-                                                close = Some(index);
-                                            }
-                                        }
-                                    });
-                                });
-                            if chrome::icon_button(
-                                ui,
-                                chrome::Icon::Plus,
-                                "New terminal in the project directory (⌘/Ctrl T)",
-                            )
-                            .clicked()
-                            {
-                                new = true;
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if chrome::icon_button(
+            .show(ctx, |ui| self.contents(ui, root, enabled));
+    }
+
+    pub fn central_panel(&mut self, ctx: &egui::Context, root: &Path, enabled: bool) {
+        self.materialize_restored_tabs(ctx);
+        if self.tabs.is_empty() {
+            self.new_tab(root, ctx);
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(chrome::EDITOR))
+            .show(ctx, |ui| self.contents(ui, root, enabled));
+    }
+
+    fn contents(&mut self, ui: &mut egui::Ui, root: &Path, enabled: bool) {
+        let ctx = ui.ctx().clone();
+        let labels = self.labels();
+        let mut new = false;
+        let mut close = None;
+        egui::Frame::new()
+            .fill(chrome::PANEL)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    chrome::heading_icon(ui, chrome::Icon::Terminal, chrome::GREEN);
+                    ui.strong("Terminal");
+                    ui.add_space(4.0);
+                    egui::ScrollArea::horizontal()
+                        .id_salt("terminal-tabs")
+                        .max_width((ui.available_width() - 110.0).max(80.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                for (index, tab) in self.tabs.iter().enumerate() {
+                                    let exited = tab.screen.lock().unwrap().exited;
+                                    let response = chrome::workspace_tab(
                                         ui,
-                                        chrome::Icon::HideDown,
-                                        "Hide terminal · sessions keep running",
-                                    )
-                                    .clicked()
-                                    {
-                                        self.visible = false;
+                                        ui.make_persistent_id(("terminal-tab", tab.id)),
+                                        &labels[index],
+                                        chrome::TabKind::Terminal { exited },
+                                        self.active == index,
+                                        false,
+                                        &format!("{}\n{}", tab.root.display(), tab.shell),
+                                    );
+                                    if response.activate {
+                                        self.active = index;
+                                        self.focus = true;
                                     }
-                                },
-                            );
+                                    if response.close {
+                                        close = Some(index);
+                                    }
+                                }
+                            });
                         });
-                    });
-                egui::Frame::new()
-                    .inner_margin(egui::Margin::symmetric(10, 8))
-                    .show(ui, |ui| {
-                        if let Some(tab) = self.tabs.get_mut(self.active) {
-                            let size = render(
-                                ui,
-                                tab,
-                                enabled && !self.settings_open,
-                                &mut self.focus,
-                                self.settings.terminal_font_size,
-                            );
-                            self.size = Some(size);
+                    if chrome::icon_button(
+                        ui,
+                        chrome::Icon::Plus,
+                        "New terminal in the project directory (⌘/Ctrl T)",
+                    )
+                    .clicked()
+                    {
+                        new = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if chrome::icon_button(
+                            ui,
+                            if self.maximized {
+                                chrome::Icon::Restore
+                            } else {
+                                chrome::Icon::Maximize
+                            },
+                            if self.maximized {
+                                "Restore terminal panel"
+                            } else {
+                                "Maximize terminal · replace file tabs"
+                            },
+                        )
+                        .clicked()
+                        {
+                            self.maximized = !self.maximized;
+                            self.focus = true;
+                        }
+                        if chrome::icon_button(
+                            ui,
+                            chrome::Icon::HideDown,
+                            "Hide terminal · sessions keep running",
+                        )
+                        .clicked()
+                        {
+                            self.visible = false;
                         }
                     });
+                });
+            });
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    let size = render(
+                        ui,
+                        tab,
+                        enabled && !self.settings_open,
+                        &mut self.focus,
+                        self.settings.terminal_font_size,
+                    );
+                    self.size = Some(size);
+                }
             });
         // Every tab learns the size of the panel, not only the one that is on
         // screen. A shell that starts with the wrong width builds its prompt
@@ -601,7 +689,7 @@ impl Terminal {
         // command.
         self.sync_background_size();
         if new {
-            self.new_tab(root, ctx);
+            self.new_tab(root, &ctx);
         }
         if let Some(index) = close {
             self.request_close(index);
@@ -2051,6 +2139,23 @@ mod tests {
     }
 
     #[test]
+    fn restored_terminal_metadata_is_lazy_and_roundtrips_without_spawning_shells() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut terminal = Terminal::default();
+        let value = serde_json::json!({"roots": [dir.path(), dir.path()], "active": 1, "visible": false, "maximized": true});
+        terminal.restore(&value);
+        assert!(terminal.tabs.is_empty());
+        assert_eq!(terminal.restored_tabs.len(), 2);
+        assert_eq!(terminal.snapshot(), value);
+        let missing = dir.path().join("missing");
+        terminal.restore(&serde_json::json!({"roots": [missing], "active": 99}));
+        assert!(terminal.restored_tabs.is_empty());
+        assert!(!terminal.visible);
+        assert!(!terminal.maximized);
+        Ok(())
+    }
+
+    #[test]
     fn terminal_queries_reply_to_fragmented_cli_probes_without_claiming_unknown_modes() {
         let mut parser = vt100::Parser::new_with_callbacks(30, 100, 100, Callbacks::default());
         let queries = b"\x1b]11;?\x07\x1b[>c\x1b[18t\x1b[?2004$p\x1b[?2026$p\x1b[?2004h\x1b[?2004$p\x1b[?1004h\x1b[?1004$p";
@@ -2058,7 +2163,7 @@ mod tests {
             parser.process(&[*byte]);
         }
         assert_eq!(parser.callbacks().replies,
-            b"\x1b]11;rgb:1c1c/1e1e/2323\x1b\\\x1b[>0;0;0c\x1b[8;30;100t\x1b[?2004;2$y\x1b[?2026;0$y\x1b[?2004;1$y\x1b[?1004;1$y");
+            b"\x1b]11;rgb:1818/1d1d/2727\x1b\\\x1b[>0;0;0c\x1b[8;30;100t\x1b[?2004;2$y\x1b[?2026;0$y\x1b[?2004;1$y\x1b[?1004;1$y");
         assert!(parser.callbacks().focus_reporting);
         parser.process(b"\x1b[?1004l");
         assert!(!parser.callbacks().focus_reporting);
@@ -2215,7 +2320,7 @@ mod tests {
     #[test]
     fn real_pty_answers_interactive_startup_queries() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let expected = b"\x1b]11;rgb:1c1c/1e1e/2323\x1b\\\x1b[>0;0;0c\x1b[?2004;2$y";
+        let expected = b"\x1b]11;rgb:1818/1d1d/2727\x1b\\\x1b[>0;0;0c\x1b[?2004;2$y";
         let script = format!(
             r#"stty raw -echo; printf '\033]11;?\007\033[>c\033[?2004$p'; reply=$(dd bs=1 count={} 2>/dev/null | od -An -tx1); stty sane; printf 'PROBE:%s:DONE\n' "$reply""#,
             expected.len()

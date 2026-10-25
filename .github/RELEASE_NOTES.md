@@ -1,20 +1,13 @@
-## Changes in v0.1.3
+## Changes in v0.2.0
 
-- Fixed the case-insensitive file and value filter. A term with overlapping prefixes, such as `aab`, was not found in `aaab`, so the explorer filter and the CSV value filter hid rows that do match.
-- Fixed background terminal tabs being resized on every frame. The command queue filled up, the hidden shell redrew in a loop, and the user's own input was pushed to the back of the line.
-- Fixed copying a terminal selection that reaches past the last column of the screen, which crashed the editor.
-- Fixed a search that started while a click was still being ranked: the status bar reported the old token and the selection jumped to an unrelated row.
-- Fixed the results of the previous search staying on screen after the search term was cleared.
-- Fixed a crash when a tab was closed and a queued action still referred to it.
-- Fixed the Markdown preview aborting the editor for a document whose path could not be resolved to an absolute path.
-- Fixed grid edits in a CSV being reported as a change on disk, and the whole file being copied on every frame.
-- Click-to-navigate now ranks vendored, generated and test files last only when the click does not happen inside such a file. The declaration above the click is weighted by its distance, and a file next to the clicked one is preferred.
-- The syntax colors of a document are computed once per change and shared by the editor, the Structure panel and the folding, instead of being copied and hashed several times per frame.
-- A search hands over only the buffers that changed, and the worker reads the rest, so a search no longer freezes the interface on large open files. A click does not copy the file it happens in either.
-- The Go highlighter walks the tree with a cursor instead of recursion, which could abort the editor on a deeply nested generated file, and looks up shadowed names by name.
-- Files without a match are no longer parsed for the search classification.
-- The file picker marks the part of the search term that is in the row, so a path such as `src/app` marks the file name it found, and the highlight now matches the case-insensitive filter.
-- Find in Files fits into a small viewport instead of hanging off the window, Enter no longer reaches the editor behind an empty result list, and the duplicated Alt+F12 shortcut is resolved.
+- Added Git worktree creation, safe removal, and switching. Each workspace keeps its unsaved buffers, editor tabs, navigation history, and live terminals while the app is running.
+- Reworked workspace navigation with folder-first cards, branch labels, active and unsaved indicators, visible action menus, and a creation button above the scrolling list. New worktrees default to a sibling folder and a branch matching their name.
+- Refreshed the editor with a slate palette, clearer selected tabs, consistent controls, a useful welcome screen, and an active indentation guide for the current code scope.
+- Unified project files and changes into a right-side Files panel. Comparison controls start collapsed; expanding them reveals a full-width branch selector with bounded, searchable choices and long-name tooltips.
+- Added persistent folder sessions under `~/.glimcode/projects/`, shared settings in `~/.glimcode/settings.json`, and last-folder state in `~/.glimcode/state.json`. Existing `~/.coder` settings migrate while retaining the old file and unknown settings keys.
+- Reopening a folder restores file tabs, active tab, cursor locations, panel visibility, and terminal tabs. Restored terminals start fresh shells on demand in their reported or launch directories. Shell commands are never replayed. Unsaved buffers, running processes, and terminal scrollback are not restored after quitting.
+- Improved Git review with selectable source text, hunk reversion into editor buffers, synchronized comparisons, and changed-file navigation.
+- Reduced work during workspace rendering by removing worktree-list clones and moving path normalization off the render loop. Added regression coverage for session persistence, narrow comparison controls, workspace menus, scope guides, and panel resizing.
 
 ## Installation
 

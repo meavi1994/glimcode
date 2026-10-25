@@ -346,9 +346,12 @@ impl<'a> FileCache<'a> {
         }
         let remaining = MAX_CACHE_BYTES.saturating_sub(self.bytes);
         let limit = MAX_FILE_BYTES.min(remaining);
-        let info = if self.reads >= MAX_FILE_READS || limit == 0 {
-            None
-        } else {
+        if self.reads >= MAX_FILE_READS || limit == 0 {
+            // No further candidate can be read: do not retain one negative
+            // cache entry per remaining match after exhausting the budget.
+            return None;
+        }
+        let info = {
             // Count unique files, including snapshots, and bound parsing as well as I/O.
             self.reads += 1;
             let source = if let Some(source) = self.snapshot.get(path) {
@@ -1525,6 +1528,25 @@ fn normalize(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn exhausted_ranking_cache_does_not_retain_rejected_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = FileCache::new(HashMap::new());
+        for index in 0..1000 {
+            assert!(
+                cache
+                    .info(&dir.path().join(format!("missing-{index}.rs")))
+                    .is_none()
+            );
+        }
+        assert_eq!(cache.reads, MAX_FILE_READS);
+        assert_eq!(cache.files.len(), MAX_FILE_READS);
+        let mut full = FileCache::new(HashMap::new());
+        full.bytes = MAX_CACHE_BYTES;
+        assert!(full.info(&dir.path().join("over-budget.rs")).is_none());
+        assert!(full.files.is_empty());
+    }
 
     fn write(root: &Path, relative: &str, source: &str) -> PathBuf {
         let path = root.join(relative);

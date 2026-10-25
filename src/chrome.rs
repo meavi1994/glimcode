@@ -1,15 +1,15 @@
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, text::LayoutJob};
 use std::path::Path;
 
-pub const EDITOR: Color32 = Color32::from_rgb(28, 30, 35);
-pub const PANEL: Color32 = Color32::from_rgb(38, 41, 47);
-pub const HEADER: Color32 = Color32::from_rgb(49, 54, 63);
-pub const BORDER: Color32 = Color32::from_rgb(57, 63, 74);
-pub const TEXT: Color32 = Color32::from_rgb(205, 210, 219);
-pub const MUTED: Color32 = Color32::from_rgb(139, 148, 164);
-pub const BLUE: Color32 = Color32::from_rgb(75, 137, 255);
-pub const SELECTED: Color32 = Color32::from_rgb(48, 68, 109);
-pub const TABS: Color32 = Color32::from_rgb(25, 27, 32);
+pub const EDITOR: Color32 = Color32::from_rgb(24, 29, 39);
+pub const PANEL: Color32 = Color32::from_rgb(20, 25, 34);
+pub const HEADER: Color32 = Color32::from_rgb(32, 40, 53);
+pub const BORDER: Color32 = Color32::from_rgb(42, 51, 65);
+pub const TEXT: Color32 = Color32::from_rgb(222, 225, 233);
+pub const MUTED: Color32 = Color32::from_rgb(148, 154, 169);
+pub const BLUE: Color32 = Color32::from_rgb(110, 168, 254);
+pub const SELECTED: Color32 = Color32::from_rgb(32, 50, 73);
+pub const TABS: Color32 = Color32::from_rgb(16, 21, 29);
 
 pub fn install(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -62,7 +62,8 @@ pub fn install(ctx: &egui::Context) {
     ctx.set_theme(egui::ThemePreference::Dark);
     ctx.set_visuals(egui::Visuals::dark());
     ctx.style_mut(|s| {
-        s.spacing.item_spacing = egui::vec2(7.0, 4.0);
+        s.spacing.item_spacing = egui::vec2(8.0, 5.0);
+        s.animation_time = 0.12;
         s.spacing.button_padding = egui::vec2(10.0, 6.0);
         s.spacing.indent = 16.0;
         s.interaction.resize_grab_radius_side = 8.0;
@@ -72,19 +73,27 @@ pub fn install(ctx: &egui::Context) {
         s.visuals.panel_fill = PANEL;
         s.visuals.window_fill = PANEL;
         s.visuals.extreme_bg_color = EDITOR;
-        s.visuals.faint_bg_color = Color32::from_rgb(39, 41, 44);
+        s.visuals.faint_bg_color = HEADER;
         s.visuals.override_text_color = Some(TEXT);
         s.visuals.selection.bg_fill = SELECTED;
         s.visuals.selection.stroke = Stroke::new(1.0_f32, TEXT);
         s.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
         s.visuals.widgets.inactive.weak_bg_fill = HEADER;
-        s.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(5);
-        s.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(5);
-        s.visuals.widgets.active.corner_radius = egui::CornerRadius::same(5);
-        s.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(65, 67, 72);
+        s.visuals.widgets.inactive.bg_fill = HEADER;
+        s.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+        s.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
+        s.visuals.widgets.hovered.bg_fill = HEADER;
+        s.visuals.widgets.active.bg_fill = SELECTED;
+        s.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(7);
+        s.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(7);
+        s.visuals.widgets.active.corner_radius = egui::CornerRadius::same(7);
+        s.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(46, 49, 59);
         s.visuals.widgets.active.weak_bg_fill = SELECTED;
         s.visuals.window_corner_radius = egui::CornerRadius::same(10);
-        s.visuals.window_stroke = Stroke::new(2.0_f32, Color32::from_rgb(91, 94, 99));
+        s.visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
+        s.visuals.hyperlink_color = BLUE;
+        s.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BLUE.gamma_multiply(0.5));
+        s.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, BLUE);
         s.text_styles
             .insert(egui::TextStyle::Body, FontId::proportional(13.0));
         s.text_styles
@@ -249,8 +258,8 @@ impl CaseFilter {
 
 pub fn popup_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(Color32::from_rgb(39, 41, 46))
-        .stroke(Stroke::new(2.0_f32, Color32::from_rgb(72, 76, 87)))
+        .fill(PANEL)
+        .stroke(Stroke::new(1.0_f32, BORDER))
         .corner_radius(14)
         .inner_margin(24)
         .shadow(egui::epaint::Shadow {
@@ -760,13 +769,13 @@ pub fn finish_resize_borders(
         ctx.layer_painter(response.layer_id).line_segment(
             points,
             Stroke::new(
-                if active || hovered { 4.0_f32 } else { 3.0_f32 },
+                if active || hovered { 2.0_f32 } else { 1.0_f32 },
                 if active {
                     BLUE
                 } else if hovered {
                     Color32::from_rgb(112, 124, 149)
                 } else {
-                    Color32::from_rgb(66, 70, 80)
+                    BORDER
                 },
             ),
         );
@@ -1046,7 +1055,7 @@ pub fn dialog_button(ui: &mut egui::Ui, label: &str, accent: Option<Color32>) ->
 
 pub const GREEN: Color32 = Color32::from_rgb(112, 190, 148);
 pub const PURPLE: Color32 = Color32::from_rgb(178, 153, 225);
-pub const ACTIVE_TAB: Color32 = Color32::from_rgb(48, 56, 70);
+pub const ACTIVE_TAB: Color32 = Color32::from_rgb(28, 36, 49);
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Icon {
@@ -1065,6 +1074,8 @@ pub enum Icon {
     Branch,
     Dock,
     External,
+    Maximize,
+    Restore,
 }
 
 pub fn paint_icon(painter: &egui::Painter, center: egui::Pos2, icon: Icon, color: Color32) {
@@ -1074,6 +1085,26 @@ pub fn paint_icon(painter: &egui::Painter, center: egui::Pos2, icon: Icon, color
         painter.line_segment([p(a.0, a.1), p(b.0, b.1)], stroke);
     };
     match icon {
+        Icon::Maximize | Icon::Restore => {
+            if icon == Icon::Restore {
+                painter.rect_stroke(
+                    egui::Rect::from_min_max(p(-2.0, -5.0), p(5.0, 2.0)),
+                    1.0,
+                    stroke,
+                    egui::StrokeKind::Inside,
+                );
+            }
+            painter.rect_stroke(
+                egui::Rect::from_min_max(p(-5.0, -2.0), p(2.0, 5.0)),
+                1.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            if icon == Icon::Maximize {
+                line((-5.0, -5.0), (5.0, -5.0));
+                line((5.0, -5.0), (5.0, 5.0));
+            }
+        }
         Icon::Close => {
             line((-4.0, -4.0), (4.0, 4.0));
             line((-4.0, 4.0), (4.0, -4.0));
@@ -1204,9 +1235,9 @@ fn icon_at(
     let fill = if hovered && close {
         Color32::from_rgb(82, 45, 55)
     } else if hovered {
-        Color32::from_rgb(62, 73, 93)
+        HEADER
     } else {
-        Color32::from_white_alpha(5)
+        Color32::TRANSPARENT
     };
     ui.painter().rect_filled(rect.shrink(1.0), 6, fill);
     ui.painter().rect_stroke(
@@ -1217,9 +1248,9 @@ fn icon_at(
             if response.has_focus() {
                 BLUE
             } else if hovered {
-                Color32::from_rgb(88, 100, 122)
+                BORDER
             } else {
-                Color32::from_white_alpha(10)
+                Color32::TRANSPARENT
             },
         ),
         egui::StrokeKind::Inside,
@@ -1246,6 +1277,26 @@ fn icon_at(
 pub fn icon_button(ui: &mut egui::Ui, icon: Icon, tooltip: &str) -> egui::Response {
     let (id, rect) = ui.allocate_space(egui::vec2(28.0, 28.0));
     icon_at(ui, rect, id, icon, tooltip)
+}
+
+pub fn navigation_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    active: bool,
+    tooltip: &str,
+) -> egui::Response {
+    let (id, rect) = ui.allocate_space(egui::vec2(31.0, 34.0));
+    let response = icon_at(ui, rect, id, icon, tooltip);
+    if active {
+        ui.painter().rect_filled(rect.shrink(1.0), 6, SELECTED);
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(rect.min + egui::vec2(-3.0, 7.0), egui::vec2(2.0, 20.0)),
+            1,
+            BLUE,
+        );
+        paint_icon(ui.painter(), rect.center(), icon, BLUE);
+    }
+    response
 }
 
 pub fn heading_icon(ui: &mut egui::Ui, icon: Icon, color: Color32) {
@@ -1335,7 +1386,7 @@ pub fn workspace_tab(
     } else if response.hovered() {
         HEADER
     } else {
-        PANEL
+        Color32::TRANSPARENT
     };
     let corners = egui::CornerRadius {
         nw: 7,
@@ -1350,9 +1401,9 @@ pub fn workspace_tab(
         Stroke::new(
             1.0_f32,
             if selected {
-                Color32::from_rgb(76, 90, 114)
-            } else {
                 BORDER
+            } else {
+                Color32::TRANSPARENT
             },
         ),
         egui::StrokeKind::Inside,
