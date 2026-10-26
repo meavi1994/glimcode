@@ -49,6 +49,26 @@ pub fn path() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|home| PathBuf::from(home).join(".glimcode/settings.json"))
 }
+
+pub fn global_ignore_path() -> Option<PathBuf> {
+    path().and_then(|path| path.parent().map(|parent| parent.join(".gitignore")))
+}
+
+fn ensure_global_ignore(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path.parent().context("No preferences directory")?)?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            file.write_all(b"# Extra ignore rules for all Glimcode projects.\n# Use .gitignore syntax; project ignore rules can override these defaults.\n")?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
 fn legacy_path() -> Option<PathBuf> {
     let base = if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"))
@@ -126,6 +146,12 @@ impl Settings {
         Self::load_or_migrate(&destination, legacy.as_deref())
     }
     fn load_or_migrate(path: &Path, legacy: Option<&Path>) -> Result<Self> {
+        ensure_global_ignore(
+            &path
+                .parent()
+                .context("No preferences directory")?
+                .join(".gitignore"),
+        )?;
         if path.exists() {
             return Self::load(path);
         }
@@ -295,6 +321,19 @@ mod tests {
         let fresh = dir.path().join("fresh/settings.json");
         Settings::load_or_migrate(&fresh, None)?;
         assert!(fresh.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn global_ignore_is_created_once_without_overwriting_user_rules() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let settings = dir.path().join(".glimcode/settings.json");
+        let ignore = settings.parent().unwrap().join(".gitignore");
+        Settings::load_or_migrate(&settings, None)?;
+        assert!(std::fs::read_to_string(&ignore)?.starts_with("# Extra ignore rules"));
+        std::fs::write(&ignore, "*.log\ncache/\n")?;
+        Settings::load_or_migrate(&settings, None)?;
+        assert_eq!(std::fs::read_to_string(ignore)?, "*.log\ncache/\n");
         Ok(())
     }
     #[test]

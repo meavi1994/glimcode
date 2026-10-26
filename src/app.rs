@@ -33,6 +33,7 @@ enum FrameAction {
     GitDiff(usize),
     SwitchProject(PathBuf),
     SwitchWorktree(PathBuf),
+    OpenProjectInstance(PathBuf),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -225,7 +226,8 @@ impl Coder {
             let paths = navigation::workspace_paths(&app.root).unwrap_or_default();
             app.files = paths.files;
             app.folders = paths.folders;
-            app.tree = crate::explorer::FileTree::build(&app.root, &app.files);
+            app.tree =
+                crate::explorer::FileTree::build_with_folders(&app.root, &app.files, &app.folders);
             app.files_rx = None;
             if mode == "workspace-search" {
                 app.show_project = false;
@@ -701,7 +703,7 @@ impl Coder {
             .filter(|doc| doc.path == revert.path)
         {
             if doc.source_text().ok().as_deref() != Some(revert.expected.as_str()) {
-                self.error = Some("The file changed since this diff was opened. Reopen the diff before copying a hunk from the base.".into());
+                self.error = Some("The file changed since this diff was shown. Reopen the diff before applying or undoing changes.".into());
             } else {
                 if let Err(error) = doc.set_csv_source(true) {
                     self.error = Some(error.to_string());
@@ -719,6 +721,7 @@ impl Coder {
                 let Content::Text(text) = &mut doc.content else {
                     return;
                 };
+                self.git.record_review_edit(&revert);
                 *text = revert.replacement.into();
                 doc.dirty = true;
                 doc.mark_changed();
@@ -726,6 +729,9 @@ impl Coder {
                 doc.jump = Some((revert.line, 0));
                 if doc.is_markdown() {
                     doc.markdown = MarkdownMode::Edit;
+                }
+                if let Ok(source) = doc.source_text() {
+                    self.git.refresh_review_buffer(&doc.path, source, ctx);
                 }
             }
         }
@@ -936,7 +942,7 @@ impl Coder {
             match result {
                 Ok(paths) => {
                     if self.files != paths.files || self.folders != paths.folders {
-                        self.tree.refresh(&self.root, &paths.files);
+                        self.tree.refresh(&self.root, &paths.files, &paths.folders);
                         self.files = paths.files;
                         self.folders = paths.folders;
                     }
@@ -2558,8 +2564,30 @@ impl Coder {
     fn editor(&mut self, ctx: &egui::Context) {
         let mut clicked_token = None;
         let mut clicked_blame = None;
+        // Keep scrollbars outside the neighbouring panels' resize hit zones.
+        // Floating bars otherwise grow under a splitter, lose hover, shrink,
+        // and repeatedly regain hover while the pointer stays still.
+        let style = ctx.style();
+        let resize_gap = (style.interaction.resize_grab_radius_side
+            + style.visuals.clip_rect_margin)
+            .ceil() as i8
+            + 1;
+        let margin = egui::Margin {
+            left: if self.show_worktrees { resize_gap } else { 0 },
+            right: if self.show_project || self.show_structure || self.git.visible {
+                resize_gap
+            } else {
+                0
+            },
+            bottom: if self.terminal.visible || (self.search_open && self.search_docked) {
+                resize_gap
+            } else {
+                0
+            },
+            top: 0,
+        };
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(chrome::EDITOR).inner_margin(0))
+            .frame(egui::Frame::new().fill(chrome::EDITOR).inner_margin(margin))
             .show(ctx, |ui| {
                 let mut close = None;
                 let mut activate = None;
@@ -3159,6 +3187,101 @@ impl Coder {
         self.picker_focus = true;
     }
 
+    fn open_terminal_link(&mut self, link: crate::terminal::FileLink) {
+        let query = crate::terminal::file_link_query(&link.query);
+        let (file, target) = split_file_location(&query);
+        let target = target.map(|(line, _)| (line, 1));
+        let resolved = self.resolve_terminal_path(file, &link.directory);
+        if let Some(path) = resolved {
+            if path.is_dir() {
+                let root = self
+                    .root
+                    .canonicalize()
+                    .unwrap_or_else(|_| self.root.clone());
+                if !path.starts_with(&root) {
+                    self.actions.push(FrameAction::OpenProjectInstance(path));
+                    return;
+                }
+                self.terminal.maximized = false;
+                self.show_project = true;
+                self.files_changed_only = false;
+                self.show_structure = false;
+                self.git.visible = false;
+                self.file_filter.clear();
+                let path = self.root.join(path.strip_prefix(&root).unwrap_or(&path));
+                self.tree.reveal_path(&self.root, &path);
+            } else {
+                self.terminal.maximized = false;
+                self.open(path, target);
+                self.focus_editor = true;
+            }
+        } else {
+            self.show_picker(Picker::Files);
+            self.picker_query = query;
+        }
+    }
+
+    fn resolve_terminal_path(&self, file: &str, directory: &Path) -> Option<PathBuf> {
+        let path = if let Some(relative) = file.strip_prefix("~/") {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(relative))
+        } else if file == "~" {
+            std::env::var_os("HOME").map(PathBuf::from)
+        } else {
+            Some(PathBuf::from(file))
+        }?;
+        let existing = |path: PathBuf| {
+            (path.is_file() || path.is_dir()).then(|| path.canonicalize().unwrap_or(path))
+        };
+        if path.is_absolute() {
+            return existing(path);
+        }
+        let root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        let directory = directory
+            .canonicalize()
+            .unwrap_or_else(|_| directory.to_owned());
+        for base in directory.ancestors() {
+            if base != directory && !base.starts_with(&root) {
+                break;
+            }
+            if let Some(found) = existing(base.join(&path)) {
+                return Some(found);
+            }
+        }
+        if let Some(found) = existing(root.join(&path)) {
+            return Some(found);
+        }
+        // Logs sometimes include the project name or Git's a/ and b/ prefixes.
+        if path.components().next().map(|c| c.as_os_str()) == root.file_name()
+            && let Some(parent) = root.parent()
+            && let Some(found) = existing(parent.join(&path))
+        {
+            return Some(found);
+        }
+        for prefix in ["a", "b"] {
+            if let Ok(relative) = path.strip_prefix(prefix)
+                && let Some(found) = existing(root.join(relative))
+            {
+                return Some(found);
+            }
+        }
+        // A unique suffix can resolve filenames printed relative to a build
+        // directory. Ambiguous matches go to the picker instead of guessing.
+        let suffix = path.strip_prefix(".").unwrap_or(&path);
+        let mut matches = self.files.iter().chain(&self.folders).filter(|candidate| {
+            candidate.ends_with(suffix) && (candidate.is_file() || candidate.is_dir())
+        });
+        let first = matches.next()?;
+        if matches.any(|candidate| candidate != first) {
+            return None;
+        }
+        existing(first.clone())
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
         use egui::Modifiers as M;
         let key = |modifiers, key| ctx.input_mut(|input| input.consume_key(modifiers, key));
@@ -3502,6 +3625,7 @@ impl Coder {
         }
         if !blocked {
             self.terminal.shortcuts(ctx, &self.root);
+            self.git.review_shortcuts(ctx);
         }
         if !blocked && !self.terminal.focused(ctx) {
             self.shortcuts(ctx);
@@ -3582,6 +3706,9 @@ impl Coder {
         } else {
             self.editor(ctx);
         }
+        if let Some(link) = crate::terminal::take_file_link(ctx) {
+            self.open_terminal_link(link);
+        }
         if !self.search_docked {
             self.results_panel(ctx);
         }
@@ -3591,6 +3718,12 @@ impl Coder {
                 FrameAction::Open(path, target) => self.open(path, target),
                 FrameAction::SwitchProject(root) => self.switch_project(root),
                 FrameAction::SwitchWorktree(root) => self.switch_worktree(root),
+                FrameAction::OpenProjectInstance(root) => {
+                    if let Err(error) = open_project_instance(&root) {
+                        self.error =
+                            Some(format!("Could not open project in a new instance: {error}"));
+                    }
+                }
                 FrameAction::Save(index) => {
                     self.save(index);
                 }
@@ -3722,6 +3855,34 @@ impl Drop for Coder {
 }
 
 /// Parse numeric suffixes from the right, preserving colons in the path itself.
+fn open_project_instance(root: &Path) -> std::io::Result<()> {
+    let executable = std::env::current_exe()?;
+    let mut child = project_instance_command(&executable, root).spawn()?;
+    // Reap the independent process without blocking either editor's UI.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+fn project_instance_command(executable: &Path, root: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg(root)
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for name in [
+        "GLIMCODE_PREVIEW_FILE",
+        "CODER_UI_PREVIEW",
+        "CODER_CAPTURE_TO",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
 fn split_file_location(query: &str) -> (&str, Option<(usize, usize)>) {
     let query = query.trim();
     let Some((prefix, last)) = query.rsplit_once(':') else {
@@ -5313,6 +5474,116 @@ fn edit_line(text: &mut String, cursor: usize, path: &Path, duplicate: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_links_resolve_from_directory_or_project_and_prefill_search() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested)?;
+        std::fs::write(nested.join("main.rs"), "fn main() {}\n")?;
+        std::fs::write(dir.path().join("root.rs"), "// root\n")?;
+        let mut app = Coder::empty(dir.path().to_path_buf());
+        for (query, expected) in [
+            ("main.rs:42:43", nested.join("main.rs")),
+            ("root.rs:42-7", dir.path().join("root.rs")),
+        ] {
+            app.terminal.maximized = true;
+            app.open_terminal_link(crate::terminal::FileLink {
+                query: query.into(),
+                directory: nested.clone(),
+            });
+            assert_eq!(app.documents[app.active].path, expected.canonicalize()?);
+            assert_eq!(app.documents[app.active].jump, Some((42, 1)));
+            assert!(!app.terminal.maximized);
+        }
+        app.open_terminal_link(crate::terminal::FileLink {
+            query: "src/missing.rs:42:43-50".into(),
+            directory: nested,
+        });
+        assert!(app.picker == Some(Picker::Files));
+        assert_eq!(app.picker_query, "src/missing.rs:42");
+        assert!(app.picker_focus);
+        assert_eq!(app.documents.len(), 2);
+        Ok(())
+    }
+    #[test]
+    fn terminal_paths_resolve_folders_absolute_ancestors_and_unambiguous_suffixes()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let nested = root.join("nested");
+        let deep = nested.join("build/deep");
+        let source = nested.join("src/main.rs");
+        std::fs::create_dir_all(&deep)?;
+        std::fs::create_dir_all(source.parent().unwrap())?;
+        std::fs::write(&source, "fn main() {}\n")?;
+        let mut app = Coder::empty(root.clone());
+        app.files = vec![source.clone()];
+        app.folders = vec![nested.clone(), nested.join("src")];
+        for (query, expected) in [
+            (source.to_string_lossy().into_owned(), source.clone()),
+            (nested.to_string_lossy().into_owned(), nested.clone()),
+            ("src/main.rs".into(), source.clone()),
+            ("main.rs".into(), source.clone()),
+            ("../../src/main.rs".into(), source.clone()),
+            ("a/nested/src/main.rs".into(), source.clone()),
+            (
+                format!(
+                    "{}/nested/src/main.rs",
+                    root.file_name().unwrap().to_string_lossy()
+                ),
+                source.clone(),
+            ),
+        ] {
+            assert_eq!(
+                app.resolve_terminal_path(&query, &deep),
+                Some(expected),
+                "{query}"
+            );
+        }
+        app.open_terminal_link(crate::terminal::FileLink {
+            query: format!("{}.", nested.display()),
+            directory: deep.clone(),
+        });
+        assert!(app.tree.reveal_pending());
+        assert!(app.show_project && !app.show_structure && !app.git.visible);
+        assert!(app.documents.is_empty());
+        assert_eq!(app.root, root);
+        let other = root.join("other/main.rs");
+        std::fs::create_dir_all(other.parent().unwrap())?;
+        std::fs::write(&other, "// other\n")?;
+        app.files.push(other);
+        assert_eq!(app.resolve_terminal_path("main.rs", &deep), None);
+        let external = tempfile::tempdir()?;
+        app.open(source, None);
+        app.documents[0].dirty = true;
+        app.terminal.maximized = true;
+        app.open_terminal_link(crate::terminal::FileLink {
+            query: external.path().to_string_lossy().into_owned(),
+            directory: deep,
+        });
+        assert!(
+            matches!(app.actions.last(), Some(FrameAction::OpenProjectInstance(path)) if *path == external.path().canonicalize().unwrap())
+        );
+        assert!(app.pending.is_none());
+        assert_eq!(app.root, root);
+        assert!(app.documents[0].dirty);
+        assert!(
+            app.terminal.maximized,
+            "external folders must leave this instance's layout intact"
+        );
+        let command = project_instance_command(
+            Path::new("/Applications/Glimcode.app/Contents/MacOS/glimcode"),
+            external.path(),
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![external.path().as_os_str()]
+        );
+        assert_eq!(command.get_current_dir(), Some(external.path()));
+        Ok(())
+    }
+
     use crate::search_view::{extension, result_visible};
     #[test]
     fn review_revert_updates_the_buffer_and_rejects_a_stale_diff() -> anyhow::Result<()> {
@@ -5328,6 +5599,7 @@ mod tests {
                 expected: "current\n".into(),
                 replacement: "base\n".into(),
                 line: 0,
+                undo: false,
             },
             &ctx,
         );
@@ -5341,6 +5613,7 @@ mod tests {
                 expected: "current\n".into(),
                 replacement: "stale\n".into(),
                 line: 0,
+                undo: true,
             },
             &ctx,
         );
@@ -6043,7 +6316,7 @@ mod tests {
                     handle.width()
                 } else {
                     handle.height()
-                }) >= 16.0
+                }) >= 2.0 * ctx.style().interaction.resize_grab_radius_side
             );
             let cursor = if horizontal {
                 C::ResizeHorizontal
@@ -6253,7 +6526,7 @@ mod tests {
         std::fs::write(&normal, "normal")?;
         let mut app = Coder::empty(root.clone());
         app.files = vec![changed.clone(), normal];
-        app.tree = crate::explorer::FileTree::build(&root, &app.files);
+        app.tree = crate::explorer::FileTree::build_with_folders(&root, &app.files, &app.folders);
         app.git.repo = Some(crate::git::Repository {
             root: root.clone(),
             branch: "feature".into(),
@@ -6491,6 +6764,64 @@ mod tests {
                     output.platform_output.cursor_icon,
                     egui::CursorIcon::ResizeVertical
                 );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn editor_scrollbars_do_not_overlap_panel_resize_boundaries() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("wide.rs");
+        std::fs::write(
+            &path,
+            format!("// {}\n", "long line ".repeat(100)).repeat(80),
+        )?;
+        let mut app = Coder::empty(dir.path().to_path_buf());
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        app.open(path, None);
+        app.terminal.settings.shell = "/bin/sh".into();
+        app.terminal.new_tab(dir.path(), &ctx);
+        let frame = |app: &mut Coder, pointer| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 900.0),
+                    )),
+                    events: vec![egui::Event::PointerMoved(pointer)],
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            )
+        };
+        for _ in 0..4 {
+            frame(&mut app, egui::pos2(700.0, 300.0));
+        }
+        let handle = ctx
+            .read_response(egui::Id::new("terminal-panel").with("__resize"))
+            .unwrap()
+            .rect;
+        let editor_id = app.documents[0].editor_id.unwrap();
+        let editor = ctx.read_response(editor_id).unwrap();
+        assert!(
+            editor.interact_rect.bottom() < handle.top(),
+            "editor and its scrollbars must end above the splitter: {editor:?}, {handle:?}"
+        );
+        for delta in -12..=12 {
+            let pos = egui::pos2(700.0, handle.center().y + delta as f32);
+            let mut icons = Vec::new();
+            for _ in 0..12 {
+                let output = frame(&mut app, pos);
+                icons.push(output.platform_output.cursor_icon);
+            }
+            assert!(
+                icons[2..].windows(2).all(|pair| pair[0] == pair[1]),
+                "boundary cursor flickered at {pos:?}: {icons:?}"
+            );
+            if handle.contains(pos) {
+                assert_eq!(*icons.last().unwrap(), egui::CursorIcon::ResizeVertical);
             }
         }
         Ok(())
@@ -6749,7 +7080,7 @@ mod tests {
         let mut app = Coder::empty(root.clone());
         app.files = paths.files;
         app.folders = paths.folders;
-        app.tree = crate::explorer::FileTree::build(&root, &app.files);
+        app.tree = crate::explorer::FileTree::build_with_folders(&root, &app.files, &app.folders);
         app.show_project = false;
         app.show_picker(Picker::Files);
         app.picker_query = "empty".into();
@@ -7085,7 +7416,8 @@ mod tests {
         let mut app = Coder::empty(dir.path().to_path_buf());
         app.open(path.clone(), None);
         app.files = vec![path.clone()];
-        app.tree = crate::explorer::FileTree::build(&app.root, &app.files);
+        app.tree =
+            crate::explorer::FileTree::build_with_folders(&app.root, &app.files, &app.folders);
         app.query = "sample".into();
         app.results = vec![Location {
             path,

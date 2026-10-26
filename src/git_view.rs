@@ -5,7 +5,7 @@ use crate::{
 };
 use eframe::egui::{self, Color32, RichText};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -75,8 +75,10 @@ pub struct GitTool {
     failed_file: Option<u64>,
     review: Option<Review>,
     pub pending_revert: Option<RevertHunk>,
+    review_undo: VecDeque<ReviewEdit>,
     review_mode: DiffMode,
     review_rx: Option<Job<Review>>,
+    review_update_rx: Option<Job<ReviewUpdate>>,
     review_next: Option<(Repository, PathBuf, Option<String>, bool)>,
     review_open: bool,
     review_note: Option<String>,
@@ -181,6 +183,32 @@ impl GitTool {
                 }
             }
         }
+        if let Some(result) = received(&self.review_update_rx) {
+            self.review_update_rx = None;
+            match result {
+                Ok(update) => {
+                    if let Some(review) = self.review.as_mut()
+                        && review.path == update.path
+                        && review.after.source() == update.expected
+                    {
+                        review.after_newline = update.after.source().ends_with('\n');
+                        review.after = update.after;
+                        review.rows = update.rows;
+                        review.changes = change_targets(&review.rows);
+                        review.visible = update.visible;
+                        review.split = update.split;
+                        review.hunk = review.hunk.min(review.changes.len().saturating_sub(1));
+                        ctx.data_mut(|data| {
+                            data.remove::<DiffSelection>(egui::Id::new((
+                                "diff-selection",
+                                &review.path,
+                            )));
+                        });
+                    }
+                }
+                Err(note) => self.review_note = Some(note),
+            }
+        }
         if let Some(result) = received(&self.detail_rx) {
             self.detail_rx = None;
             match result {
@@ -216,6 +244,7 @@ impl GitTool {
             || self.file_rx.is_some()
             || self.pr_rx.is_some()
             || self.review_rx.is_some()
+            || self.review_update_rx.is_some()
             || self.detail_rx.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(50));
@@ -289,6 +318,8 @@ impl GitTool {
             return;
         };
         self.review_open = true;
+        self.review_update_rx = None;
+        self.review_undo.clear();
         ctx.data_mut(|data| {
             data.remove::<DiffSelection>(egui::Id::new(("diff-selection", &path)));
         });
@@ -301,6 +332,111 @@ impl GitTool {
             self.review_rx = Some(worker(ctx, move || Review::new(&repo, path, buffer, dark)));
         }
     }
+    pub fn review_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.review_open
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z))
+        {
+            self.queue_review_undo();
+        }
+    }
+
+    fn queue_review_undo(&mut self) {
+        if !self.review_open || self.review_update_rx.is_some() || self.pending_revert.is_some() {
+            return;
+        }
+        let Some(review) = &self.review else {
+            return;
+        };
+        let Some(edit) = self.review_undo.back() else {
+            return;
+        };
+        let source = review.after.source();
+        let range = edit.start..edit.start + edit.inserted.len();
+        if source.get(range.clone()) != Some(edit.inserted.as_str()) {
+            return;
+        }
+        let mut replacement = source.to_owned();
+        replacement.replace_range(range, &edit.removed);
+        self.pending_revert = Some(RevertHunk {
+            path: review.path.clone(),
+            expected: source.to_owned(),
+            replacement,
+            line: source[..edit.start]
+                .bytes()
+                .filter(|&byte| byte == b'\n')
+                .count(),
+            undo: true,
+        });
+    }
+
+    /// Record only edits accepted by the editor against the expected buffer.
+    pub fn record_review_edit(&mut self, edit: &RevertHunk) {
+        if !self.review_open
+            || !self
+                .review
+                .as_ref()
+                .is_some_and(|review| review.path == edit.path)
+        {
+            return;
+        }
+        if edit.undo {
+            self.review_undo.pop_back();
+            return;
+        }
+        let (old, new) = changed_ranges(&edit.expected, &edit.replacement);
+        if old.is_empty() && new.is_empty() {
+            return;
+        }
+        self.review_undo.push_back(ReviewEdit {
+            start: old.start,
+            removed: edit.expected[old].to_owned(),
+            inserted: edit.replacement[new].to_owned(),
+        });
+        // Bound both step count and retained text; always retain the newest edit.
+        let mut bytes: usize = self
+            .review_undo
+            .iter()
+            .map(|edit| edit.removed.len() + edit.inserted.len())
+            .sum();
+        while self.review_undo.len() > 1
+            && (self.review_undo.len() > 128 || bytes > 32 * 1024 * 1024)
+        {
+            let edit = self.review_undo.pop_front().unwrap();
+            bytes -= edit.removed.len() + edit.inserted.len();
+        }
+    }
+
+    /// Rebuild the working side in the background while keeping the review visible.
+    pub fn refresh_review_buffer(&mut self, path: &Path, source: String, ctx: &egui::Context) {
+        let Some(review) = self
+            .review
+            .as_ref()
+            .filter(|review| self.review_open && review.path == path)
+        else {
+            return;
+        };
+        let path = review.path.clone();
+        let before = review.before.source().to_owned();
+        let expected = review.after.source().to_owned();
+        let full = review.full;
+        let dark = ctx.style().visuals.dark_mode;
+        self.review_update_rx = Some(worker(ctx, move || {
+            let rows = diff::compare(&before, &source);
+            let visible = review_rows(&rows, full);
+            let split = split_rows(&rows, &visible);
+            let after = SourcePreview::build(path.clone(), source, dark, &|| false)
+                .ok_or_else(|| anyhow::anyhow!("Could not highlight updated file"))?;
+            Ok(ReviewUpdate {
+                path,
+                expected,
+                after,
+                rows,
+                visible,
+                split,
+            })
+        }));
+    }
+
     pub fn show_commit(&mut self, blame: BlameLine, ctx: &egui::Context) {
         let Some(repo) = self.repo.clone() else {
             return;
@@ -573,6 +709,7 @@ impl GitTool {
                 };
             }
             let mut close = false;
+            let mut undo_requested = false;
             let size = ctx.content_rect().size();
             egui::Window::new("Branch changes · PR diff")
                 .id(egui::Id::new("branch-review"))
@@ -641,17 +778,30 @@ impl GitTool {
                                             {
                                                 opened = Some(review.path.clone());
                                             }
+                                            undo_requested = ui
+                                                .add_enabled(
+                                                    !self.review_undo.is_empty()
+                                                        && self.review_update_rx.is_none()
+                                                        && self.pending_revert.is_none(),
+                                                    egui::Button::new("Undo applied change")
+                                                        .frame(false),
+                                                )
+                                                .on_hover_text(
+                                                    "Undo the last applied change (⌘/Ctrl Z)",
+                                                )
+                                                .clicked();
                                         },
                                     );
                                 });
                             });
-                        review.show(ui, &mut self.review_mode);
+                        ui.add_enabled_ui(self.review_update_rx.is_none(), |ui| {
+                            review.show(ui, &mut self.review_mode);
+                        });
                         let id = egui::Id::new(("revert-hunk", &review.path));
                         if let Some(hunk) = ui.ctx().data_mut(|data| data.remove_temp::<usize>(id))
                         {
                             review.hunk = hunk;
                             self.pending_revert = review.revert_hunk();
-                            close = true;
                         }
                     } else if let Some(note) = &self.review_note {
                         ui.label(note);
@@ -664,11 +814,16 @@ impl GitTool {
                     close |=
                         ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
                 });
+            if undo_requested {
+                self.queue_review_undo();
+            }
             if close {
                 self.review_open = false;
+                self.review_undo.clear();
                 // The review holds two copies of the compared files, so they
                 // are released when the window closes.
                 self.review = None;
+                self.review_update_rx = None;
             }
         }
         if self.detail_open {
@@ -937,6 +1092,13 @@ pub struct RevertHunk {
     pub expected: String,
     pub replacement: String,
     pub line: usize,
+    pub undo: bool,
+}
+
+struct ReviewEdit {
+    start: usize,
+    removed: String,
+    inserted: String,
 }
 
 #[derive(Clone, Default)]
@@ -964,6 +1126,15 @@ impl DiffSelection {
             }),
         )
     }
+}
+
+struct ReviewUpdate {
+    path: PathBuf,
+    expected: String,
+    after: SourcePreview,
+    rows: Vec<diff::Row>,
+    visible: Vec<ReviewRow>,
+    split: Vec<SplitRow>,
 }
 
 struct Review {
@@ -1040,8 +1211,15 @@ fn split_rows(rows: &[diff::Row], visible: &[ReviewRow]) -> Vec<SplitRow> {
     result
 }
 
+/// Review actions operate on contiguous edits, independently of the context
+/// that groups nearby edits under a shared Git-style hunk header.
 fn change_targets(rows: &[diff::Row]) -> Vec<usize> {
-    diff::hunk_targets(rows)
+    rows.iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            (row.changed && (index == 0 || !rows[index - 1].changed)).then_some(index)
+        })
+        .collect()
 }
 
 // Navigate from the viewport, so scrolling away never strands the selected hunk.
@@ -1061,12 +1239,11 @@ fn navigation_target(targets: &[usize], scroll_y: f32, height: f32, next: bool) 
 impl Review {
     fn revert_hunk(&self) -> Option<RevertHunk> {
         let start = *self.changes.get(self.hunk)?;
-        let end = self
-            .changes
-            .get(self.hunk + 1)
-            .copied()
-            .unwrap_or(self.rows.len());
-        let end = start + self.rows[start..end].iter().rposition(|row| row.changed)? + 1;
+        let end = start
+            + self.rows[start..]
+                .iter()
+                .take_while(|row| row.changed)
+                .count();
         let old_start = self.rows[..start]
             .iter()
             .filter(|row| row.disk.is_some())
@@ -1101,6 +1278,7 @@ impl Review {
             expected: after.to_owned(),
             replacement,
             line: new_start,
+            undo: false,
         })
     }
 
@@ -1323,7 +1501,7 @@ impl Review {
                     self.jump_requested = true;
                 }
                 ui.weak(
-                    RichText::new(format!("{} / {} hunks", self.hunk + 1, count))
+                    RichText::new(format!("{} / {} changes", self.hunk + 1, count))
                         .size(crate::preferences::dialog_font_size(ui.ctx())),
                 );
             }
@@ -1428,109 +1606,162 @@ impl Review {
             DiffMode::Split => {
                 let old_y = self.scroll_y;
                 let mut next_y = old_y;
-                ui.columns(2, |columns| {
-                    for (side, ui) in columns.iter_mut().enumerate() {
-                        let (preview, newline, heading) = if side == 0 {
-                            (&self.before, self.before_newline, self.base.as_str())
-                        } else {
-                            (
-                                &self.after,
-                                self.after_newline,
-                                "Working tree + unsaved edits",
-                            )
-                        };
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), 26.0),
-                            egui::Sense::hover(),
+                let mut gutter_rows = Vec::new();
+                let mut gutter_rect = egui::Rect::NOTHING;
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.x = 28.0;
+                    ui.columns(2, |columns| {
+                        gutter_rect = egui::Rect::from_min_max(
+                            egui::pos2(columns[0].max_rect().right(), columns[0].max_rect().top()),
+                            egui::pos2(
+                                columns[1].max_rect().left(),
+                                columns[1].max_rect().bottom(),
+                            ),
                         );
-                        ui.painter().rect_filled(rect, 0, chrome::TABS);
-                        ui.painter().text(
-                            rect.left_center() + egui::vec2(10.0, 0.0),
-                            egui::Align2::LEFT_CENTER,
-                            heading,
-                            egui::FontId::proportional(11.0),
-                            chrome::MUTED,
-                        );
-                        let output = egui::ScrollArea::both()
-                            .id_salt(("split-diff", &self.path, side))
-                            .scroll_source(egui::scroll_area::ScrollSource {
-                                drag: false,
-                                ..egui::scroll_area::ScrollSource::ALL
-                            })
-                            .scroll_bar_visibility(
-                                egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
-                            )
-                            .vertical_scroll_offset(old_y)
-                            .auto_shrink([false, false])
-                            .show_rows(
-                                ui,
-                                height,
-                                self.split.len() + (ui.available_height() / height).ceil() as usize,
-                                |ui, range| {
-                                    let width = ui.available_width().max(
-                                        preview.width * scale
-                                            + 110.0
-                                            + if newline { 0.0 } else { 200.0 },
-                                    );
-                                    ui.set_min_width(width);
-                                    scroll_diff_selection(ui, &selection, side + 1);
-                                    for index in range.take_while(|&index| index < self.split.len())
-                                    {
-                                        match &self.split[index] {
-                                            SplitRow::Hunk(header) => {
-                                                paint_hunk(ui, header, width, height)
-                                            }
-                                            SplitRow::Line {
-                                                before,
-                                                after,
-                                                changed,
-                                            } => {
-                                                let line = if side == 0 { *before } else { *after };
-                                                let mark = if !changed || line.is_none() {
-                                                    ' '
-                                                } else if side == 0 {
-                                                    '-'
-                                                } else {
-                                                    '+'
-                                                };
-                                                let inline = before
-                                                    .zip(*after)
-                                                    .filter(|_| *changed)
-                                                    .map(|(old, new)| {
-                                                        let ranges = changed_ranges(
-                                                            self.before.line_text(old),
-                                                            self.after.line_text(new),
+                        for (side, ui) in columns.iter_mut().enumerate() {
+                            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                            let (preview, newline, heading) = if side == 0 {
+                                (&self.before, self.before_newline, self.base.as_str())
+                            } else {
+                                (
+                                    &self.after,
+                                    self.after_newline,
+                                    "Working tree + unsaved edits",
+                                )
+                            };
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 26.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(rect, 0, chrome::TABS);
+                            ui.painter().text(
+                                rect.left_center() + egui::vec2(10.0, 0.0),
+                                egui::Align2::LEFT_CENTER,
+                                heading,
+                                egui::FontId::proportional(11.0),
+                                chrome::MUTED,
+                            );
+                            let output = egui::ScrollArea::both()
+                                .id_salt(("split-diff", &self.path, side))
+                                .scroll_source(egui::scroll_area::ScrollSource {
+                                    drag: false,
+                                    ..egui::scroll_area::ScrollSource::ALL
+                                })
+                                .scroll_bar_visibility(
+                                    egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                                )
+                                .vertical_scroll_offset(old_y)
+                                .auto_shrink([false, false])
+                                .show_rows(
+                                    ui,
+                                    height,
+                                    self.split.len()
+                                        + (ui.available_height() / height).ceil() as usize,
+                                    |ui, range| {
+                                        let width = ui.available_width().max(
+                                            preview.width * scale
+                                                + 110.0
+                                                + if newline { 0.0 } else { 200.0 },
+                                        );
+                                        ui.set_min_width(width);
+                                        scroll_diff_selection(ui, &selection, side + 1);
+                                        for index in
+                                            range.take_while(|&index| index < self.split.len())
+                                        {
+                                            match &self.split[index] {
+                                                SplitRow::Hunk(header) => {
+                                                    paint_hunk(ui, header, width, height)
+                                                }
+                                                SplitRow::Line {
+                                                    before,
+                                                    after,
+                                                    changed,
+                                                } => {
+                                                    let line =
+                                                        if side == 0 { *before } else { *after };
+                                                    let mark = if !changed || line.is_none() {
+                                                        ' '
+                                                    } else if side == 0 {
+                                                        '-'
+                                                    } else {
+                                                        '+'
+                                                    };
+                                                    let inline = before
+                                                        .zip(*after)
+                                                        .filter(|_| *changed)
+                                                        .map(|(old, new)| {
+                                                            let ranges = changed_ranges(
+                                                                self.before.line_text(old),
+                                                                self.after.line_text(new),
+                                                            );
+                                                            if side == 0 {
+                                                                ranges.0
+                                                            } else {
+                                                                ranges.1
+                                                            }
+                                                        });
+                                                    if side == 0 {
+                                                        let top = ui.next_widget_position().y;
+                                                        let rect = egui::Rect::from_min_max(
+                                                            egui::pos2(gutter_rect.left(), top),
+                                                            egui::pos2(
+                                                                gutter_rect.right(),
+                                                                top + height,
+                                                            ),
                                                         );
-                                                        if side == 0 { ranges.0 } else { ranges.1 }
-                                                    });
-                                                paint_diff_line(
-                                                    ui,
-                                                    preview,
-                                                    line,
-                                                    &[line],
-                                                    mark,
-                                                    newline,
-                                                    width,
-                                                    height,
-                                                    inline,
-                                                    &mut selection,
-                                                    side + 1,
-                                                    index,
-                                                    selection_id,
-                                                    targets.binary_search(&index).ok().filter(
-                                                        |_| side == 0 && self.path.is_file(),
-                                                    ),
-                                                );
+                                                        let clip = egui::Rect::from_min_max(
+                                                            egui::pos2(
+                                                                gutter_rect.left(),
+                                                                ui.clip_rect().top(),
+                                                            ),
+                                                            egui::pos2(
+                                                                gutter_rect.right(),
+                                                                ui.clip_rect().bottom(),
+                                                            ),
+                                                        );
+                                                        gutter_rows
+                                                            .push((index, rect, clip, *changed));
+                                                    }
+                                                    paint_diff_line(
+                                                        ui,
+                                                        preview,
+                                                        line,
+                                                        &[line],
+                                                        mark,
+                                                        newline,
+                                                        width,
+                                                        height,
+                                                        inline,
+                                                        &mut selection,
+                                                        side + 1,
+                                                        index,
+                                                        selection_id,
+                                                        None,
+                                                    );
+                                                }
                                             }
                                         }
-                                    }
-                                },
-                            );
-                        if (output.state.offset.y - old_y).abs() > 0.5 {
-                            next_y = output.state.offset.y;
+                                    },
+                                );
+                            if (output.state.offset.y - old_y).abs() > 0.5 {
+                                next_y = output.state.offset.y;
+                            }
                         }
-                    }
+                    });
                 });
+                ui.painter().rect_filled(gutter_rect, 0, chrome::PANEL);
+                for (index, rect, clip, changed) in gutter_rows {
+                    let painter = ui.painter().with_clip_rect(clip);
+                    if changed {
+                        painter.rect_filled(rect, 0, chrome::BLUE.gamma_multiply(0.12));
+                    }
+                    if self.path.is_file()
+                        && let Ok(hunk) = targets.binary_search(&index)
+                        && rect.intersects(clip)
+                    {
+                        paint_apply_arrow(ui, rect.intersect(clip), selection_id, 1, index, hunk);
+                    }
+                }
                 if (next_y - self.scroll_y).abs() > 0.5 {
                     ui.ctx().request_repaint();
                 }
@@ -1639,6 +1870,49 @@ fn scroll_diff_selection(ui: &mut egui::Ui, selection: &DiffSelection, pane: usi
     }
 }
 
+/// A fixed divider control, separate from selectable and horizontally scrolling code.
+fn paint_apply_arrow(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    selection_id: egui::Id,
+    pane: usize,
+    row: usize,
+    hunk: usize,
+) {
+    let response = ui
+        .interact(
+            rect,
+            selection_id.with(("apply-diff-hunk", pane, row)),
+            egui::Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Apply this change from base to working file (unsaved; undo in editor)");
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    if response.hovered() {
+        painter.rect_filled(rect.shrink(1.0), 3, chrome::SELECTED);
+    }
+    let center = rect.center();
+    let color = if response.hovered() {
+        chrome::TEXT
+    } else {
+        chrome::BLUE
+    };
+    for offset in [-3.0, 3.0] {
+        painter.add(egui::Shape::line(
+            vec![
+                center + egui::vec2(offset - 2.0, -4.0),
+                center + egui::vec2(offset + 2.0, 0.0),
+                center + egui::vec2(offset - 2.0, 4.0),
+            ],
+            egui::Stroke::new(1.4_f32, color),
+        ));
+    }
+    if response.clicked() {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(selection_id.with("apply-hunk"), hunk));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_diff_line(
     ui: &mut egui::Ui,
@@ -1672,7 +1946,7 @@ fn paint_diff_line(
         _ if line.is_none() => (Color32::from_rgb(29, 32, 38), chrome::TABS, chrome::MUTED),
         _ => (chrome::EDITOR, Color32::from_rgb(26, 29, 35), chrome::MUTED),
     };
-    let action_gutter = pane != 2;
+    let action_gutter = pane == 0;
     let edge = rect.right().min(ui.clip_rect().right());
     let action_rect = egui::Rect::from_min_max(
         egui::pos2(edge - 30.0, rect.top()),
@@ -1691,24 +1965,7 @@ fn paint_diff_line(
     if action_gutter {
         ui.painter().rect_filled(action_rect, 0, chrome::PANEL);
         if let Some(hunk) = apply_hunk {
-            let mut actions = ui.new_child(
-                egui::UiBuilder::new()
-                    .id_salt(("apply-diff-hunk", pane, row))
-                    .max_rect(action_rect),
-            );
-            actions.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
-            if actions
-                .add_sized(
-                    action_rect.size(),
-                    egui::Button::new(RichText::new(">>").monospace().color(chrome::BLUE))
-                        .frame(false),
-                )
-                .on_hover_text("Copy this hunk from base → working file (unsaved; undo in editor)")
-                .clicked()
-            {
-                ui.ctx()
-                    .data_mut(|data| data.insert_temp(selection_id.with("apply-hunk"), hunk));
-            }
+            paint_apply_arrow(ui, action_rect, selection_id, pane, row, hunk);
         }
     }
     let gutter_width = 44.0 * gutters.len() as f32;
@@ -1997,18 +2254,274 @@ mod tests {
     }
 
     #[test]
+    fn nearby_edits_revert_independently_inside_one_context_hunk() {
+        for (before, after, first_reverted, second_reverted) in [
+            (
+                "# generated\nvendordiff.patch\n",
+                "# generated\n\nvendordiff.patch\nmain.go\n",
+                "# generated\nvendordiff.patch\nmain.go\n",
+                "# generated\n\nvendordiff.patch\n",
+            ),
+            (
+                "α\nkeep\n猫\n",
+                "犬\nkeep\n鳥\n",
+                "α\nkeep\n鳥\n",
+                "犬\nkeep\n猫\n",
+            ),
+            (
+                "remove first\nkeep\nremove last\n",
+                "keep\n",
+                "remove first\nkeep\n",
+                "keep\nremove last\n",
+            ),
+        ] {
+            let mut review = review_fixture(before, after);
+            assert_eq!(diff::hunk_targets(&review.rows).len(), 1);
+            assert_eq!(review.changes.len(), 2);
+            assert_eq!(review.revert_hunk().unwrap().replacement, first_reverted);
+            review.hunk = 1;
+            assert_eq!(review.revert_hunk().unwrap().replacement, second_reverted);
+            for full in [false, true] {
+                review.visible = review_rows(&review.rows, full);
+                review.split = split_rows(&review.rows, &review.visible);
+                for mode in [DiffMode::Split, DiffMode::Unified] {
+                    let targets = review.target_rows(mode);
+                    assert_eq!(targets.len(), 2);
+                    assert!(targets[0] < targets[1]);
+                    let offset = (targets[0] as f32 - 2.0).max(0.0) * 20.0;
+                    assert_eq!(navigation_target(&targets, offset, 20.0, true), 1);
+                }
+            }
+        }
+        // A replacement is one block even though the raw diff has deletions and insertions.
+        assert_eq!(review_fixture("a\nb\n", "x\ny\nz\n").changes.len(), 1);
+    }
+
+    #[test]
+    fn applying_hunks_keeps_review_open_and_refreshes_until_no_changes_remain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.rs");
+        let middle = (0..1).map(|i| format!("context {i}\n")).collect::<String>();
+        let before = format!("old first\n{middle}old last\n");
+        let after = format!("new first\n{middle}new last\n");
+        std::fs::write(&path, &after).unwrap();
+        let mut review = review_fixture(&before, &after);
+        review.path = path.clone();
+        review.full = true;
+        review.visible = review_rows(&review.rows, true);
+        review.split = split_rows(&review.rows, &review.visible);
+        let mut tool = GitTool {
+            project: dir.path().to_path_buf(),
+            review: Some(review),
+            review_open: true,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        for remaining in [1, 0] {
+            ctx.data_mut(|data| data.insert_temp(egui::Id::new(("revert-hunk", &path)), 0_usize));
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert!(tool.windows(ctx).is_none());
+                },
+            );
+            assert!(tool.review_open, "applying a hunk must keep the diff open");
+            let revert = tool.pending_revert.take().unwrap();
+            tool.review.as_mut().unwrap().scroll_y = 42.0;
+            tool.refresh_review_buffer(&path, revert.replacement.clone(), &ctx);
+            assert!(
+                tool.review.is_some(),
+                "keep the current diff visible while refreshing"
+            );
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while tool.review_update_rx.is_some() {
+                assert!(Instant::now() < deadline, "review refresh timed out");
+                tool.poll(dir.path(), &ctx);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let review = tool.review.as_ref().unwrap();
+            assert!(tool.review_open);
+            assert_eq!(review.after.source(), revert.replacement);
+            assert_eq!(review.changes.len(), remaining);
+            assert_eq!(review.scroll_y, 42.0);
+            assert!(review.full);
+        }
+        assert_eq!(tool.review.as_ref().unwrap().after.source(), before);
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            after,
+            "review updates must not save the file"
+        );
+    }
+
+    #[test]
+    fn diff_undo_restores_applied_changes_in_reverse_order_without_closing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.rs");
+        let before = "# generated\nvendordiff.patch\n";
+        let after = "# generated\n\nvendordiff.patch\nmain.go\n";
+        std::fs::write(&path, after).unwrap();
+        let mut review = review_fixture(before, after);
+        review.path = path.clone();
+        let mut tool = GitTool {
+            project: dir.path().to_path_buf(),
+            review: Some(review),
+            review_open: true,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let accept = |tool: &mut GitTool, edit: RevertHunk| {
+            tool.record_review_edit(&edit);
+            tool.refresh_review_buffer(&path, edit.replacement, &ctx);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while tool.review_update_rx.is_some() {
+                assert!(Instant::now() < deadline);
+                tool.poll(dir.path(), &ctx);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        for _ in 0..2 {
+            let edit = tool.review.as_ref().unwrap().revert_hunk().unwrap();
+            accept(&mut tool, edit);
+        }
+        assert_eq!(tool.review.as_ref().unwrap().after.source(), before);
+        assert_eq!(tool.review_undo.len(), 2);
+        let frame = |tool: &mut GitTool, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    tool.review_shortcuts(ctx);
+                    tool.windows(ctx);
+                },
+            )
+        };
+        frame(&mut tool, vec![]);
+        let output = frame(&mut tool, vec![]);
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Undo applied change" => {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                _ => None,
+            })
+            .expect("Undo remains visible after applying the final change");
+        for pressed in [true, false] {
+            frame(
+                &mut tool,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        let edit = tool
+            .pending_revert
+            .take()
+            .expect("Undo button queues an edit");
+        assert!(edit.undo);
+        assert_eq!(edit.replacement, "# generated\nvendordiff.patch\nmain.go\n");
+        accept(&mut tool, edit);
+        assert_eq!(tool.review_undo.len(), 1);
+        frame(
+            &mut tool,
+            vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+        );
+        let edit = tool
+            .pending_revert
+            .take()
+            .expect("Cmd/Ctrl Z queues an undo");
+        assert_eq!(edit.replacement, after);
+        accept(&mut tool, edit);
+        assert!(tool.review_open);
+        assert!(tool.review_undo.is_empty());
+        assert_eq!(tool.review.as_ref().unwrap().changes.len(), 2);
+        assert_eq!(tool.review.as_ref().unwrap().after.source(), after);
+        tool.queue_review_undo();
+        assert!(tool.pending_revert.is_none());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), after);
+    }
+
+    #[test]
+    fn diff_undo_stores_only_changed_text_and_preserves_unicode_and_newlines() {
+        for (before, after) in [
+            ("α\r\n猫\r\n", "α\r\n犬\r\n"),
+            ("α", "α\n"),
+            ("", "猫\n"),
+            ("猫\n", ""),
+        ] {
+            let mut tool = GitTool {
+                review: Some(review_fixture(before, after)),
+                review_open: true,
+                ..Default::default()
+            };
+            let edit = tool.review.as_ref().unwrap().revert_hunk().unwrap();
+            tool.record_review_edit(&edit);
+            tool.review = Some(review_fixture(before, &edit.replacement));
+            tool.queue_review_undo();
+            let undo = tool.pending_revert.take().unwrap();
+            assert_eq!(undo.expected, before);
+            assert_eq!(undo.replacement, after);
+            // Failed application leaves the history intact; consume it only after success.
+            assert_eq!(tool.review_undo.len(), 1);
+            tool.record_review_edit(&undo);
+            assert!(tool.review_undo.is_empty());
+        }
+        let context = "// unchanged context\n".repeat(1_000);
+        let before = format!("{context}old\n");
+        let after = format!("{context}new\n");
+        let mut tool = GitTool {
+            review: Some(review_fixture(&before, &after)),
+            review_open: true,
+            ..Default::default()
+        };
+        let edit = tool.review.as_ref().unwrap().revert_hunk().unwrap();
+        tool.record_review_edit(&edit);
+        let stored = tool.review_undo.back().unwrap();
+        assert_eq!(stored.removed.len() + stored.inserted.len(), 6);
+    }
+
+    #[test]
     fn inline_arrows_apply_the_clicked_hunk_in_both_layouts() {
         for mut mode in [DiffMode::Unified, DiffMode::Split] {
             let file = tempfile::NamedTempFile::new().unwrap();
-            let middle = (0..12)
-                .map(|i| format!("context {i}\n"))
-                .collect::<String>();
+            let middle = (0..1).map(|i| format!("context {i}\n")).collect::<String>();
             let before = format!("old first\n{middle}old last\n");
             let after = format!("new first\n{middle}new last\n");
             let mut review = review_fixture(&before, &after);
+            assert_eq!(diff::hunk_targets(&review.rows).len(), 1);
+            assert_eq!(review.changes.len(), 2);
             review.path = file.path().to_path_buf();
             let ctx = egui::Context::default();
             chrome::install(&ctx);
+            let initial_mode = mode;
             let mut frame = |events, review: &mut Review| {
                 ctx.run(
                     egui::RawInput {
@@ -2026,18 +2539,28 @@ mod tests {
             };
             frame(vec![], &mut review);
             let output = frame(vec![], &mut review);
-            let arrows: Vec<_> = output
-                .shapes
+            let _ = output;
+            let pane = if initial_mode == DiffMode::Split {
+                1
+            } else {
+                0
+            };
+            let targets = review.target_rows(initial_mode);
+            let selection_id = egui::Id::new(("diff-selection", &review.path));
+            let arrows: Vec<_> = targets
                 .iter()
-                .filter_map(|shape| match &shape.shape {
-                    egui::Shape::Text(text) if text.galley.text() == ">>" => {
-                        Some(text.pos + text.galley.size() / 2.0)
-                    }
-                    _ => None,
+                .map(|row| {
+                    ctx.read_response(selection_id.with(("apply-diff-hunk", pane, *row)))
+                        .expect("change arrow must be interactive")
+                        .rect
                 })
                 .collect();
             assert_eq!(arrows.len(), 2);
-            let point = arrows[1];
+            if initial_mode == DiffMode::Split {
+                assert!((arrows[0].center().x - 600.0).abs() < 25.0);
+                assert!(arrows.iter().all(|rect| rect.width() <= 28.0));
+            }
+            let point = arrows[1].center();
             for pressed in [true, false] {
                 frame(
                     vec![
@@ -2861,19 +3384,18 @@ mod tests {
     }
 
     #[test]
-    fn single_git_hunk_can_be_refocused_from_away_in_both_layouts() {
+    fn single_change_can_be_refocused_from_away_in_both_layouts() {
         let path = PathBuf::from("code.rs");
         let before = (0..80)
             .map(|i| format!("const ITEM_{i}: usize = {i};\n"))
             .collect::<String>();
-        let after = before
-            .replace("ITEM_35: usize = 35", "ITEM_35: usize = 3500")
-            .replace("ITEM_37: usize = 37", "ITEM_37: usize = 3700");
+        let after = before.replace("ITEM_35: usize = 35", "ITEM_35: usize = 3500");
         let rows = diff::compare(&before, &after);
         let visible = review_rows(&rows, false);
         let split = split_rows(&rows, &visible);
         let changes = change_targets(&rows);
-        assert_eq!(changes.len(), 1, "nearby edits retain Git hunk grouping");
+        assert_eq!(diff::hunk_targets(&rows).len(), 1);
+        assert_eq!(changes.len(), 1);
         assert_navigation_from_away(Review {
             path: path.clone(),
             relative_path: path.clone(),

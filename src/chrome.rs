@@ -66,7 +66,7 @@ pub fn install(ctx: &egui::Context) {
         s.animation_time = 0.12;
         s.spacing.button_padding = egui::vec2(10.0, 6.0);
         s.spacing.indent = 16.0;
-        s.interaction.resize_grab_radius_side = 8.0;
+        s.interaction.resize_grab_radius_side = 4.0;
         s.interaction.resize_grab_radius_corner = 14.0;
         s.visuals.resize_corner_size = 16.0;
         s.spacing.interact_size.y = 28.0;

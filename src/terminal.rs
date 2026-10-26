@@ -1105,6 +1105,103 @@ fn color(color: vt100::Color, default: Color32) -> Color32 {
         }
     }
 }
+/// A file navigation request emitted by the terminal and consumed by the editor.
+#[derive(Clone, Debug, Default)]
+pub struct FileLink {
+    pub query: String,
+    pub directory: PathBuf,
+}
+
+pub fn take_file_link(ctx: &egui::Context) -> Option<FileLink> {
+    ctx.data_mut(|data| data.remove_temp(egui::Id::new("terminal-file-link")))
+}
+
+#[derive(Debug, PartialEq)]
+enum Link {
+    Url(String),
+    File(String),
+}
+
+fn parse_link(text: &str) -> Option<Link> {
+    let text = trim_link_punctuation(text);
+    if text.to_ascii_lowercase().starts_with("www.") {
+        let url = url::Url::parse(&format!("https://{text}")).ok()?;
+        url.host_str()?;
+        return Some(Link::Url(url.into()));
+    }
+    if text.starts_with("http://") || text.starts_with("https://") {
+        let url = url::Url::parse(text).ok()?;
+        return url.host_str().map(|_| Link::Url(text.to_owned()));
+    }
+    if text.starts_with("file://") {
+        let path = url::Url::parse(text).ok()?.to_file_path().ok()?;
+        return Some(Link::File(path.to_string_lossy().into_owned()));
+    }
+    if matches!(text, "~" | "." | "..") {
+        return Some(Link::File(text.to_owned()));
+    }
+    // Avoid making arbitrary output, decimal numbers and shell flags into links.
+    let path = text.split(':').next().unwrap_or(text);
+    let filename = Path::new(path).file_name()?.to_str()?;
+    let extension = Path::new(filename).extension().and_then(|s| s.to_str());
+    let looks_like_file = path.contains('/')
+        || (extension.is_some_and(|ext| ext.chars().any(char::is_alphabetic))
+            && !filename.starts_with('-'));
+    (looks_like_file && !text.contains("://") && !text.starts_with('-'))
+        .then(|| Link::File(file_link_query(text)))
+}
+
+/// Compiler diagnostics may append columns, ranges or prose after the line.
+/// Terminal navigation always goes to the beginning of that first line.
+pub fn file_link_query(text: &str) -> String {
+    let text = trim_link_punctuation(text);
+    if let Some((path, suffix)) = text.split_once(':') {
+        let digits: String = suffix.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty() {
+            return format!("{path}:{digits}");
+        }
+    }
+    text.to_owned()
+}
+
+fn trim_link_punctuation(text: &str) -> &str {
+    let text = text.trim_end_matches([',', ':']);
+    if matches!(text, "." | "..") || text.ends_with("/.") || text.ends_with("/..") {
+        text
+    } else {
+        text.trim_end_matches(['.', ',', ':'])
+    }
+}
+
+fn terminal_link(
+    screen: &vt100::Screen,
+    point: (u16, u16),
+    directory: &Path,
+    root: &Path,
+) -> Option<(Link, (u16, u16), (u16, u16))> {
+    let (start, end) = terminal_word(screen, point)?;
+    let (_, cols) = screen.size();
+    let mut text = String::new();
+    for row in start.0..=end.0 {
+        let first = if row == start.0 { start.1 } else { 0 };
+        let last = if row == end.0 { end.1 } else { cols - 1 };
+        for col in first..=last {
+            if let Some(cell) = screen.cell(row, col)
+                && !cell.is_wide_continuation()
+            {
+                text.push_str(cell.contents());
+            }
+        }
+    }
+    let link = parse_link(&text).or_else(|| {
+        let query = file_link_query(&text);
+        let path = query.split(':').next().unwrap_or(&query);
+        (!path.is_empty() && (directory.join(path).exists() || root.join(path).exists()))
+            .then(|| Link::File(query))
+    })?;
+    Some((link, start, end))
+}
+
 /// Keep path and URL punctuation inside a word; quotes and shell separators bound it.
 fn terminal_word(screen: &vt100::Screen, point: (u16, u16)) -> Option<((u16, u16), (u16, u16))> {
     let (rows, cols) = screen.size();
@@ -1280,7 +1377,7 @@ fn render(
         tab.size = size;
         tab.selection = None;
     }
-    if enabled && (*focus || response.clicked()) {
+    if enabled && (*focus || response.clicked() || response.drag_started() || response.dragged()) {
         ui.memory_mut(|m| m.request_focus(id));
         *focus = false;
     }
@@ -1313,12 +1410,62 @@ fn render(
         .parser
         .screen()
         .mouse_protocol_mode();
+    let command = enabled && ui.input(|i| i.modifiers.command);
+    let hovered_link = if command && response.hovered() {
+        response.hover_pos().and_then(|pos| {
+            let state = tab.screen.lock().unwrap();
+            terminal_link(
+                state.parser.screen(),
+                point(pos),
+                state
+                    .parser
+                    .callbacks()
+                    .directory
+                    .as_deref()
+                    .unwrap_or(&tab.root),
+                &tab.root,
+            )
+        })
+    } else {
+        None
+    };
+    if hovered_link.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if response.clicked()
+        && let Some((link, _, _)) = &hovered_link
+    {
+        match link {
+            Link::Url(url) => ui.ctx().open_url(egui::OpenUrl::new_tab(url)),
+            Link::File(query) => {
+                let state = tab.screen.lock().unwrap();
+                let directory = state
+                    .parser
+                    .callbacks()
+                    .directory
+                    .clone()
+                    .unwrap_or_else(|| tab.root.clone());
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("terminal-file-link"),
+                        FileLink {
+                            query: query.clone(),
+                            directory,
+                        },
+                    )
+                });
+            }
+        }
+        ui.memory_mut(|m| m.surrender_focus(id));
+    }
     let report_mouse = enabled
+        && !command
         && ui.input(|i| i.focused)
         && !tab.screen.lock().unwrap().exited
         && !ui.input(|i| i.modifiers.shift)
         && mouse_mode != vt100::MouseProtocolMode::None;
     if !report_mouse
+        && !command
         && response.drag_started()
         && let Some(pos) = ui.input(|i| i.pointer.press_origin())
     {
@@ -1444,13 +1591,14 @@ fn render(
     }
     if enabled
         && !report_mouse
+        && !command
         && response.double_clicked()
         && let Some(pos) = response.interact_pointer_pos()
     {
         tab.selection = terminal_word(state.parser.screen(), point(pos));
     }
     let mut copy = false;
-    if focused && !state.exited {
+    if focused {
         let events = ui.input_mut(|i| {
             let mut events = vec![];
             i.events.retain(|event| {
@@ -1518,7 +1666,11 @@ fn render(
                     modifiers,
                     ..
                 } => {
-                    if modifiers.ctrl && modifiers.shift && key == Key::C {
+                    if key == Key::C
+                        && (modifiers.mac_cmd
+                            || (cfg!(target_os = "macos") && modifiers.command)
+                            || (modifiers.ctrl && modifiers.shift))
+                    {
                         copy = true;
                     } else if !(clipboard_copy
                         && key == Key::C
@@ -1585,6 +1737,9 @@ fn render(
             end.1.saturating_add(1).min(cols),
         ));
     }
+    if state.exited {
+        outgoing.clear();
+    }
     if !outgoing.is_empty() {
         state.parser.screen_mut().set_scrollback(0);
         tab.selection = None;
@@ -1616,10 +1771,13 @@ fn render(
             if bg != chrome::EDITOR {
                 painter.rect_filled(cell_rect, 0.0, bg);
             }
-            if c.underline() {
+            let link_cell = hovered_link
+                .as_ref()
+                .is_some_and(|(_, start, end)| (row, col) >= *start && (row, col) <= *end);
+            if c.underline() || link_cell {
                 painter.line_segment(
                     [cell_rect.left_bottom(), cell_rect.right_bottom()],
-                    egui::Stroke::new(1.0_f32, fg),
+                    egui::Stroke::new(1.0_f32, if link_cell { chrome::BLUE } else { fg }),
                 );
             }
         }
@@ -1707,6 +1865,82 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_detect_urls_paths_and_only_the_first_line_number() {
+        for (input, expected) in [
+            ("src/main.rs:42:43", "src/main.rs:42"),
+            ("src/main.rs:42-7", "src/main.rs:42"),
+            ("/tmp/main.rs:42:", "/tmp/main.rs:42"),
+            ("../src/main.rs:42:43-50", "../src/main.rs:42"),
+            ("~/main.rs", "~/main.rs"),
+            ("main.rs", "main.rs"),
+            ("src/main.rs,", "src/main.rs"),
+            ("src/main.rs.", "src/main.rs"),
+            ("src/main.rs:42:43,", "src/main.rs:42"),
+            (
+                "/Users/avinash/Desktop/workspace/kubernetes.",
+                "/Users/avinash/Desktop/workspace/kubernetes",
+            ),
+            ("..", ".."),
+            (".", "."),
+            ("~", "~"),
+        ] {
+            assert_eq!(parse_link(input), Some(Link::File(expected.into())));
+        }
+        assert_eq!(
+            parse_link("https://example.com/test?q=a#anchor."),
+            Some(Link::Url("https://example.com/test?q=a#anchor".into()))
+        );
+        assert_eq!(
+            parse_link("https://example.com/test,."),
+            Some(Link::Url("https://example.com/test".into()))
+        );
+        assert_eq!(
+            parse_link("www.google.com,."),
+            Some(Link::Url("https://www.google.com/".into()))
+        );
+        assert_eq!(
+            parse_link("file:///tmp/a%20b.rs"),
+            Some(Link::File("/tmp/a b.rs".into()))
+        );
+        for text in [
+            "hello",
+            "42.7",
+            "--option=value",
+            "javascript:alert",
+            "https://",
+            "ssh://host/path",
+        ] {
+            assert_eq!(parse_link(text), None, "{text}");
+        }
+        let mut parser = vt100::Parser::new(4, 12, 0);
+        parser.process("猫 src/main.rs:42:43".as_bytes());
+        assert_eq!(
+            terminal_link(parser.screen(), (1, 2), Path::new("/"), Path::new("/"))
+                .unwrap()
+                .0,
+            Link::File("src/main.rs:42".into())
+        );
+    }
+
+    #[test]
+    fn terminal_links_include_existing_extensionless_files_and_folders() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir(dir.path().join("src"))?;
+        std::fs::write(dir.path().join("Makefile"), "all:\n")?;
+        for (text, expected) in [("src", "src"), ("Makefile:42:43,", "Makefile:42")] {
+            let mut parser = vt100::Parser::new(4, 80, 0);
+            parser.process(text.as_bytes());
+            assert_eq!(
+                terminal_link(parser.screen(), (0, 1), dir.path(), dir.path())
+                    .unwrap()
+                    .0,
+                Link::File(expected.into())
+            );
+        }
+        Ok(())
+    }
     #[test]
     fn double_click_words_preserve_paths_colors_unicode_and_wrapped_lines() {
         let path = "hack/apidiff-changelog/main.go";
@@ -1778,12 +2012,19 @@ mod tests {
         };
         let mut focus = true;
         let mut time = 0.0;
-        let mut frame = |tab: &mut Session, events| {
+        let mut frame = |tab: &mut Session, events: Vec<egui::Event>| {
             time += 0.08;
             let mut point = egui::Pos2::ZERO;
             let output = ctx.run(
                 egui::RawInput {
                     time: Some(time),
+                    modifiers: events
+                        .iter()
+                        .find_map(|event| match event {
+                            egui::Event::PointerButton { modifiers, .. } => Some(*modifiers),
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
                     events,
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -1847,6 +2088,26 @@ mod tests {
             )
         };
         assert!(copied_path(&output));
+        // Some backends deliver only the key event, without Event::Copy.
+        // Copy remains available after a shell has exited as well.
+        for exited in [false, true] {
+            tab.screen.lock().unwrap().exited = exited;
+            let (output, _) = frame(
+                &mut tab,
+                vec![egui::Event::Key {
+                    key: Key::C,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::MAC_CMD,
+                }],
+            );
+            assert!(
+                copied_path(&output),
+                "Cmd+C should copy selection with exited={exited}"
+            );
+        }
+        tab.screen.lock().unwrap().exited = false;
         assert!(
             !rx.try_iter()
                 .any(|command| matches!(command, Command::Input(_))),
@@ -1867,6 +2128,43 @@ mod tests {
                 .collect();
             assert_eq!(input, [3], "Ctrl+C must remain a shell interrupt");
         }
+        // Dragging to select from an unfocused terminal must claim keyboard
+        // focus, so Cmd+C copies the terminal rather than the editor behind it.
+        let width = ctx.fonts_mut(|fonts| fonts.glyph_width(&FontId::monospace(14.0), 'M'));
+        let start = point - egui::vec2(9.0 * width, 0.0);
+        let end = start + egui::vec2((path.len() - 1) as f32 * width, 0.0);
+        ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::new(("terminal-input", tab.id))));
+        frame(
+            &mut tab,
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        frame(&mut tab, vec![egui::Event::PointerMoved(end)]);
+        frame(
+            &mut tab,
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new(("terminal-input", tab.id)))));
+        let (output, _) = frame(
+            &mut tab,
+            vec![egui::Event::Key {
+                key: Key::C,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::MAC_CMD,
+            }],
+        );
+        assert!(copied_path(&output));
         // An ordinary click still clears selection.
         for pressed in [true, false] {
             frame(
@@ -1880,6 +2178,61 @@ mod tests {
             );
         }
         assert!(tab.selection.is_none());
+
+        // Command-click navigates instead of selecting, even in a mouse-aware app.
+        tab.screen.lock().unwrap().parser.process(b"\x1b[?1000h");
+        for pressed in [true, false] {
+            let (output, _) = frame(
+                &mut tab,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Modifiers::COMMAND,
+                    },
+                ],
+            );
+            assert_eq!(
+                output.platform_output.cursor_icon,
+                egui::CursorIcon::PointingHand
+            );
+        }
+        let link = take_file_link(&ctx).expect("command-click should emit file navigation");
+        assert_eq!(link.query, path);
+        assert_eq!(link.directory, Path::new("/project"));
+        assert!(take_file_link(&ctx).is_none());
+        assert!(tab.selection.is_none());
+
+        tab.screen
+            .lock()
+            .unwrap()
+            .parser
+            .process(b"\x1b[2J\x1b[Hwww.google.com/path.,");
+        let url_point = point - egui::vec2(8.0 * width, 0.0);
+        let mut opened = false;
+        for pressed in [true, false] {
+            let (output, _) = frame(
+                &mut tab,
+                vec![egui::Event::PointerButton {
+                    pos: url_point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::COMMAND,
+                }],
+            );
+            opened |= output.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::OpenUrl(url) if url.url == "https://www.google.com/path")
+            });
+        }
+        assert!(opened, "URL command-click should open the cleaned URL");
+        assert!(take_file_link(&ctx).is_none());
+        assert!(
+            !rx.try_iter()
+                .any(|command| matches!(command, Command::Input(_))),
+            "command-click must not forward mouse input to the terminal application"
+        );
     }
 
     fn wait_for(state: &Arc<Mutex<ScreenState>>, condition: impl Fn(&ScreenState) -> bool) {

@@ -63,7 +63,6 @@ pub struct FileTree {
     pub diff: Option<PathBuf>,
     children: BTreeMap<OsString, FileTree>,
     file: Option<PathBuf>,
-    directories_loaded: bool,
     last_active: Option<PathBuf>,
     open_override: Option<bool>,
     reveal_requested: bool,
@@ -78,6 +77,7 @@ impl FileTree {
         }
     }
     pub fn reveal_active(&mut self) {
+        self.reveal_target = None;
         self.reveal_requested = true;
     }
 
@@ -118,13 +118,36 @@ impl FileTree {
         tree
     }
 
+    pub fn build_with_folders(root: &Path, files: &[PathBuf], folders: &[PathBuf]) -> Self {
+        let mut tree = Self::build(root, files);
+        for path in folders {
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let mut node = &mut tree;
+            for component in relative.components() {
+                node = node
+                    .children
+                    .entry(component.as_os_str().to_owned())
+                    .or_default();
+            }
+        }
+        tree
+    }
+
     /// Refresh entries while retaining reveal commands. Folder expansion is
     /// persisted by egui under path-based IDs, so it survives this rebuild.
-    pub fn refresh(&mut self, root: &Path, files: &[PathBuf]) {
-        let mut fresh = Self::build(root, files);
+    pub fn refresh(&mut self, root: &Path, files: &[PathBuf], folders: &[PathBuf]) {
+        let mut fresh = Self::build_with_folders(root, files, folders);
         fresh.last_active = self.last_active.take();
         fresh.reveal_requested = self.reveal_requested;
         fresh.reveal_target = self.reveal_target.take();
+        if let Some(target) = fresh.reveal_target.clone() {
+            // Keep explicitly revealed empty/ignored folders in the rebuilt tree.
+            let pending = fresh.reveal_requested;
+            fresh.reveal_path(root, &target);
+            fresh.reveal_requested = pending;
+        }
         fresh.action = self.action.take();
         fresh.diff = self.diff.take();
         fn keep_commands(fresh: &mut FileTree, old: &mut FileTree) {
@@ -161,20 +184,30 @@ impl FileTree {
         filter: &str,
         colors: &BTreeMap<PathBuf, egui::Color32>,
     ) -> Option<PathBuf> {
-        let target = self.reveal_target.take();
-        let active = target.as_deref().or(active);
-        let reveal =
-            std::mem::take(&mut self.reveal_requested) || self.last_active.as_deref() != active;
+        let requested = std::mem::take(&mut self.reveal_requested);
+        let active_changed = self.last_active.as_deref() != active;
+        if active_changed && !requested {
+            self.reveal_target = None;
+        }
+        // Track editor navigation separately from an explicit tree selection.
+        // Otherwise the next frame interprets the still-open file as a new
+        // selection and immediately scrolls back to it.
         self.last_active = active.map(Path::to_path_buf);
-        self.show_children(
+        let target = self.reveal_target.clone();
+        let selected = target.as_deref().or(active);
+        let opened = self.show_children(
             ui,
             root,
             root,
-            active,
+            selected,
             &crate::chrome::CaseFilter::new(filter),
-            reveal,
+            requested || active_changed,
             colors,
-        )
+        );
+        if opened.is_some() {
+            self.reveal_target = None;
+        }
+        opened
     }
 
     fn show_children(
@@ -188,17 +221,6 @@ impl FileTree {
         colors: &BTreeMap<PathBuf, egui::Color32>,
     ) -> Option<PathBuf> {
         let mut opened = None;
-        // Include empty folders so they can receive a new file.
-        if !self.directories_loaded {
-            self.directories_loaded = true;
-            for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
-                if entry.file_type().is_ok_and(|kind| kind.is_dir())
-                    && !entry.file_name().to_string_lossy().starts_with('.')
-                {
-                    self.children.entry(entry.file_name()).or_default();
-                }
-            }
-        }
         for is_file in [false, true] {
             for (name, child) in &mut self.children {
                 if child.file.is_some() != is_file
@@ -258,6 +280,8 @@ impl FileTree {
                         opened = Some(file.clone());
                     }
                 } else {
+                    let selected_background = (active == Some(path.as_path()))
+                        .then(|| ui.painter().add(egui::Shape::Noop));
                     let open_override = child.open_override.take();
                     let header_response = crate::chrome::folder_header(
                         ui,
@@ -279,6 +303,16 @@ impl FileTree {
                             }
                         },
                     );
+                    if let Some(background) = selected_background {
+                        let rect = egui::Rect::from_min_max(
+                            egui::pos2(ui.clip_rect().left() + 4.0, header_response.rect.top()),
+                            header_response.rect.right_bottom(),
+                        );
+                        ui.painter().set(
+                            background,
+                            egui::Shape::rect_filled(rect, 4.0, crate::chrome::SELECTED),
+                        );
+                    }
                     if let Some(path) = child.diff.take() {
                         self.diff = Some(path);
                     }
@@ -303,6 +337,95 @@ impl FileTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_uses_filtered_folder_index_instead_of_rediscovering_ignored_directories()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let empty = root.join("empty");
+        let ignored = root.join("ignored");
+        std::fs::create_dir_all(&empty)?;
+        std::fs::create_dir_all(&ignored)?;
+        let mut tree = FileTree::build_with_folders(root, &[], &[empty]);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                tree.show(ui, root, None, "", &BTreeMap::new());
+            });
+        });
+        assert!(tree.children.contains_key(&OsString::from("empty")));
+        assert!(!tree.children.contains_key(&OsString::from("ignored")));
+        Ok(())
+    }
+
+    #[test]
+    fn revealed_folder_stays_selected_across_frames_and_refresh_until_editor_navigation() {
+        let root = Path::new("/project");
+        let active = root.join("aaa/active.rs");
+        let folder = root.join("zzz-target");
+        let mut files = vec![active.clone()];
+        files.extend((0..60).map(|i| root.join(format!("folder{i:02}/item.rs"))));
+        let mut tree = FileTree::build(root, &files);
+        let ctx = egui::Context::default();
+        let colors = BTreeMap::new();
+        let mut time = 0.0;
+        let mut frame = |tree: &mut FileTree, active: &Path| {
+            time += 0.1;
+            let mut offset = 0.0;
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(360.0, 260.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let scroll = egui::ScrollArea::vertical()
+                            .id_salt("folder-reveal-test")
+                            .show(ui, |ui| {
+                                tree.show(ui, root, Some(active), "", &colors);
+                            });
+                        offset = scroll.state.offset.y;
+                    });
+                },
+            );
+            offset
+        };
+        for _ in 0..4 {
+            frame(&mut tree, &active);
+        }
+        tree.reveal_path(root, &folder);
+        for _ in 0..10 {
+            frame(&mut tree, &active);
+        }
+        assert_eq!(tree.reveal_target.as_ref(), Some(&folder));
+        assert_eq!(tree.last_active.as_ref(), Some(&active));
+        assert!(
+            frame(&mut tree, &active) > 500.0,
+            "folder reveal must not scroll back to the active file"
+        );
+        tree.refresh(root, &files, &[]);
+        assert!(tree.children.contains_key(&OsString::from("zzz-target")));
+        assert!(frame(&mut tree, &active) > 500.0);
+        tree.reveal_active();
+        for _ in 0..10 {
+            frame(&mut tree, &active);
+        }
+        assert!(tree.reveal_target.is_none());
+        assert!(frame(&mut tree, &active) < 50.0);
+        tree.reveal_path(root, &folder);
+        frame(&mut tree, &active);
+        frame(&mut tree, &root.join("folder10/item.rs"));
+        assert!(
+            tree.reveal_target.is_none(),
+            "switching editor files must restore normal tree tracking"
+        );
+    }
+
     #[test]
     fn refresh_keeps_reveal_and_expansion_commands_but_removes_stale_entries() {
         let root = Path::new("/project");
@@ -313,7 +436,7 @@ mod tests {
         tree.last_active = Some(active.clone());
         tree.expand_all(false);
         tree.reveal_path(root, &active);
-        tree.refresh(root, &[active.clone(), added]);
+        tree.refresh(root, &[active.clone(), added], &[]);
         assert_eq!(tree.last_active, Some(active.clone()));
         assert_eq!(tree.reveal_target, Some(active));
         assert!(tree.reveal_pending());

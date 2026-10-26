@@ -220,6 +220,77 @@ fn owner_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     None
 }
 
+/// True only for the binding name within a pattern, excluding default values,
+/// destructuring property keys, type names, and writes through existing objects.
+fn binding_contains(mut binding: Node<'_>, start: usize, end: usize) -> bool {
+    let contains = |node: Node<'_>| start >= node.start_byte() && end <= node.end_byte();
+    if start >= end || !contains(binding) {
+        return false;
+    }
+    loop {
+        let field = match binding.kind() {
+            "identifier"
+            | "type_identifier"
+            | "field_identifier"
+            | "property_identifier"
+            | "shorthand_field_identifier"
+            | "shorthand_property_identifier_pattern" => return true,
+            "assignment_pattern" | "object_assignment_pattern" => Some("left"),
+            "pair_pattern" => Some("value"),
+            "field_pattern" => {
+                if let Some(pattern) = binding.child_by_field_name("pattern") {
+                    binding = pattern;
+                    if !contains(binding) {
+                        return false;
+                    }
+                    continue;
+                }
+                return binding.child_by_field_name("name").is_some_and(|name| {
+                    name.kind() == "shorthand_field_identifier" && contains(name)
+                });
+            }
+            "tuple_pattern"
+            | "slice_pattern"
+            | "array_pattern"
+            | "object_pattern"
+            | "pattern_list"
+            | "list_pattern"
+            | "tuple"
+            | "list"
+            | "expression_list"
+            | "parameters"
+            | "formal_parameters"
+            | "lambda_parameters"
+            | "closure_parameters"
+            | "rest_pattern"
+            | "list_splat_pattern"
+            | "dictionary_splat_pattern"
+            | "mut_pattern"
+            | "ref_pattern"
+            | "reference_pattern"
+            | "captured_pattern"
+            | "struct_pattern"
+            | "tuple_struct_pattern"
+            | "typed_parameter" => None,
+            _ => return false,
+        };
+        let next = if let Some(field) = field {
+            binding
+                .child_by_field_name(field)
+                .filter(|node| contains(*node))
+        } else {
+            let excluded_type = binding.child_by_field_name("type").map(|node| node.id());
+            binding
+                .named_children(&mut binding.walk())
+                .find(|node| Some(node.id()) != excluded_type && contains(*node))
+        };
+        let Some(next) = next else {
+            return false;
+        };
+        binding = next;
+    }
+}
+
 struct Classifier {
     tree: tree_sitter::Tree,
 }
@@ -270,9 +341,17 @@ impl Classifier {
             }
             let field = match kind {
                 "let_declaration" => Some("pattern"),
-                "assignment" | "named_expression" => Some("left"),
+                "assignment" | "named_expression" | "short_var_declaration" => Some("left"),
+                "arrow_function" => Some("parameter"),
+                "formal_parameters" | "lambda_parameters" | "closure_parameters"
+                | "typed_parameter" => {
+                    if binding_contains(current, start, end) {
+                        category = MatchCategory::Declaration;
+                    }
+                    None
+                }
                 "parameter" | "required_parameter" | "optional_parameter" => Some("pattern"),
-                "default_parameter" | "typed_parameter" | "typed_default_parameter" => Some("name"),
+                "default_parameter" | "typed_default_parameter" => Some("name"),
                 "function_item"
                 | "struct_item"
                 | "enum_item"
@@ -317,10 +396,10 @@ impl Classifier {
                 let mut cursor = current.walk();
                 let binding = current
                     .children_by_field_name(field, &mut cursor)
-                    .any(|binding| start >= binding.start_byte() && end <= binding.end_byte());
-                let fallback = current.child_by_field_name("name").is_some_and(|binding| {
-                    start >= binding.start_byte() && end <= binding.end_byte()
-                });
+                    .any(|binding| binding_contains(binding, start, end));
+                let fallback = current
+                    .child_by_field_name("name")
+                    .is_some_and(|binding| binding_contains(binding, start, end));
                 let kotlin_binding = matches!(
                     kind,
                     "variable_declaration" | "parameter" | "class_parameter" | "type_parameter"
@@ -550,12 +629,26 @@ pub fn read_text_bounded(path: &Path, limit: usize) -> Result<String> {
 
 /// Shared traversal rules for the explorer, file picker and project search.
 fn workspace_walk(root: &Path) -> Result<WalkBuilder> {
+    workspace_walk_with_ignore(root, crate::preferences::global_ignore_path().as_deref())
+}
+
+fn workspace_walk_with_ignore(root: &Path, global_ignore: Option<&Path>) -> Result<WalkBuilder> {
     let mut overrides = OverrideBuilder::new(root);
     overrides.add("!.git")?.add("!target")?;
     let mut walk = WalkBuilder::new(root);
     walk.hidden(false)
         .add_custom_ignore_filename(".rgignore")
         .overrides(overrides.build()?);
+    if let Some(path) = global_ignore.filter(|path| path.is_file()) {
+        // Anchor /patterns to this project, rather than the app's launch CWD
+        // or ~/.glimcode. Local ignore files retain their usual precedence.
+        walk.current_dir(root);
+        if let Some(error) = walk.add_ignore(path) {
+            return Err(error).with_context(|| {
+                format!("Cannot load global ignore rules from {}", path.display())
+            });
+        }
+    }
     Ok(walk)
 }
 
@@ -1164,6 +1257,128 @@ mod tests {
     }
 
     #[test]
+    fn search_classifies_each_occurrence_instead_of_its_declaration_line() -> Result<()> {
+        use MatchCategory::{Declaration as D, Usage as U};
+        let cases: &[(&str, &str, &str, &[MatchCategory])] = &[
+            (
+                "rs",
+                "fn demo() { let value = value(); consume(value); }",
+                "value",
+                &[D, U, U],
+            ),
+            (
+                "rs",
+                "fn demo() { let Widget { field: value } = input; }",
+                "Widget",
+                &[U],
+            ),
+            (
+                "rs",
+                "fn demo() { let Widget { field: value } = input; }",
+                "field",
+                &[U],
+            ),
+            (
+                "rs",
+                "fn demo() { let Widget { field: value } = input; }",
+                "value",
+                &[D],
+            ),
+            (
+                "go",
+                "package p\nfunc demo() { value := value(); consume(value) }",
+                "value",
+                &[D, U, U],
+            ),
+            (
+                "js",
+                "function demo(value = value()) { consume(value); }",
+                "value",
+                &[D, U, U],
+            ),
+            (
+                "js",
+                "const { value: local = value() } = input; consume(value);",
+                "value",
+                &[U, U, U],
+            ),
+            (
+                "js",
+                "const { value: local = value() } = input; consume(local);",
+                "local",
+                &[D, U],
+            ),
+            ("js", "const { value = value() } = input;", "value", &[D, U]),
+            (
+                "js",
+                "const demo = value => consume(value);",
+                "value",
+                &[D, U],
+            ),
+            (
+                "ts",
+                "function demo(value: Value = value()) { consume(value); }",
+                "value",
+                &[D, U, U],
+            ),
+            (
+                "ts",
+                "function demo(value: Value = value()) { consume(value); }",
+                "Value",
+                &[U],
+            ),
+            (
+                "py",
+                "def demo(value: Value = value()): return value\n",
+                "value",
+                &[D, U, U],
+            ),
+            (
+                "py",
+                "def demo(value: Value): return value\n",
+                "value",
+                &[D, U],
+            ),
+            ("py", "obj.value = value\n", "value", &[U, U]),
+            (
+                "java",
+                "class Demo { Value value = value(); void run() { consume(value); } }",
+                "value",
+                &[D, U, U],
+            ),
+            (
+                "kt",
+                "fun demo(value: Value = value()) = consume(value)",
+                "value",
+                &[D, U, U],
+            ),
+        ];
+        let dir = tempfile::tempdir()?;
+        for (extension, source, query, expected) in cases {
+            let path = dir.path().join(format!("sample.{extension}"));
+            std::fs::write(&path, source)?;
+            let open = search_buffer(
+                &path,
+                source,
+                query,
+                SearchKind::Text,
+                &AtomicBool::new(false),
+            );
+            let disk = search(dir.path(), query, SearchKind::Text)?;
+            for results in [&open, &disk.locations] {
+                let categories: Vec<_> = results
+                    .iter()
+                    .filter(|hit| hit.path == path)
+                    .map(|hit| hit.category)
+                    .collect();
+                assert_eq!(&categories, expected, "{extension}: {source} / {query}");
+            }
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn locals_are_classified_as_declarations() {
         let source =
             "fn compute() {\n    let value = 1;\n    println!(\"{value}\");\n    value\n}\n";
@@ -1435,6 +1650,90 @@ mod tests {
         let results = search(root, "needle", SearchKind::Text)?;
         assert_eq!(results.locations.len(), 2);
         assert!(results.locations.iter().all(|r| paths.contains(&r.path)));
+        Ok(())
+    }
+
+    #[test]
+    fn global_ignore_adds_project_relative_rules_to_both_walkers_with_local_precedence()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("project");
+        let global = dir.path().join(".glimcode/.gitignore");
+        std::fs::create_dir_all(global.parent().unwrap())?;
+        for folder in [".git", "nested", "cache/empty", "generated"] {
+            std::fs::create_dir_all(root.join(folder))?;
+        }
+        std::fs::write(
+            &global,
+            "*.log\ncache/\n/root-only.txt\ngenerated/*.rs\n!keep.log\nreinclude.txt\n!local-only.txt\n",
+        )?;
+        std::fs::write(root.join(".gitignore"), "local-only.txt\n!reinclude.txt\n")?;
+        std::fs::write(root.join("nested/.gitignore"), "!nested.log\n")?;
+        let visible = [
+            "visible.txt",
+            "keep.log",
+            "reinclude.txt",
+            "nested/nested.log",
+            "nested/root-only.txt",
+        ];
+        let ignored = [
+            "debug.log",
+            "nested/debug.log",
+            "root-only.txt",
+            "local-only.txt",
+            "cache/hidden.txt",
+            "generated/output.rs",
+        ];
+        for name in visible.iter().chain(&ignored) {
+            std::fs::write(root.join(name), "needle\n")?;
+        }
+        let walk = workspace_walk_with_ignore(&root, Some(&global))?;
+        let serial = walk
+            .build()
+            .map(|entry| entry.map(|e| e.into_path()))
+            .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()?;
+        for name in visible {
+            assert!(serial.contains(&root.join(name)), "must include {name}");
+        }
+        for name in ignored {
+            assert!(!serial.contains(&root.join(name)), "must ignore {name}");
+        }
+        assert!(!serial.contains(&root.join("cache")));
+        assert!(!serial.contains(&root.join("cache/empty")));
+        let parallel = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        walk.build_parallel().run(|| {
+            let parallel = parallel.clone();
+            Box::new(move |entry| {
+                parallel.lock().unwrap().insert(entry.unwrap().into_path());
+                WalkState::Continue
+            })
+        });
+        assert_eq!(
+            serial,
+            *parallel.lock().unwrap(),
+            "file listing and parallel search must agree"
+        );
+        // Global defaults also apply to ordinary folders without a Git repository.
+        std::fs::remove_dir(root.join(".git"))?;
+        let paths = workspace_walk_with_ignore(&root, Some(&global))?
+            .build()
+            .map(|entry| entry.map(|e| e.into_path()))
+            .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()?;
+        assert!(!paths.contains(&root.join("debug.log")));
+        assert!(!paths.contains(&root.join("root-only.txt")));
+        // The next scan picks up edits or deletion without restarting the app.
+        std::fs::write(&global, "")?;
+        assert!(
+            workspace_walk_with_ignore(&root, Some(&global))?
+                .build()
+                .any(|entry| entry.is_ok_and(|e| e.path() == root.join("debug.log")))
+        );
+        std::fs::remove_file(&global)?;
+        assert!(
+            workspace_walk_with_ignore(&root, Some(&global))?
+                .build()
+                .any(|entry| entry.is_ok_and(|e| e.path() == root.join("debug.log")))
+        );
         Ok(())
     }
 
