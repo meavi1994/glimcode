@@ -123,7 +123,7 @@ Font and terminal preferences are stored in `~/.glimcode/settings.json`, includi
 
 ## Global ignore rules
 
-Glimcode creates `~/.glimcode/.gitignore` on startup. Add standard `.gitignore` patterns there to exclude files and folders from the project tree, file picker, Changed files view, and search (including open buffers and Git-changed files) in every project:
+Glimcode creates `~/.glimcode/.gitignore` on startup. Add standard `.gitignore` patterns there to exclude files and folders from the Changed files view and search (including open buffers and Git-changed files) in every project:
 
 ```gitignore
 *.log
@@ -131,7 +131,7 @@ Glimcode creates `~/.glimcode/.gitignore` on startup. Add standard `.gitignore` 
 generated/
 ```
 
-These rules supplement each project's ignore files. Project `.gitignore`, `.ignore`, and `.rgignore` rules take precedence, including `!` exceptions. Patterns starting with `/` are anchored to each project's root. The global rules also apply to folders without a Git repository. File lists refresh automatically after edits; new searches read the latest rules. Existing global rules are preserved when Glimcode starts.
+These rules supplement each project's ignore files. Project `.gitignore`, `.ignore`, and `.rgignore` rules take precedence, including `!` exceptions. Patterns starting with `/` are anchored to each project's root. The global rules also apply to folders without a Git repository. File lists refresh automatically after edits; new searches read the latest rules. Existing global rules are preserved when Glimcode starts. The full **All files** tree keeps globally ignored files and folders visible; project-local ignore rules still apply to that tree.
 
 ## Terminal
 

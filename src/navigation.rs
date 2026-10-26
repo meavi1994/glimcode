@@ -627,9 +627,10 @@ pub fn read_text_bounded(path: &Path, limit: usize) -> Result<String> {
     String::from_utf8(bytes).context("This file is not valid UTF-8")
 }
 
-/// Shared traversal rules for the explorer, file picker and project search.
+/// Browse all project paths using local ignore rules. Global Glimcode rules
+/// filter Changed files and search, without hiding files from project browsing.
 fn workspace_walk(root: &Path) -> Result<WalkBuilder> {
-    workspace_walk_with_ignore(root, crate::preferences::global_ignore_path().as_deref())
+    workspace_walk_with_ignore(root, None)
 }
 
 fn workspace_walk_with_ignore(root: &Path, global_ignore: Option<&Path>) -> Result<WalkBuilder> {
@@ -1795,6 +1796,32 @@ mod tests {
                 .build()
                 .any(|entry| entry.is_ok_and(|e| e.path() == root.join("debug.log")))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn full_project_listing_keeps_globally_ignored_paths_but_honors_local_rules() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(root.join("tmp/empty"))?;
+        std::fs::write(root.join("tmp/file.rs"), "needle\n")?;
+        std::fs::write(root.join("debug.log"), "needle\n")?;
+        std::fs::write(root.join("local.rs"), "needle\n")?;
+        std::fs::write(root.join(".gitignore"), "local.rs\n")?;
+        let global = dir.path().join("global.gitignore");
+        std::fs::write(&global, "**/tmp/\n*.log\n")?;
+        let paths = workspace_paths(&root)?;
+        assert!(paths.files.contains(&root.join("tmp/file.rs")));
+        assert!(paths.files.contains(&root.join("debug.log")));
+        assert!(paths.folders.contains(&root.join("tmp/empty")));
+        assert!(!paths.files.contains(&root.join("local.rs")));
+        let search_paths = workspace_walk_with_ignore(&root, Some(&global))?
+            .build()
+            .map(|entry| entry.map(|entry| entry.into_path()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert!(!search_paths.contains(&root.join("tmp/file.rs")));
+        assert!(!search_paths.contains(&root.join("debug.log")));
         Ok(())
     }
 
