@@ -210,12 +210,26 @@ impl Coder {
             .or_else(crate::session::last_project)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let mut app = Self::empty(root.canonicalize().unwrap_or(root));
-        app.terminal.load_settings();
+        let capturing =
+            cfg!(feature = "ui-capture") && std::env::var_os("CODER_CAPTURE_TO").is_some();
+        if capturing {
+            // Visual previews read preferences without creating or saving user state.
+            if let Some(settings) = crate::preferences::path()
+                .and_then(|path| crate::preferences::Settings::load(&path).ok())
+            {
+                app.terminal.settings = settings;
+            }
+        } else {
+            app.terminal.load_settings();
+        }
         app.terminal.settings.apply(&cc.egui_ctx);
-        app.session_store = crate::preferences::path().and_then(|path| {
-            path.parent()
-                .map(|parent| crate::session::Store::new(parent.join("projects")))
-        });
+        app.session_store = (!capturing)
+            .then(crate::preferences::path)
+            .flatten()
+            .and_then(|path| {
+                path.parent()
+                    .map(|parent| crate::session::Store::new(parent.join("projects")))
+            });
         app.restore_session();
         app.refresh_files();
         if let Some(file) = argument.filter(|p| p.is_file()) {
@@ -1455,7 +1469,7 @@ impl Coder {
         egui::SidePanel::left("worktrees-panel")
             .default_width(255.0)
             .width_range(200.0..=450.0)
-            .frame(egui::Frame::new().fill(chrome::PANEL).inner_margin(10))
+            .frame(egui::Frame::new().fill(chrome::SIDEBAR).inner_margin(10))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     chrome::heading_icon(ui, chrome::Icon::Branch, chrome::BLUE);
@@ -1525,7 +1539,7 @@ impl Coder {
             .width_range(160.0..=500.0)
             .frame(
                 egui::Frame::new()
-                    .fill(chrome::PANEL)
+                    .fill(chrome::SIDEBAR)
                     .inner_margin(egui::Margin::symmetric(9, 8)),
             )
             .show(ctx, |ui| {
@@ -1750,7 +1764,7 @@ impl Coder {
         egui::SidePanel::right("structure")
             .default_width(255.0)
             .width_range(180.0..=500.0)
-            .frame(egui::Frame::new().fill(chrome::PANEL).inner_margin(10))
+            .frame(egui::Frame::new().fill(chrome::SIDEBAR).inner_margin(10))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     chrome::heading_icon(ui, chrome::Icon::Structure, chrome::PURPLE);

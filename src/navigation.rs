@@ -777,19 +777,52 @@ pub fn search_workspace(
     buffers: Vec<(PathBuf, Option<String>)>,
     priority_paths: Vec<PathBuf>,
     cancelled: Arc<AtomicBool>,
+    emit: impl FnMut(SearchUpdate),
+) {
+    let global_ignore = crate::preferences::global_ignore_path();
+    search_workspace_with_ignore_file(
+        root,
+        query,
+        kind,
+        exclude_tests,
+        buffers,
+        priority_paths,
+        cancelled,
+        global_ignore.as_deref(),
+        emit,
+    );
+}
+
+fn search_workspace_with_ignore_file(
+    root: &Path,
+    query: &str,
+    kind: SearchKind,
+    exclude_tests: bool,
+    buffers: Vec<(PathBuf, Option<String>)>,
+    priority_paths: Vec<PathBuf>,
+    cancelled: Arc<AtomicBool>,
+    global_ignore: Option<&Path>,
     mut emit: impl FnMut(SearchUpdate),
 ) {
     if cancelled.load(Ordering::Relaxed) {
         return;
     }
     let mut remaining = MAX_RESULTS;
+    let mut ignores = match crate::ignore_rules::GlobalIgnores::load(root, global_ignore) {
+        Ok(ignores) => ignores,
+        Err(error) => {
+            emit(SearchUpdate::Failed(format!("{error:#}")));
+            return;
+        }
+    };
     let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut excluded = std::collections::HashSet::new();
     for (path, source) in buffers {
         if cancelled.load(Ordering::Relaxed) {
             return;
         }
-        if !excluded.insert(path.clone())
+        if ignores.is_ignored(&path)
+            || !excluded.insert(path.clone())
             || (exclude_tests && is_test_search_path(root, &canonical_root, &path))
         {
             continue;
@@ -820,7 +853,8 @@ pub fn search_workspace(
         if cancelled.load(Ordering::Relaxed) {
             return;
         }
-        if !excluded.insert(path.clone())
+        if ignores.is_ignored(&path)
+            || !excluded.insert(path.clone())
             || (exclude_tests && is_test_search_path(root, &canonical_root, &path))
         {
             continue;
@@ -840,7 +874,7 @@ pub fn search_workspace(
         }
     }
     // Project search starts only after editor snapshots and Git-changed files are delivered.
-    match search_stream(
+    match search_stream_with_ignore_file(
         root,
         query,
         kind,
@@ -848,6 +882,7 @@ pub fn search_workspace(
         &excluded,
         remaining,
         cancelled.clone(),
+        global_ignore,
         |batch| emit(SearchUpdate::Project(batch)),
     ) {
         Ok(truncated) if !cancelled.load(Ordering::Relaxed) => {
@@ -1021,6 +1056,7 @@ fn is_test_search_path(root: &Path, canonical_root: &Path, path: &Path) -> bool 
     )
 }
 
+#[cfg(any(test, feature = "ui-capture"))]
 fn search_stream(
     root: &Path,
     query: &str,
@@ -1029,6 +1065,31 @@ fn search_stream(
     excluded: &std::collections::HashSet<PathBuf>,
     limit: usize,
     cancelled: Arc<AtomicBool>,
+    emit: impl FnMut(Vec<Location>),
+) -> Result<bool> {
+    let global_ignore = crate::preferences::global_ignore_path();
+    search_stream_with_ignore_file(
+        root,
+        query,
+        kind,
+        exclude_tests,
+        excluded,
+        limit,
+        cancelled,
+        global_ignore.as_deref(),
+        emit,
+    )
+}
+
+fn search_stream_with_ignore_file(
+    root: &Path,
+    query: &str,
+    kind: SearchKind,
+    exclude_tests: bool,
+    excluded: &std::collections::HashSet<PathBuf>,
+    limit: usize,
+    cancelled: Arc<AtomicBool>,
+    global_ignore: Option<&Path>,
     mut emit: impl FnMut(Vec<Location>),
 ) -> Result<bool> {
     if query.is_empty() || cancelled.load(Ordering::Relaxed) {
@@ -1058,7 +1119,7 @@ fn search_stream(
     // Cap concurrent syntax trees and I/O buffers, while using more than two cores
     // on larger machines. The bounded channel provides backpressure.
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get().min(4));
-    let walk = workspace_walk(root)?
+    let walk = workspace_walk_with_ignore(root, global_ignore)?
         .max_filesize(Some(MAX_FILE_BYTES))
         .threads(threads)
         .build_parallel();
@@ -1733,6 +1794,89 @@ mod tests {
             workspace_walk_with_ignore(&root, Some(&global))?
                 .build()
                 .any(|entry| entry.is_ok_and(|e| e.path() == root.join("debug.log")))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn global_rules_filter_open_buffers_changed_files_and_disk_search_consistently() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("tmp/project");
+        for folder in [".git", "tmp", "nested/tmp", "nested"] {
+            std::fs::create_dir_all(root.join(folder))?;
+        }
+        let global = dir.path().join("global.gitignore");
+        std::fs::write(&global, "**/tmp/\n*.log\n/root-only.rs\n!keep.log\n")?;
+        std::fs::write(root.join(".gitignore"), "!local.log\n")?;
+        std::fs::write(root.join("nested/.gitignore"), "!nested.log\n")?;
+        let visible = [
+            "open.rs",
+            "changed.rs",
+            "project.rs",
+            "keep.log",
+            "local.log",
+            "nested/nested.log",
+            "nested/root-only.rs",
+        ];
+        let ignored = [
+            "tmp/tracked.rs",
+            "nested/tmp/changed.rs",
+            "debug.log",
+            "root-only.rs",
+        ];
+        for name in visible.iter().chain(&ignored) {
+            std::fs::write(root.join(name), "// needle disk\n")?;
+        }
+        let mut updates = Vec::new();
+        search_workspace_with_ignore_file(
+            &root,
+            "needle",
+            SearchKind::Text,
+            false,
+            vec![
+                (root.join("open.rs"), Some("// needle unsaved\n".into())),
+                (
+                    root.join("tmp/tracked.rs"),
+                    Some("// needle hidden\n".into()),
+                ),
+                (
+                    root.join("nested/tmp/new.rs"),
+                    Some("// needle unsaved hidden\n".into()),
+                ),
+            ],
+            vec![
+                root.join("changed.rs"),
+                root.join("nested/tmp/changed.rs"),
+                root.join("debug.log"),
+                root.join("root-only.rs"),
+            ],
+            Arc::new(AtomicBool::new(false)),
+            Some(&global),
+            |update| updates.push(update),
+        );
+        let mut rows = Vec::new();
+        for update in updates {
+            match update {
+                SearchUpdate::OpenFiles(batch) | SearchUpdate::Project(batch) => rows.extend(batch),
+                SearchUpdate::Failed(error) => panic!("{error}"),
+                SearchUpdate::Finished { truncated } => assert!(!truncated),
+            }
+        }
+        let expected: std::collections::BTreeSet<_> =
+            visible.iter().map(|path| root.join(path)).collect();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.path.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(rows.len(), visible.len());
+        assert!(
+            rows.iter()
+                .find(|row| row.path == root.join("open.rs"))
+                .unwrap()
+                .preview
+                .contains("unsaved")
         );
         Ok(())
     }

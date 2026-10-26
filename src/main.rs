@@ -10,6 +10,7 @@ mod folding;
 mod git;
 mod git_view;
 mod highlighting;
+mod ignore_rules;
 mod markdown;
 mod markdown_images;
 mod navigation;

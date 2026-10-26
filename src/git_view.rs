@@ -913,6 +913,16 @@ impl GitTool {
 }
 /// Use the same status precedence in Project and Changes, including unsaved buffers.
 pub fn tree_files(repo: &Repository, dirty: &[PathBuf]) -> Vec<git::ChangedFile> {
+    crate::ignore_rules::with_global_ignores(&repo.root, |ignores| {
+        tree_files_with_ignores(repo, dirty, ignores)
+    })
+}
+
+fn tree_files_with_ignores(
+    repo: &Repository,
+    dirty: &[PathBuf],
+    ignores: &mut crate::ignore_rules::GlobalIgnores,
+) -> Vec<git::ChangedFile> {
     let mut files = repo.files.clone();
     for path in dirty {
         if let Ok(path) = path.strip_prefix(&repo.root) {
@@ -927,6 +937,7 @@ pub fn tree_files(repo: &Repository, dirty: &[PathBuf]) -> Vec<git::ChangedFile>
             }
         }
     }
+    files.retain(|file| !ignores.is_ignored(&repo.root.join(&file.path)));
     files
 }
 
@@ -2196,6 +2207,81 @@ fn review_rows(rows: &[diff::Row], full: bool) -> Vec<ReviewRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_tree_filters_global_patterns_for_git_entries_and_unsaved_files() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let global = root.join("global.gitignore");
+        std::fs::write(&global, "**/tmp/\n*.log\n/root-only.rs\n!keep.log\n")?;
+        let repo = Repository {
+            root: root.into(),
+            branch: "main".into(),
+            head: String::new(),
+            base: "main".into(),
+            merge_base: None,
+            branches: vec![],
+            remote: None,
+            files: vec![
+                git::ChangedFile {
+                    path: "tmp/tracked.rs".into(),
+                    committed: true,
+                    ..Default::default()
+                },
+                git::ChangedFile {
+                    path: "nested/tmp/deleted.rs".into(),
+                    deleted: true,
+                    ..Default::default()
+                },
+                git::ChangedFile {
+                    path: "debug.log".into(),
+                    uncommitted: true,
+                    ..Default::default()
+                },
+                git::ChangedFile {
+                    path: "root-only.rs".into(),
+                    added: true,
+                    ..Default::default()
+                },
+                git::ChangedFile {
+                    path: "src/main.rs".into(),
+                    committed: true,
+                    ..Default::default()
+                },
+                git::ChangedFile {
+                    path: "keep.log".into(),
+                    uncommitted: true,
+                    ..Default::default()
+                },
+            ],
+        };
+        let dirty = [
+            root.join("tmp/unsaved.rs"),
+            root.join("src/debug.log"),
+            root.join("src/new.rs"),
+        ];
+        let mut ignores = crate::ignore_rules::GlobalIgnores::load(root, Some(&global))?;
+        let files = tree_files_with_ignores(&repo, &dirty, &mut ignores);
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![
+                Path::new("src/main.rs"),
+                Path::new("keep.log"),
+                Path::new("src/new.rs")
+            ]
+        );
+        assert_eq!(ChangeTree::build(&files, "", false).file_count(), 3);
+        assert_eq!(
+            repo.files.len(),
+            6,
+            "filtering the UI must preserve the Git snapshot"
+        );
+        Ok(())
+    }
     fn review_fixture(before: &str, after: &str) -> Review {
         let path = PathBuf::from("sample.rs");
         let rows = diff::compare(before, after);

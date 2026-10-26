@@ -1,15 +1,16 @@
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, text::LayoutJob};
 use std::path::Path;
 
-pub const EDITOR: Color32 = Color32::from_rgb(24, 29, 39);
-pub const PANEL: Color32 = Color32::from_rgb(20, 25, 34);
-pub const HEADER: Color32 = Color32::from_rgb(32, 40, 53);
-pub const BORDER: Color32 = Color32::from_rgb(42, 51, 65);
+pub const EDITOR: Color32 = Color32::from_rgb(27, 29, 33);
+pub const PANEL: Color32 = Color32::from_rgb(31, 33, 37);
+pub const SIDEBAR: Color32 = Color32::from_rgb(35, 37, 41);
+pub const HEADER: Color32 = Color32::from_rgb(42, 44, 49);
+pub const BORDER: Color32 = Color32::from_rgb(53, 56, 62);
 pub const TEXT: Color32 = Color32::from_rgb(222, 225, 233);
 pub const MUTED: Color32 = Color32::from_rgb(148, 154, 169);
 pub const BLUE: Color32 = Color32::from_rgb(110, 168, 254);
-pub const SELECTED: Color32 = Color32::from_rgb(32, 50, 73);
-pub const TABS: Color32 = Color32::from_rgb(16, 21, 29);
+pub const SELECTED: Color32 = Color32::from_rgb(43, 60, 82);
+pub const TABS: Color32 = PANEL;
 
 pub fn install(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -1055,7 +1056,7 @@ pub fn dialog_button(ui: &mut egui::Ui, label: &str, accent: Option<Color32>) ->
 
 pub const GREEN: Color32 = Color32::from_rgb(112, 190, 148);
 pub const PURPLE: Color32 = Color32::from_rgb(178, 153, 225);
-pub const ACTIVE_TAB: Color32 = Color32::from_rgb(28, 36, 49);
+pub const ACTIVE_TAB: Color32 = EDITOR;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Icon {

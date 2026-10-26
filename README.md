@@ -29,7 +29,7 @@ If an AI agent handles much of your typing, you still need to find the right fil
 - **Multiple worktrees, one workspace.** Create, switch, and safely remove Git worktrees from the left panel, keeping each folder’s open files and live terminals when switching.
 - **The tools beside your code.** Git diffs and blame, a native terminal, editable CSV/TSV grids, and Markdown previews.
 
-Add shared ignore rules to `~/.glimcode/.gitignore` to filter the file tree, file picker, and project-wide search across all projects, alongside each project’s local ignore rules. The file is created automatically on startup.
+Add shared ignore rules to `~/.glimcode/.gitignore` to filter the file tree, file picker, Changed files view, and search across all projects, alongside each project’s local ignore rules. The file is created automatically on startup.
 
 Search uses the official `grep` library and `ignore` walker directly, with up to four background search workers, bounded result queues, and cancellation. It does not launch an external search process or parse command-line JSON output.
 

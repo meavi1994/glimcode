@@ -2516,7 +2516,7 @@ mod tests {
             parser.process(&[*byte]);
         }
         assert_eq!(parser.callbacks().replies,
-            b"\x1b]11;rgb:1818/1d1d/2727\x1b\\\x1b[>0;0;0c\x1b[8;30;100t\x1b[?2004;2$y\x1b[?2026;0$y\x1b[?2004;1$y\x1b[?1004;1$y");
+            b"\x1b]11;rgb:1b1b/1d1d/2121\x1b\\\x1b[>0;0;0c\x1b[8;30;100t\x1b[?2004;2$y\x1b[?2026;0$y\x1b[?2004;1$y\x1b[?1004;1$y");
         assert!(parser.callbacks().focus_reporting);
         parser.process(b"\x1b[?1004l");
         assert!(!parser.callbacks().focus_reporting);
@@ -2673,7 +2673,7 @@ mod tests {
     #[test]
     fn real_pty_answers_interactive_startup_queries() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let expected = b"\x1b]11;rgb:1818/1d1d/2727\x1b\\\x1b[>0;0;0c\x1b[?2004;2$y";
+        let expected = b"\x1b]11;rgb:1b1b/1d1d/2121\x1b\\\x1b[>0;0;0c\x1b[?2004;2$y";
         let script = format!(
             r#"stty raw -echo; printf '\033]11;?\007\033[>c\033[?2004$p'; reply=$(dd bs=1 count={} 2>/dev/null | od -An -tx1); stty sane; printf 'PROBE:%s:DONE\n' "$reply""#,
             expected.len()

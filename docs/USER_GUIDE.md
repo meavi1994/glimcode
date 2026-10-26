@@ -123,7 +123,7 @@ Font and terminal preferences are stored in `~/.glimcode/settings.json`, includi
 
 ## Global ignore rules
 
-Glimcode creates `~/.glimcode/.gitignore` on startup. Add standard `.gitignore` patterns there to exclude files and folders from the project tree, file picker, and project-wide disk searches in every project:
+Glimcode creates `~/.glimcode/.gitignore` on startup. Add standard `.gitignore` patterns there to exclude files and folders from the project tree, file picker, Changed files view, and search (including open buffers and Git-changed files) in every project:
 
 ```gitignore
 *.log

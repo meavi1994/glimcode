@@ -329,13 +329,12 @@ impl Manager {
                 self.run(root, |_| Ok(()), ui.ctx());
             }
             self.update_default_path(root);
-            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.spacing_mut().item_spacing.y = 6.0;
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("WORKSPACES")
-                        .size(10.0)
-                        .color(chrome::MUTED)
-                        .strong(),
+                    RichText::new(format!("{} worktrees", self.trees.len()))
+                        .size(11.0)
+                        .color(chrome::MUTED),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.rx.is_some() {
@@ -345,11 +344,6 @@ impl Manager {
                     {
                         self.run(root, |_| Ok(()), ui.ctx());
                     }
-                    ui.label(
-                        RichText::new(self.trees.len().to_string())
-                            .size(11.0)
-                            .color(chrome::MUTED),
-                    );
                 });
             });
             if ui
@@ -362,8 +356,8 @@ impl Manager {
                     )
                     .fill(chrome::HEADER)
                     .stroke(Stroke::new(1.0_f32, chrome::BORDER))
-                    .corner_radius(8)
-                    .min_size(egui::vec2(ui.available_width(), 36.0)),
+                    .corner_radius(5)
+                    .min_size(egui::vec2(ui.available_width(), 30.0)),
                 )
                 .clicked()
             {
@@ -384,7 +378,7 @@ impl Manager {
                             .file_name()
                             .unwrap_or(tree.path.as_os_str())
                             .to_string_lossy();
-                        let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 64.0));
+                        let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 56.0));
                         let body =
                             egui::Rect::from_min_max(rect.min, rect.max - egui::vec2(42.0, 0.0));
                         let response = ui.interact(
@@ -409,11 +403,11 @@ impl Manager {
                         } else if response.hovered() || response.has_focus() {
                             chrome::HEADER
                         } else {
-                            chrome::PANEL
+                            egui::Color32::TRANSPARENT
                         };
                         ui.painter().rect(
                             rect,
-                            9,
+                            5,
                             fill,
                             Stroke::new(
                                 1.0_f32,
@@ -428,8 +422,8 @@ impl Manager {
                         if current {
                             ui.painter().rect_filled(
                                 egui::Rect::from_min_size(
-                                    rect.min + egui::vec2(0.0, 14.0),
-                                    egui::vec2(3.0, 36.0),
+                                    rect.min + egui::vec2(0.0, 11.0),
+                                    egui::vec2(3.0, 34.0),
                                 ),
                                 2,
                                 chrome::BLUE,
@@ -444,10 +438,10 @@ impl Manager {
                                     FontId::proportional(13.0),
                                 );
                         ui.painter()
-                            .galley(rect.min + egui::vec2(13.0, 11.0), title, chrome::TEXT);
+                            .galley(rect.min + egui::vec2(13.0, 9.0), title, chrome::TEXT);
                         chrome::paint_icon(
                             ui.painter(),
-                            rect.min + egui::vec2(20.0, 41.0),
+                            rect.min + egui::vec2(20.0, 36.0),
                             chrome::Icon::Branch,
                             chrome::MUTED,
                         );
@@ -459,13 +453,13 @@ impl Manager {
                                 FontId::proportional(11.0),
                             );
                         ui.painter().galley(
-                            rect.min + egui::vec2(34.0, 35.0),
+                            rect.min + egui::vec2(34.0, 30.0),
                             branch,
                             chrome::MUTED,
                         );
                         if current || unsaved {
                             ui.painter().circle_filled(
-                                egui::pos2(rect.right() - 22.0, rect.top() + 44.0),
+                                egui::pos2(rect.right() - 22.0, rect.top() + 38.0),
                                 3.0,
                                 if unsaved {
                                     chrome::WARNING
@@ -627,7 +621,7 @@ mod tests {
         let first = label(&output, "main").unwrap();
         assert!(create.y < first.y);
         let second = label(&output, "feature-1").unwrap();
-        assert!(second.y - first.y >= 64.0, "worktree rows must not overlap");
+        assert!(second.y - first.y >= 56.0, "worktree rows must not overlap");
         let menu = label(&output, "···").unwrap();
         let click = |manager: &mut Manager, point| {
             frame(
