@@ -90,7 +90,7 @@ pub struct GitTool {
     detail_note: Option<String>,
     description_cache: egui_commonmark::CommonMarkCache,
     filter: String,
-    include_tests: bool,
+    pub include_tests: bool,
 }
 impl GitTool {
     pub fn resize_windows(&self) -> Vec<egui::Id> {

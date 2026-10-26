@@ -956,7 +956,9 @@ impl Coder {
             match result {
                 Ok(paths) => {
                     if self.files != paths.files || self.folders != paths.folders {
-                        self.tree.refresh(&self.root, &paths.files, &paths.folders);
+                        let mut tree_files = paths.files.clone();
+                        tree_files.extend(self.git_colors.1.keys().cloned());
+                        self.tree.refresh(&self.root, &tree_files, &paths.folders);
                         self.files = paths.files;
                         self.folders = paths.folders;
                     }
@@ -1531,6 +1533,9 @@ impl Coder {
                         .collect::<std::collections::BTreeMap<_, _>>()
                 })
                 .unwrap_or_default();
+            let mut tree_files = self.files.clone();
+            tree_files.extend(colors.keys().cloned());
+            self.tree.refresh(&self.root, &tree_files, &self.folders);
             self.git_colors = (colors_key, Arc::new(colors));
         }
         let colors = self.git_colors.1.clone();
@@ -1567,21 +1572,46 @@ impl Coder {
                     .as_ref()
                     .map(|repo| crate::git_view::tree_files(repo, &dirty).len())
                     .unwrap_or(0);
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.files_changed_only, false, "All files");
-                    ui.selectable_value(
-                        &mut self.files_changed_only,
-                        true,
-                        format!("Changed ({changed_count})"),
-                    );
-                });
-                ui.separator();
-                git_action = self
-                    .git
-                    .content(ui, &self.root, &dirty, self.files_changed_only);
-                if self.files_changed_only {
-                    return;
-                }
+                egui::Frame::new()
+                    .fill(chrome::PANEL)
+                    .corner_radius(6)
+                    .inner_margin(3)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        let width = (ui.available_width() - 3.0) / 2.0;
+                        ui.horizontal(|ui| {
+                            for (changed_only, label) in [
+                                (false, "All files".to_owned()),
+                                (true, format!("Changed · {changed_count}")),
+                            ] {
+                                let selected = self.files_changed_only == changed_only;
+                                let response = ui.add_sized(
+                                    egui::vec2(width, 25.0),
+                                    egui::Button::selectable(
+                                        selected,
+                                        RichText::new(&label).size(12.0).color(if selected {
+                                            chrome::TEXT
+                                        } else {
+                                            chrome::MUTED
+                                        }),
+                                    )
+                                    .fill(if selected {
+                                        chrome::HEADER
+                                    } else {
+                                        chrome::PANEL
+                                    })
+                                    .stroke(egui::Stroke::NONE)
+                                    .corner_radius(4)
+                                    .wrap_mode(egui::TextWrapMode::Truncate),
+                                );
+                                if response.on_hover_text(label).clicked() {
+                                    self.files_changed_only = changed_only;
+                                }
+                            }
+                        });
+                    });
+                ui.add_space(6.0);
+                git_action = self.git.content(ui, &self.root, &dirty, false);
                 ui.horizontal(|ui| {
                     for action in [0, 1, 2] {
                         if chrome::tree_button(ui, action).clicked() {
@@ -1597,9 +1627,16 @@ impl Coder {
                     }
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
-                            RichText::new(format!("{} files", self.files.len()))
-                                .size(11.0)
-                                .color(chrome::MUTED),
+                            RichText::new(format!(
+                                "{} files",
+                                if self.files_changed_only {
+                                    changed_count
+                                } else {
+                                    self.files.len()
+                                }
+                            ))
+                            .size(11.0)
+                            .color(chrome::MUTED),
                         );
                     });
                 });
@@ -1610,6 +1647,11 @@ impl Coder {
                             .hint_text("Filter files…")
                             .desired_width(f32::INFINITY),
                     );
+                }
+                if self.files_changed_only {
+                    let mut hide_tests = !self.git.include_tests;
+                    ui.checkbox(&mut hide_tests, RichText::new("Hide test files").size(12.0));
+                    self.git.include_tests = !hide_tests;
                 }
                 egui::ScrollArea::both()
                     .id_salt("files")
@@ -1626,7 +1668,7 @@ impl Coder {
                             .default_open(true)
                             .open(force_root.then_some(true))
                             .show(ui, |ui| {
-                                open = self.tree.show(
+                                open = self.tree.show_scoped(
                                     ui,
                                     &self.root,
                                     self.documents.get(self.active).map(|d| d.path.as_path()),
@@ -1636,6 +1678,8 @@ impl Coder {
                                         ""
                                     },
                                     &colors,
+                                    self.files_changed_only,
+                                    self.files_changed_only && !self.git.include_tests,
                                 );
                             })
                             .header_response
@@ -4199,25 +4243,65 @@ fn editor_diff_navigation(ui: &mut egui::Ui, targets: &[usize], line: usize) -> 
         return None;
     }
     let mut target = None;
-    egui::Frame::new()
-        .fill(chrome::EDITOR)
+    let bar = egui::Frame::new()
+        .fill(chrome::TABS)
         .inner_margin(egui::Margin::symmetric(10, 3))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.x = 6.0;
             ui.horizontal(|ui| {
-                for (label, next) in [("↑ Previous", false), ("↓ Next", true)] {
-                    if ui
-                        .add(egui::Button::new(label).small())
-                        .on_hover_text("Jump to a changed hunk against the branch base")
-                        .clicked()
-                    {
-                        target = editor_diff_target(targets, line, next);
-                    }
-                }
-                let current = targets.partition_point(|target| *target <= line);
-                ui.weak(format!("{} / {} hunks", current, targets.len()));
+                ui.label(
+                    RichText::new("Branch changes")
+                        .size(11.5)
+                        .color(chrome::MUTED),
+                )
+                .on_hover_text("Changes in this file against the branch base");
+                egui::Frame::new()
+                    .fill(chrome::PANEL)
+                    .corner_radius(5)
+                    .inner_margin(2)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        ui.horizontal(|ui| {
+                            for (label, next, hint) in
+                                [("↑", false, "Previous change"), ("↓", true, "Next change")]
+                            {
+                                let enabled = if next {
+                                    targets.last().is_some_and(|last| line < *last)
+                                } else {
+                                    targets.first().is_some_and(|first| line > *first)
+                                };
+                                if ui
+                                    .add_enabled(
+                                        enabled,
+                                        egui::Button::new(RichText::new(label).size(15.0))
+                                            .min_size(egui::vec2(24.0, 22.0))
+                                            .frame(false),
+                                    )
+                                    .on_hover_text(hint)
+                                    .clicked()
+                                {
+                                    target = editor_diff_target(targets, line, next);
+                                }
+                            }
+                            let current = targets.partition_point(|target| *target <= line);
+                            ui.add_space(3.0);
+                            ui.label(
+                                RichText::new(format!("{current} / {}", targets.len()))
+                                    .size(11.5)
+                                    .color(chrome::TEXT),
+                            )
+                            .on_hover_text("Current change / total changes in this file");
+                            ui.add_space(4.0);
+                        });
+                    });
             });
         });
+    ui.painter().hline(
+        bar.response.rect.x_range(),
+        bar.response.rect.bottom(),
+        egui::Stroke::new(1.0_f32, chrome::BORDER),
+    );
     target
 }
 
@@ -5949,7 +6033,7 @@ mod tests {
             .shapes
             .iter()
             .find_map(|shape| match &shape.shape {
-                egui::Shape::Text(text) if text.galley.text() == "↓ Next" => {
+                egui::Shape::Text(text) if text.galley.text() == "↓" => {
                     Some(text.pos + text.galley.size() / 2.0)
                 }
                 _ => None,
@@ -6584,7 +6668,23 @@ mod tests {
         for _ in 0..3 {
             frame(&mut app, vec![]);
         }
+        app.open(changed.clone(), None);
         let output = frame(&mut app, vec![]);
+        let selected = |output: &egui::FullOutput, label: &str| {
+            let position = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => Some(text.pos),
+                    _ => None,
+                })
+                .expect("file row is visible");
+            output.shapes.iter().any(|shape| matches!(
+                &shape.shape,
+                egui::Shape::Rect(rect) if rect.fill == chrome::SELECTED && rect.rect.contains(position)
+            ))
+        };
+        assert!(selected(&output, "changed.txt"));
         let has = |output: &egui::FullOutput, label: &str| {
             output.shapes.iter().any(|shape|
             matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label))
@@ -6594,7 +6694,7 @@ mod tests {
             .shapes
             .iter()
             .find_map(|shape| match &shape.shape {
-                egui::Shape::Text(text) if text.galley.text() == "Changed (2)" => {
+                egui::Shape::Text(text) if text.galley.text() == "Changed · 2" => {
                     Some(text.pos + text.galley.size() / 2.0)
                 }
                 _ => None,
@@ -6617,7 +6717,17 @@ mod tests {
         assert!(app.files_changed_only);
         let output = frame(&mut app, vec![]);
         assert!(!has(&output, "normal.txt"));
-        assert!(has(&output, "D  deleted.txt"));
+        assert!(has(&output, "deleted.txt"));
+        assert!(
+            selected(&output, "changed.txt"),
+            "Changed must retain the same selection highlight"
+        );
+        app.show_file_filter = true;
+        app.file_filter = "deleted".into();
+        let filtered = frame(&mut app, vec![]);
+        assert!(has(&filtered, "deleted.txt"));
+        assert!(!has(&filtered, "changed.txt"));
+        app.file_filter.clear();
         assert!(
             ctx.read_response(egui::Id::new("git-changes-panel").with("__resize"))
                 .is_none()

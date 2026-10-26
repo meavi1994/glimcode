@@ -174,6 +174,7 @@ impl FileTree {
         *self = fresh;
     }
 
+    #[cfg(test)]
     fn matches(&self, root: &Path, filter: &crate::chrome::CaseFilter) -> bool {
         self.file.as_ref().is_some_and(|path| {
             filter.matches(
@@ -188,6 +189,33 @@ impl FileTree {
             .any(|child| child.matches(root, filter))
     }
 
+    fn matches_scope(
+        &self,
+        root: &Path,
+        filter: &crate::chrome::CaseFilter,
+        colors: &BTreeMap<PathBuf, egui::Color32>,
+        changed_only: bool,
+        hide_tests: bool,
+    ) -> bool {
+        if !changed_only && filter.is_empty() && !hide_tests {
+            return true;
+        }
+        self.file.as_ref().is_some_and(|path| {
+            (!changed_only || colors.contains_key(path))
+                && (!hide_tests || !crate::test_files::is_test_file(path))
+                && filter.matches(
+                    path.strip_prefix(root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .as_ref(),
+                )
+        }) || self
+            .children
+            .values()
+            .any(|child| child.matches_scope(root, filter, colors, changed_only, hide_tests))
+    }
+
+    #[cfg(test)]
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -195,6 +223,21 @@ impl FileTree {
         active: Option<&Path>,
         filter: &str,
         colors: &BTreeMap<PathBuf, egui::Color32>,
+    ) -> Option<PathBuf> {
+        self.show_scoped(ui, root, active, filter, colors, false, false)
+    }
+
+    /// The same tree and row renderer serve both file scopes. Status entries may
+    /// include deleted files which are absent from the on-disk project index.
+    pub fn show_scoped(
+        &mut self,
+        ui: &mut egui::Ui,
+        root: &Path,
+        active: Option<&Path>,
+        filter: &str,
+        colors: &BTreeMap<PathBuf, egui::Color32>,
+        changed_only: bool,
+        hide_tests: bool,
     ) -> Option<PathBuf> {
         let requested = std::mem::take(&mut self.reveal_requested);
         let active_changed = self.last_active.as_deref() != active;
@@ -215,6 +258,8 @@ impl FileTree {
             &crate::chrome::CaseFilter::new(filter),
             requested || active_changed,
             colors,
+            changed_only,
+            hide_tests,
         );
         if opened.is_some() {
             self.reveal_target = None;
@@ -231,12 +276,14 @@ impl FileTree {
         filter: &crate::chrome::CaseFilter,
         reveal: bool,
         colors: &BTreeMap<PathBuf, egui::Color32>,
+        changed_only: bool,
+        hide_tests: bool,
     ) -> Option<PathBuf> {
         let mut opened = None;
         for is_file in [false, true] {
             for (name, child) in &mut self.children {
                 if child.file.is_some() != is_file
-                    || (!filter.is_empty() && !child.matches(root, filter))
+                    || !child.matches_scope(root, filter, colors, changed_only, hide_tests)
                 {
                     continue;
                 }
@@ -288,7 +335,9 @@ impl FileTree {
                             self.action = Some(action);
                         }
                     });
-                    if response.on_hover_text(file.display().to_string()).clicked() {
+                    if response.on_hover_text(file.display().to_string()).clicked()
+                        && colors.get(file) != Some(&crate::git_view::deleted())
+                    {
                         opened = Some(file.clone());
                     }
                 } else {
@@ -308,9 +357,17 @@ impl FileTree {
                             open_override
                         },
                         |ui| {
-                            if let Some(file) =
-                                child.show_children(ui, root, &path, active, filter, reveal, colors)
-                            {
+                            if let Some(file) = child.show_children(
+                                ui,
+                                root,
+                                &path,
+                                active,
+                                filter,
+                                reveal,
+                                colors,
+                                changed_only,
+                                hide_tests,
+                            ) {
                                 opened = Some(file);
                             }
                         },
