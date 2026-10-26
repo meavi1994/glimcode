@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum FileAction {
     NewFile(PathBuf),
     Rename(PathBuf),
@@ -42,15 +42,27 @@ pub fn context_menu(
         }
     }
     ui.separator();
-    if folder && ui.button("New file…").clicked() {
+    if folder
+        && ui
+            .add_enabled(path.is_dir(), egui::Button::new("New file…"))
+            .clicked()
+    {
         action = Some(FileAction::NewFile(path.into()));
         ui.close();
     }
-    if path != root && ui.button("Rename…").clicked() {
+    if path != root
+        && ui
+            .add_enabled(path.exists(), egui::Button::new("Rename…"))
+            .clicked()
+    {
         action = Some(FileAction::Rename(path.into()));
         ui.close();
     }
-    if !folder && ui.button("Delete file…").clicked() {
+    if !folder
+        && ui
+            .add_enabled(path.is_file(), egui::Button::new("Delete file…"))
+            .clicked()
+    {
         action = Some(FileAction::Delete(path.into()));
         ui.close();
     }

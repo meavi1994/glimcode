@@ -39,12 +39,14 @@ fn received<T>(rx: &Option<Job<T>>) -> Option<Result<T, String>> {
 pub enum ChangeAction {
     Open(PathBuf),
     Diff(PathBuf),
+    File(crate::explorer::FileAction),
 }
 impl ChangeAction {
     fn absolute(self, root: &Path) -> Self {
         match self {
             Self::Open(path) => Self::Open(root.join(path)),
             Self::Diff(path) => Self::Diff(root.join(path)),
+            Self::File(action) => Self::File(action),
         }
     }
 }
@@ -671,7 +673,7 @@ impl GitTool {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         selected = tree
-                            .show(ui, &files, Path::new(""))
+                            .show(ui, &files, Path::new(""), &repo.root)
                             .map(|action| action.absolute(&repo.root));
                     });
                 if files.is_empty() {
@@ -1003,6 +1005,7 @@ impl ChangeTree {
         ui: &mut egui::Ui,
         files: &[git::ChangedFile],
         directory: &Path,
+        root: &Path,
     ) -> Option<ChangeAction> {
         let mut selected = None;
         for is_file in [false, true] {
@@ -1070,20 +1073,33 @@ impl ChangeTree {
                             selected = Some(ChangeAction::Diff(file.path.clone()));
                             ui.close();
                         }
+                        ui.separator();
+                        if let Some(action) =
+                            crate::explorer::context_menu(ui, root, &root.join(&file.path), false)
+                        {
+                            selected = Some(ChangeAction::File(action));
+                        }
                     });
                 } else {
-                    chrome::folder_header(
+                    let header = chrome::folder_header(
                         ui,
                         ui.make_persistent_id(("git-folder", &path)),
                         &name,
                         true,
                         None,
                         |ui| {
-                            if let Some(path) = node.show(ui, files, &path) {
+                            if let Some(path) = node.show(ui, files, &path, root) {
                                 selected = Some(path);
                             }
                         },
                     );
+                    header.context_menu(|ui| {
+                        if let Some(action) =
+                            crate::explorer::context_menu(ui, root, &root.join(&path), true)
+                        {
+                            selected = Some(ChangeAction::File(action));
+                        }
+                    });
                 }
             }
         }
@@ -2828,7 +2844,7 @@ mod tests {
                             "",
                             &colors,
                         );
-                        changes.show(&mut columns[1], &files, Path::new(""));
+                        changes.show(&mut columns[1], &files, Path::new(""), root);
                     });
                 });
             });
@@ -3146,6 +3162,9 @@ mod tests {
     #[test]
     fn changed_file_click_opens_editor_and_context_menu_requests_diff() {
         use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
         let ctx = egui::Context::default();
         let files = vec![git::ChangedFile {
             path: "main.rs".into(),
@@ -3169,7 +3188,7 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        action = tree.show(ui, &files, Path::new(""));
+                        action = tree.show(ui, &files, Path::new(""), root);
                     });
                 },
             );
@@ -3205,7 +3224,40 @@ mod tests {
         );
         frame(event(point, egui::PointerButton::Secondary, true));
         frame(event(point, egui::PointerButton::Secondary, false));
-        let (output, _) = frame(vec![]);
+        let row_point = point;
+        let (mut output, _) = frame(vec![]);
+        for label in [
+            "Copy file name",
+            "Copy absolute path",
+            "Copy path from content root",
+            "Rename…",
+            "Delete file…",
+        ] {
+            assert!(
+                output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == label)),
+                "missing {label}"
+            );
+        }
+        let copy = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Copy absolute path" => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(event(copy, egui::PointerButton::Primary, true));
+        let copied = frame(event(copy, egui::PointerButton::Primary, false)).0;
+        assert!(copied.platform_output.commands.iter().any(|command| matches!(command,
+            egui::OutputCommand::CopyText(text) if text == &root.join("main.rs").to_string_lossy())));
+        frame(vec![]);
+        frame(vec![egui::Event::PointerMoved(row_point)]);
+        frame(event(row_point, egui::PointerButton::Secondary, true));
+        frame(event(row_point, egui::PointerButton::Secondary, false));
+        (output, _) = frame(vec![]);
         let point = output
             .shapes
             .iter()

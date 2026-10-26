@@ -1677,6 +1677,9 @@ impl Coder {
         ctx: &egui::Context,
     ) {
         match action {
+            crate::git_view::ChangeAction::File(action) => {
+                self.tree.action = Some(action);
+            }
             crate::git_view::ChangeAction::Open(path) => self.open(path, None),
             crate::git_view::ChangeAction::Diff(path) => {
                 let buffer = self
