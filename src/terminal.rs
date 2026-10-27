@@ -1,5 +1,7 @@
 //! Native PTY sessions, with bounded scrollback and background I/O.
 use crate::chrome;
+#[cfg(target_os = "macos")]
+mod macos;
 mod view;
 use anyhow::{Context, Result, bail};
 use eframe::egui::{self, Color32, FontId, Key, Modifiers};
@@ -1510,21 +1512,10 @@ fn cell_colors(
 /// cursor while dragging rather than routing a drop using a stale egui pointer.
 fn file_drop_position(ctx: &egui::Context) -> Option<egui::Pos2> {
     #[cfg(target_os = "macos")]
-    if let Some(window) = ctx.input(|i| i.viewport().inner_rect) {
-        #[repr(C)]
-        struct Point {
-            x: f64,
-            y: f64,
-        }
-        #[link(name = "CoreGraphics", kind = "framework")]
-        unsafe extern "C" {
-            fn CGEventGetLocation(event: *const std::ffi::c_void) -> Point;
-        }
-        // A null event queries the current cursor in global display points.
-        let point = unsafe { CGEventGetLocation(std::ptr::null()) };
-        return Some(
-            egui::pos2(point.x as f32, point.y as f32) / ctx.zoom_factor() - window.min.to_vec2(),
-        );
+    if let Some(window) = ctx.input(|i| i.viewport().inner_rect)
+        && let Some(cursor) = macos::cursor_position()
+    {
+        return Some(macos::window_position(cursor, window, ctx.zoom_factor()));
     }
     ctx.input(|i| i.pointer.hover_pos())
 }
@@ -3033,6 +3024,92 @@ mod tests {
         parser.process(b"\x1b[?1049l");
         assert_eq!(parser.screen().contents(), "red");
     }
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "manual image attachment smoke test; set GLIMCODE_TEST_CLI to Claude Code"]
+    fn installed_claude_accepts_a_dropped_screenshot_without_submitting() -> Result<()> {
+        let command = std::env::var("GLIMCODE_TEST_CLI").context("Set GLIMCODE_TEST_CLI")?;
+        let dir = tempfile::tempdir()?;
+        let path = dir
+            .path()
+            .join("Screenshot with spaces \u{202f} sample.png");
+        image::save_buffer(
+            &path,
+            &[255, 0, 0, 255].repeat(32 * 32),
+            32,
+            32,
+            image::ColorType::Rgba8,
+        )?;
+        let tab = Session::spawn(
+            1,
+            std::env::current_dir()?,
+            Settings {
+                shell: command,
+                ..Default::default()
+            },
+            egui::Context::default(),
+        );
+        assert!(tab.send(Command::Resize(PtySize {
+            rows: 40,
+            cols: 120,
+            ..FALLBACK_SIZE
+        })));
+        let start = Instant::now();
+        loop {
+            let state = tab.screen.lock().unwrap();
+            let output = state.parser.screen().contents();
+            if output.contains("Yes, I trust this folder") {
+                bail!(
+                    "Claude is waiting for folder trust. Complete that step manually in this project before running this smoke test."
+                );
+            }
+            if output.contains('❯') {
+                break;
+            }
+            assert!(
+                !state.exited && start.elapsed() < Duration::from_secs(12),
+                "Claude did not reach its input prompt; startup, trust or authentication needs attention"
+            );
+            drop(state);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let paths = dropped_file_paths(&[egui::DroppedFile {
+            path: Some(path),
+            ..Default::default()
+        }])?;
+        let mut bytes = vec![];
+        append_paste(
+            &mut bytes,
+            &paths,
+            tab.screen.lock().unwrap().parser.screen().bracketed_paste(),
+        );
+        assert!(tab.send(Command::Input(bytes)));
+        let start = Instant::now();
+        loop {
+            let state = tab.screen.lock().unwrap();
+            let output = state.parser.screen().contents();
+            if output.contains("[Image #1]") {
+                break;
+            }
+            assert!(
+                !state.exited && start.elapsed() < Duration::from_secs(10),
+                "Claude did not show an image attachment after receiving the dropped path; final prompt: {}",
+                output
+                    .lines()
+                    .rev()
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            drop(state);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     #[ignore = "manual CLI startup smoke test; set GLIMCODE_TEST_CLI to an interactive command"]
