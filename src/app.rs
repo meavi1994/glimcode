@@ -3686,7 +3686,9 @@ impl Coder {
         }
         if !blocked {
             self.terminal.shortcuts(ctx, &self.root);
-            self.git.review_shortcuts(ctx);
+            if !self.terminal.focused(ctx) {
+                self.git.review_shortcuts(ctx);
+            }
         }
         if !blocked && !self.terminal.focused(ctx) {
             self.shortcuts(ctx);

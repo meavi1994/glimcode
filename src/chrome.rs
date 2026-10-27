@@ -59,6 +59,38 @@ pub fn install(ctx: &egui::Context) {
                 .insert(0, name.into());
         }
     }
+    let bold_candidates = [
+        (
+            "/Applications/IntelliJ IDEA.app/Contents/jbr/Contents/Home/lib/fonts/JetBrainsMono-Bold.ttf",
+            0,
+        ),
+        (
+            "/Applications/IntelliJ IDEA CE.app/Contents/jbr/Contents/Home/lib/fonts/JetBrainsMono-Bold.ttf",
+            0,
+        ),
+        ("/System/Library/Fonts/Menlo.ttc", 1),
+        (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+            0,
+        ),
+        ("C:/Windows/Fonts/consolab.ttf", 0),
+    ];
+    if let Some((bytes, index)) = bold_candidates
+        .iter()
+        .find_map(|(path, index)| std::fs::read(path).ok().map(|bytes| (bytes, *index)))
+    {
+        let mut data = egui::FontData::from_owned(bytes);
+        data.index = index;
+        fonts
+            .font_data
+            .insert("terminal-bold".into(), std::sync::Arc::new(data));
+        let mut fallback = fonts.families[&egui::FontFamily::Monospace].clone();
+        fallback.insert(0, "terminal-bold".into());
+        fonts
+            .families
+            .insert(egui::FontFamily::Name("terminal-bold".into()), fallback);
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("terminal-bold-installed"), true));
+    }
     ctx.set_fonts(fonts);
     ctx.set_theme(egui::ThemePreference::Dark);
     ctx.set_visuals(egui::Visuals::dark());

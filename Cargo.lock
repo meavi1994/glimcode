@@ -886,8 +886,6 @@ dependencies = [
 [[package]]
 name = "egui-winit"
 version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec6687e5bb551702f4ad10ac428bab12acf9d53047ebb1082d4a0ed8c6251a29"
 dependencies = [
  "arboard",
  "bytemuck",
@@ -1441,6 +1439,7 @@ name = "glimcode"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "comrak",
  "csv",
  "eframe",
@@ -1450,6 +1449,7 @@ dependencies = [
  "grep",
  "ignore",
  "image",
+ "libc",
  "portable-pty",
  "pulldown-cmark",
  "regex",
@@ -4075,8 +4075,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vt100"
 version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
 dependencies = [
  "itoa",
  "unicode-width",

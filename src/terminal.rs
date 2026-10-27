@@ -1,5 +1,6 @@
 //! Native PTY sessions, with bounded scrollback and background I/O.
 use crate::chrome;
+mod view;
 use anyhow::{Context, Result, bail};
 use eframe::egui::{self, Color32, FontId, Key, Modifiers};
 use portable_pty::{ChildKiller, CommandBuilder, PtySize};
@@ -13,6 +14,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use view::{TerminalView, named_link};
 
 pub use crate::preferences::Settings;
 
@@ -138,12 +140,21 @@ struct Callbacks {
     replies: Vec<u8>,
     focus_reporting: bool,
     last_focus: Option<bool>,
+    synchronized: Option<(Instant, vt100::Screen)>,
 }
 impl vt100::Callbacks for Callbacks {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = clean_title(&String::from_utf8_lossy(title));
     }
-    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+    fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
+        if params.first() == Some(&b"8".as_slice()) {
+            let joined = params.get(2..).unwrap_or_default().join(&b';');
+            let target = std::str::from_utf8(&joined).unwrap_or("");
+            // Only expose safe browser destinations and local file links.
+            let valid = url::Url::parse(target)
+                .is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "file"));
+            screen.set_hyperlink(if valid { target } else { "" });
+        }
         if params.get(1) == Some(&b"?".as_slice()) {
             let color = match params.first().copied() {
                 Some(b"10") => Some(chrome::TEXT),
@@ -208,6 +219,15 @@ impl vt100::Callbacks for Callbacks {
                     .extend_from_slice(format!("\x1b[8;{rows};{cols}t").as_bytes());
             }
             (Some(b'?'), None, 'h' | 'l', _) => {
+                if params.iter().any(|p| p.first() == Some(&2026)) {
+                    if c == 'h' {
+                        if self.synchronized.is_none() {
+                            self.synchronized = Some((Instant::now(), screen.visible_snapshot()));
+                        }
+                    } else {
+                        self.synchronized = None;
+                    }
+                }
                 if params.iter().any(|p| p.first() == Some(&1004)) {
                     self.focus_reporting = c == 'h';
                     self.last_focus = None;
@@ -221,6 +241,7 @@ impl vt100::Callbacks for Callbacks {
                     1004 => Some(self.focus_reporting),
                     1049 => Some(screen.alternate_screen()),
                     2004 => Some(screen.bracketed_paste()),
+                    2026 => Some(self.synchronized.is_some()),
                     _ => None,
                 };
                 let status = enabled.map_or(0, |enabled| if enabled { 1 } else { 2 });
@@ -236,6 +257,24 @@ struct ScreenState {
     status: String,
     exited: bool,
     error: Option<String>,
+    revision: u64,
+}
+impl ScreenState {
+    fn expire_synchronized_output(&mut self) {
+        if self
+            .parser
+            .callbacks()
+            .synchronized
+            .as_ref()
+            .is_some_and(|(start, snapshot)| {
+                self.exited
+                    || start.elapsed() >= Duration::from_secs(1)
+                    || snapshot.size() != self.parser.screen().size()
+            })
+        {
+            self.parser.callbacks_mut().synchronized = None;
+        }
+    }
 }
 impl Default for ScreenState {
     fn default() -> Self {
@@ -244,6 +283,7 @@ impl Default for ScreenState {
             status: "Starting shell…".into(),
             exited: false,
             error: None,
+            revision: 0,
         }
     }
 }
@@ -274,6 +314,7 @@ struct Session {
     size: (u16, u16),
     selection: Option<((u16, u16), (u16, u16))>,
     scroll_remainder: f32,
+    view: TerminalView,
 }
 /// The size a shell falls back to when the interface never reports one.
 const FALLBACK_SIZE: PtySize = PtySize {
@@ -337,6 +378,7 @@ impl Session {
                 // an existing pty afterwards is not seen by the shell that is
                 // started with it.
                 let pair = portable_pty::native_pty_system().openpty(size)?;
+                configure_pty_input(pair.master.as_ref())?;
                 let mut reader = pair.master.try_clone_reader()?;
                 let mut writer = pair.master.take_writer()?;
                 // The screen starts at the fallback size, so it is told about
@@ -361,7 +403,11 @@ impl Session {
                             Ok(0) | Err(_) => break,
                             Ok(count) => count,
                         };
-                        output.lock().unwrap().parser.process(&buffer[..count]);
+                        {
+                            let mut state = output.lock().unwrap();
+                            state.parser.process(&buffer[..count]);
+                            state.revision = state.revision.wrapping_add(1);
+                        }
                         repaint.request_repaint();
                     }
                 });
@@ -432,12 +478,39 @@ impl Session {
             size: (0, 0),
             selection: None,
             scroll_remainder: 0.0,
+            view: TerminalView::default(),
         }
     }
     fn send(&self, command: Command) -> bool {
         self.tx.try_send(command).is_ok()
     }
 }
+
+/// Reserve Ctrl+S/Ctrl+Q for the foreground program instead of the tty's
+/// software flow control. Keep signals, echo, and canonical editing intact;
+/// shells and interactive programs manage those modes themselves.
+fn configure_pty_input(master: &dyn portable_pty::MasterPty) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let fd = master.as_raw_fd().context("PTY has no file descriptor")?;
+        let mut settings = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // The descriptor belongs to the live master and tcgetattr initializes
+        // the complete termios value on success.
+        if unsafe { libc::tcgetattr(fd, settings.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("Could not read PTY input settings");
+        }
+        let mut settings = unsafe { settings.assume_init() };
+        settings.c_iflag &= !(libc::IXON | libc::IXOFF);
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &settings) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("Could not configure PTY input");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = master;
+    Ok(())
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Relaxed);
@@ -533,6 +606,7 @@ impl Terminal {
         self.visible
             && self.tabs.get(self.active).is_some_and(|tab| {
                 ctx.memory(|m| m.has_focus(egui::Id::new(("terminal-input", tab.id))))
+                    || tab.view.find.focused(ctx)
             })
     }
     pub fn open_settings(&mut self) {
@@ -724,6 +798,23 @@ impl Terminal {
     pub fn shortcuts(&mut self, ctx: &egui::Context, root: &Path) {
         if !self.focused(ctx) {
             return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
+            let find = &mut self.tabs[self.active].view.find;
+            find.open = true;
+            find.focus = true;
+        }
+        if self.tabs[self.active].view.find.open {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.tabs[self.active].view.find.open = false;
+                let id = egui::Id::new(("terminal-input", self.tabs[self.active].id));
+                ctx.memory_mut(|memory| memory.request_focus(id));
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::G)) {
+                self.tabs[self.active].view.find.step = -1;
+            } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::G)) {
+                self.tabs[self.active].view.find.step = 1;
+            }
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T)) {
             self.new_tab(root, ctx);
@@ -1002,11 +1093,11 @@ fn key_bytes(key: Key, m: Modifiers, application: bool) -> Option<Vec<u8>> {
     }
     let plain = match key {
         Key::Enter => {
-            if m.alt {
-                "\x1b\r"
-            } else {
-                "\r"
+            if m.shift || m.ctrl {
+                let modifier = 1 + u8::from(m.shift) + 2 * u8::from(m.alt) + 4 * u8::from(m.ctrl);
+                return Some(format!("\x1b[13;{modifier}u").into_bytes());
             }
+            if m.alt { "\x1b\r" } else { "\r" }
         }
         Key::Tab => {
             if m.shift {
@@ -1283,20 +1374,89 @@ fn mouse_bytes(screen: &vt100::Screen, code: u8, point: (u16, u16), released: bo
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalStyle {
+    color: Color32,
+    bold: bool,
+    italic: bool,
+    strike: bool,
+    conceal: bool,
+}
+impl TerminalStyle {
+    fn from_cell(cell: &vt100::Cell, color: Color32) -> Self {
+        Self {
+            color: if cell.dim() {
+                color.gamma_multiply(0.6)
+            } else {
+                color
+            },
+            bold: cell.bold(),
+            italic: cell.italic(),
+            strike: cell.strikethrough(),
+            conceal: cell.conceal(),
+        }
+    }
+    fn format(self, ctx: &egui::Context, font: &FontId) -> egui::TextFormat {
+        let mut font = font.clone();
+        if self.bold
+            && ctx.data(|data| {
+                data.get_temp::<bool>(egui::Id::new("terminal-bold-installed"))
+                    .unwrap_or(false)
+            })
+        {
+            font.family = egui::FontFamily::Name("terminal-bold".into());
+        }
+        egui::TextFormat {
+            font_id: font,
+            color: if self.conceal {
+                Color32::TRANSPARENT
+            } else {
+                self.color
+            },
+            italics: self.italic,
+            strikethrough: if self.strike {
+                egui::Stroke::new(1.0_f32, self.color)
+            } else {
+                egui::Stroke::NONE
+            },
+            ..Default::default()
+        }
+    }
+}
+
 /// The text of one terminal row and the color of every run in it.
 ///
 /// Every cell contributes one character, so that the row keeps the columns of
 /// the grid. A cell that was never written is a blank.
+fn paint_terminal_run(
+    painter: &egui::Painter,
+    origin: egui::Pos2,
+    galley: Arc<egui::Galley>,
+    style: TerminalStyle,
+    ctx: &egui::Context,
+) {
+    painter.galley(origin, galley.clone(), style.color);
+    if style.bold
+        && !style.conceal
+        && !ctx.data(|data| {
+            data.get_temp::<bool>(egui::Id::new("terminal-bold-installed"))
+                .unwrap_or(false)
+        })
+    {
+        painter.galley(origin + egui::vec2(0.4, 0.0), galley, style.color);
+    }
+}
+
 fn row_runs(
     screen: &vt100::Screen,
     row: u16,
     cols: u16,
     selection: Option<((u16, u16), (u16, u16))>,
-) -> (String, Vec<(std::ops::Range<usize>, Color32)>) {
+) -> (String, Vec<(std::ops::Range<usize>, TerminalStyle)>) {
     let mut text = String::with_capacity(cols as usize);
-    let mut runs: Vec<(std::ops::Range<usize>, Color32)> = vec![];
+    let mut runs: Vec<(std::ops::Range<usize>, TerminalStyle)> = vec![];
     let mut start = 0usize;
-    let mut color: Option<Color32> = None;
+    let mut color: Option<TerminalStyle> = None;
     for col in 0..cols {
         let Some(c) = screen.cell(row, col) else {
             // A cell outside the screen is a blank, but the row still needs
@@ -1305,7 +1465,7 @@ fn row_runs(
             continue;
         };
         let (fg, _) = cell_colors(c, selection, row, col);
-        let cell_color = if c.dim() { fg.gamma_multiply(0.6) } else { fg };
+        let cell_color = TerminalStyle::from_cell(c, fg);
         match color {
             None => color = Some(cell_color),
             Some(current) if current != cell_color => {
@@ -1346,6 +1506,60 @@ fn cell_colors(
     (fg, bg)
 }
 
+/// External drags do not produce mouse-move events on macOS. Query the native
+/// cursor while dragging rather than routing a drop using a stale egui pointer.
+fn file_drop_position(ctx: &egui::Context) -> Option<egui::Pos2> {
+    #[cfg(target_os = "macos")]
+    if let Some(window) = ctx.input(|i| i.viewport().inner_rect) {
+        #[repr(C)]
+        struct Point {
+            x: f64,
+            y: f64,
+        }
+        #[link(name = "CoreGraphics", kind = "framework")]
+        unsafe extern "C" {
+            fn CGEventGetLocation(event: *const std::ffi::c_void) -> Point;
+        }
+        // A null event queries the current cursor in global display points.
+        let point = unsafe { CGEventGetLocation(std::ptr::null()) };
+        return Some(
+            egui::pos2(point.x as f32, point.y as f32) / ctx.zoom_factor() - window.min.to_vec2(),
+        );
+    }
+    ctx.input(|i| i.pointer.hover_pos())
+}
+
+fn dropped_file_paths(files: &[egui::DroppedFile]) -> Result<String> {
+    let mut paths = Vec::with_capacity(files.len());
+    for file in files {
+        let path = file
+            .path
+            .as_deref()
+            .context("Drop a local file from your file manager.")?;
+        let path = path
+            .to_str()
+            .context("The dropped file path is not valid UTF-8.")?;
+        // Control characters can become keystrokes in shells without bracketed
+        // paste, or terminate a bracketed paste. Never send them as file names.
+        if path.is_empty() || path.chars().any(char::is_control) {
+            bail!("Cannot insert a file path containing control characters.");
+        }
+        paths.push(shell_words::quote(path).into_owned());
+    }
+    Ok(format!("{} ", paths.join(" ")))
+}
+
+fn append_paste(outgoing: &mut Vec<u8>, text: &str, bracketed: bool) {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    if bracketed {
+        outgoing.extend_from_slice(b"\x1b[200~");
+        outgoing.extend_from_slice(text.as_bytes());
+        outgoing.extend_from_slice(b"\x1b[201~");
+    } else {
+        outgoing.extend_from_slice(text.replace('\n', "\r").as_bytes());
+    }
+}
+
 fn render(
     ui: &mut egui::Ui,
     tab: &mut Session,
@@ -1354,12 +1568,33 @@ fn render(
     font_size: f32,
 ) -> PtySize {
     let id = egui::Id::new(("terminal-input", tab.id));
+    if tab.view.find.open {
+        let closed = ui
+            .add_enabled_ui(enabled, |ui| tab.view.find.ui(ui, id))
+            .inner;
+        if closed {
+            *focus = true;
+        }
+    }
     let font = FontId::monospace(font_size);
     let cell = ui.fonts_mut(|f| egui::vec2(f.glyph_width(&font, 'M'), f.row_height(&font) + 2.0));
     let (_, rect) = ui.allocate_space(ui.available_size().max(egui::vec2(10.0, 30.0)));
     let response = ui
         .interact(rect, id, egui::Sense::click_and_drag())
         .on_hover_cursor(egui::CursorIcon::Text);
+    let has_files =
+        ui.input(|i| !i.raw.hovered_files.is_empty() || !i.raw.dropped_files.is_empty());
+    let drop_target = enabled
+        && has_files
+        && !tab.screen.lock().unwrap().exited
+        && file_drop_position(ui.ctx()).is_some_and(|pos| rect.contains(pos));
+    let dropped = if drop_target && ui.input(|i| !i.raw.dropped_files.is_empty()) {
+        Some(dropped_file_paths(
+            &ui.input_mut(|i| std::mem::take(&mut i.raw.dropped_files)),
+        ))
+    } else {
+        None
+    };
     if response.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
     }
@@ -1376,8 +1611,15 @@ fn render(
     if size != tab.size && tab.send(Command::Resize(pty)) {
         tab.size = size;
         tab.selection = None;
+        tab.view.selection = None;
     }
-    if enabled && (*focus || response.clicked() || response.drag_started() || response.dragged()) {
+    if enabled
+        && (*focus
+            || response.clicked()
+            || response.drag_started()
+            || response.dragged()
+            || dropped.is_some())
+    {
         ui.memory_mut(|m| m.request_focus(id));
         *focus = false;
     }
@@ -1414,17 +1656,19 @@ fn render(
     let hovered_link = if command && response.hovered() {
         response.hover_pos().and_then(|pos| {
             let state = tab.screen.lock().unwrap();
-            terminal_link(
-                state.parser.screen(),
-                point(pos),
-                state
-                    .parser
-                    .callbacks()
-                    .directory
-                    .as_deref()
-                    .unwrap_or(&tab.root),
-                &tab.root,
-            )
+            named_link(state.parser.screen(), point(pos)).or_else(|| {
+                terminal_link(
+                    state.parser.screen(),
+                    point(pos),
+                    state
+                        .parser
+                        .callbacks()
+                        .directory
+                        .as_deref()
+                        .unwrap_or(&tab.root),
+                    &tab.root,
+                )
+            })
         })
     } else {
         None
@@ -1471,19 +1715,86 @@ fn render(
     {
         let p = point(pos);
         tab.selection = Some((p, p));
+        tab.view
+            .capture_selection(tab.screen.lock().unwrap().parser.screen(), tab.selection);
     }
     if !report_mouse
         && response.dragged()
         && let Some(pos) = response.interact_pointer_pos()
-        && let Some((_, end)) = &mut tab.selection
+        && let Some((start, _)) = tab.view.selection
     {
-        *end = point(pos);
+        let mut state = tab.screen.lock().unwrap();
+        if pos.y < rect.top() || pos.y > rect.bottom() {
+            let offset = state.parser.screen().scrollback();
+            state
+                .parser
+                .screen_mut()
+                .set_scrollback(if pos.y < rect.top() {
+                    offset + 1
+                } else {
+                    offset.saturating_sub(1)
+                });
+            ui.ctx().request_repaint_after(Duration::from_millis(35));
+        }
+        let p = point(pos);
+        tab.view.selection = Some((
+            start,
+            (
+                state.parser.screen().history_bounds().2 + u64::from(p.0),
+                p.1,
+            ),
+        ));
     }
     if response.clicked() {
         tab.selection = None;
+        tab.view.selection = None;
     }
     let mut state = tab.screen.lock().unwrap();
     let mut outgoing = vec![];
+    if let Some(rx) = &tab.view.paste {
+        match rx.try_recv() {
+            Ok(result) => {
+                tab.view.paste = None;
+                match result {
+                    Ok(paste) => {
+                        if paste.file.is_some() && tab.view.attachments.len() >= 64 {
+                            state.error = Some("This session already holds 64 pasted images. Start a new terminal to paste more.".into());
+                        } else {
+                            append_paste(
+                                &mut outgoing,
+                                &paste.text,
+                                state.parser.screen().bracketed_paste(),
+                            );
+                            if let Some(file) = paste.file {
+                                tab.view.attachments.push(file);
+                            }
+                        }
+                    }
+                    Err(error) => state.error = Some(format!("Could not paste: {error:#}")),
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                tab.view.paste = None;
+                state.error = Some("Clipboard worker stopped. Try pasting again.".into());
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    let revision = state.revision;
+    tab.view.find.refresh(state.parser.screen_mut(), revision);
+    if tab.view.find.needs_refresh(revision) {
+        ui.ctx().request_repaint_after(Duration::from_millis(200));
+    }
+    if let Some(dropped) = dropped {
+        match dropped {
+            Ok(paths) => append_paste(
+                &mut outgoing,
+                &paths,
+                state.parser.screen().bracketed_paste(),
+            ),
+            Err(error) => state.error = Some(error.to_string()),
+        }
+    }
     let terminal_focused = focused && ui.input(|i| i.focused);
     if !state.exited
         && state.parser.callbacks().focus_reporting
@@ -1586,7 +1897,6 @@ fn render(
                     .screen_mut()
                     .set_scrollback(offset.max(0) as usize);
             }
-            tab.selection = None;
         }
     }
     if enabled
@@ -1596,6 +1906,11 @@ fn render(
         && let Some(pos) = response.interact_pointer_pos()
     {
         tab.selection = terminal_word(state.parser.screen(), point(pos));
+        tab.view
+            .capture_selection(state.parser.screen(), tab.selection);
+    }
+    if tab.view.selection.is_some() {
+        tab.selection = tab.view.visible_selection(state.parser.screen());
     }
     let mut copy = false;
     if focused {
@@ -1636,15 +1951,17 @@ fn render(
                 egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
                     outgoing.extend_from_slice(text.as_bytes())
                 }
-                egui::Event::Paste(text) => {
-                    let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                    if state.parser.screen().bracketed_paste() {
-                        outgoing.extend_from_slice(b"\x1b[200~");
-                        outgoing.extend_from_slice(text.as_bytes());
-                        outgoing.extend_from_slice(b"\x1b[201~");
-                    } else {
-                        outgoing.extend_from_slice(text.replace('\n', "\r").as_bytes());
+                egui::Event::Paste(text) if text.is_empty() => {
+                    if !state.exited {
+                        tab.view.paste(ui.ctx());
                     }
+                }
+                egui::Event::Paste(text) => {
+                    append_paste(
+                        &mut outgoing,
+                        &text,
+                        state.parser.screen().bracketed_paste(),
+                    );
                 }
                 egui::Event::Cut => {
                     if cfg!(target_os = "macos") || ui.input(|i| i.modifiers.shift) {
@@ -1695,7 +2012,10 @@ fn render(
     if !report_mouse {
         response.context_menu(|ui| {
             if ui
-                .add_enabled(selection.is_some(), egui::Button::new("Copy selection"))
+                .add_enabled(
+                    selection.is_some() || tab.view.selection.is_some(),
+                    egui::Button::new("Copy selection"),
+                )
                 .clicked()
             {
                 copy = true;
@@ -1707,8 +2027,9 @@ fn render(
             }
             if ui.button("Paste").clicked() {
                 ui.memory_mut(|m| m.request_focus(id));
-                ui.ctx()
-                    .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                if !state.exited {
+                    tab.view.paste(ui.ctx());
+                }
                 ui.close();
             }
             if ui.button("Scroll to bottom").clicked() {
@@ -1717,7 +2038,10 @@ fn render(
             }
         });
     }
-    if copy && let Some((start, end)) = selection {
+    if copy && let Some(history) = tab.view.selection {
+        ui.ctx()
+            .copy_text(view::selected_history(state.parser.screen(), history));
+    } else if copy && let Some((start, end)) = selection {
         // The selection is measured in the panel, but the screen the shell
         // drew may be narrower. A column past the last one makes the terminal
         // library subtract past zero, so the selection is clamped to the
@@ -1743,6 +2067,7 @@ fn render(
     if !outgoing.is_empty() {
         state.parser.screen_mut().set_scrollback(0);
         tab.selection = None;
+        tab.view.selection = None;
         selection = None;
         if outgoing.len() > 1024 * 1024 {
             state.error = Some("Paste is limited to 1 MiB. Paste a smaller section.".into());
@@ -1753,7 +2078,14 @@ fn render(
             state.error = None;
         }
     }
-    let screen = state.parser.screen();
+    state.expire_synchronized_output();
+    let screen = if let Some((start, snapshot)) = &state.parser.callbacks().synchronized {
+        ui.ctx()
+            .request_repaint_after(Duration::from_secs(1).saturating_sub(start.elapsed()));
+        snapshot
+    } else {
+        state.parser.screen()
+    };
     let painter = ui.painter().with_clip_rect(rect);
     for row in 0..size.0 {
         // The background and the underline belong to the cell, not to the
@@ -1767,7 +2099,15 @@ fn render(
                 origin,
                 egui::vec2(cell.x * if c.is_wide() { 2.0 } else { 1.0 }, cell.y),
             );
-            let (fg, bg) = cell_colors(c, selection, row, col);
+            let (fg, mut bg) = cell_colors(c, selection, row, col);
+            if bg != chrome::SELECTED
+                && let Some(highlight) = tab.view.find.highlight(
+                    state.parser.screen().history_bounds().2 + u64::from(row),
+                    col,
+                )
+            {
+                bg = highlight;
+            }
             if bg != chrome::EDITOR {
                 painter.rect_filled(cell_rect, 0.0, bg);
             }
@@ -1795,39 +2135,33 @@ fn render(
                     rect.min + egui::vec2(f32::from(col) * cell.x, f32::from(row) * cell.y);
                 if !c.is_wide_continuation() && !c.contents().is_empty() {
                     let (fg, _) = cell_colors(c, selection, row, col);
-                    painter.text(
-                        origin,
-                        egui::Align2::LEFT_TOP,
-                        c.contents(),
-                        font.clone(),
-                        if c.dim() { fg.gamma_multiply(0.6) } else { fg },
-                    );
+                    let style = TerminalStyle::from_cell(c, fg);
+                    let mut job = egui::text::LayoutJob::default();
+                    job.append(c.contents(), 0.0, style.format(ui.ctx(), &font));
+                    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+                    paint_terminal_run(&painter, origin, galley, style, ui.ctx());
                 }
             }
             continue;
         }
-        let mut job = egui::text::LayoutJob::default();
         let (text, runs) = row_runs(screen, row, size.1, selection);
-        for (range, color) in runs {
-            job.append(
-                &text[range],
-                0.0,
-                egui::TextFormat {
-                    font_id: font.clone(),
-                    color,
-                    ..Default::default()
-                },
-            );
+        let mut column = 0;
+        for (range, style) in runs {
+            let mut job = egui::text::LayoutJob::default();
+            job.append(&text[range.clone()], 0.0, style.format(ui.ctx(), &font));
+            let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+            let origin = rect.min + egui::vec2(column as f32 * cell.x, f32::from(row) * cell.y);
+            paint_terminal_run(&painter, origin, galley, style, ui.ctx());
+            // Count terminal cells rather than Unicode scalars (combining marks).
+            column += (column..size.1)
+                .take_while(|col| {
+                    let Some(c) = screen.cell(row, *col) else {
+                        return false;
+                    };
+                    TerminalStyle::from_cell(c, cell_colors(c, selection, row, *col).0) == style
+                })
+                .count() as u16;
         }
-        if job.sections.is_empty() {
-            continue;
-        }
-        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-        painter.galley(
-            rect.min + egui::vec2(0.0, f32::from(row) * cell.y),
-            galley,
-            chrome::TEXT,
-        );
     }
     if focused && !screen.hide_cursor() && screen.scrollback() == 0 && !state.exited {
         let (row, col) = screen.cursor_position();
@@ -1859,12 +2193,261 @@ fn render(
             chrome::MUTED,
         );
     }
+    if tab.view.paste.is_some() {
+        painter.text(
+            rect.right_bottom(),
+            egui::Align2::RIGHT_BOTTOM,
+            "Pasting…",
+            FontId::proportional(12.0),
+            chrome::MUTED,
+        );
+    }
+    if has_files {
+        // Keep the target feedback current even when native dragging suppresses
+        // ordinary pointer events.
+        ui.ctx().request_repaint_after(Duration::from_millis(16));
+    }
+    if drop_target {
+        painter.rect_stroke(
+            rect.shrink(1.0),
+            4.0,
+            egui::Stroke::new(1.5_f32, chrome::BLUE),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            rect.center_bottom() - egui::vec2(0.0, 18.0),
+            egui::Align2::CENTER_BOTTOM,
+            "Drop files to insert paths",
+            FontId::proportional(13.0),
+            chrome::BLUE,
+        );
+    }
     pty
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shifted_enter_is_distinct_and_other_modifiers_are_preserved() {
+        assert_eq!(
+            key_bytes(Key::Enter, Modifiers::NONE, false),
+            Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            key_bytes(Key::Enter, Modifiers::SHIFT, false),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+        assert_eq!(
+            key_bytes(Key::Enter, Modifiers::CTRL | Modifiers::SHIFT, false),
+            Some(b"\x1b[13;6u".to_vec())
+        );
+        assert_eq!(
+            key_bytes(Key::Enter, Modifiers::ALT, false),
+            Some(b"\x1b\r".to_vec())
+        );
+    }
+
+    #[test]
+    fn synchronized_output_holds_one_visible_snapshot_and_times_out() {
+        let mut state = ScreenState::default();
+        state.parser.process(b"before");
+        for byte in b"\x1b[?2026h\rpartial\x1b[?2026$p" {
+            state.parser.process(&[*byte]);
+        }
+        let snapshot = &state.parser.callbacks().synchronized.as_ref().unwrap().1;
+        assert_eq!(snapshot.contents(), "before");
+        assert!(
+            snapshot.history_bounds().1 <= 24,
+            "snapshot excludes scrollback"
+        );
+        assert_eq!(state.parser.screen().contents(), "partial");
+        assert_eq!(state.parser.callbacks().replies, b"\x1b[?2026;1$y");
+        state.parser.process(b"\x1b[?2026h");
+        assert_eq!(
+            state
+                .parser
+                .callbacks()
+                .synchronized
+                .as_ref()
+                .unwrap()
+                .1
+                .contents(),
+            "before"
+        );
+        state.parser.process(b"\x1b[?2026l");
+        assert!(state.parser.callbacks().synchronized.is_none());
+        state.parser.process(b"\x1b[?2026h");
+        state
+            .parser
+            .callbacks_mut()
+            .synchronized
+            .as_mut()
+            .unwrap()
+            .0 = Instant::now() - Duration::from_secs(2);
+        state.expire_synchronized_output();
+        assert!(
+            state.parser.callbacks().synchronized.is_none(),
+            "missing end marker cannot freeze the terminal"
+        );
+        state.parser.process(b"\x1b[?2026h");
+        state.parser.screen_mut().set_size(30, 100);
+        state.expire_synchronized_output();
+        assert!(
+            state.parser.callbacks().synchronized.is_none(),
+            "resize invalidates old geometry"
+        );
+    }
+
+    #[test]
+    fn terminal_styles_split_runs_without_losing_grid_columns() {
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let mut parser = vt100::Parser::new(2, 40, 0);
+        parser.process(
+            b"normal\x1b[1mbold\x1b[3mboth\x1b[22mitalic\x1b[9mstrike\x1b[8mhidden\x1b[0mplain",
+        );
+        let (text, runs) = row_runs(parser.screen(), 0, 40, None);
+        assert_eq!(&text[..6], "normal");
+        assert!(runs[1].1.bold);
+        assert!(runs[2].1.bold && runs[2].1.italic);
+        assert!(!runs[3].1.bold && runs[3].1.italic);
+        assert!(runs[4].1.strike);
+        assert!(runs[5].1.conceal);
+        assert!(!runs[6].1.conceal && !runs[6].1.bold && !runs[6].1.italic);
+        let format = runs[2].1.format(&ctx, &FontId::monospace(14.0));
+        assert!(format.italics);
+        if ctx.data(|data| {
+            data.get_temp::<bool>(egui::Id::new("terminal-bold-installed"))
+                .unwrap_or(false)
+        }) {
+            assert_eq!(
+                format.font_id.family,
+                egui::FontFamily::Name("terminal-bold".into())
+            );
+        } else {
+            assert_eq!(format.font_id.family, egui::FontFamily::Monospace);
+        }
+        assert_eq!(
+            runs[5].1.format(&ctx, &FontId::monospace(14.0)).color,
+            Color32::TRANSPARENT
+        );
+    }
+
+    #[test]
+    fn dropped_paths_preserve_spaces_unicode_and_shell_metacharacters() -> Result<()> {
+        let paths = ["/tmp/Screen shot 猫.png", "/tmp/it's-$(touch hacked);.jpg"];
+        let files: Vec<_> = paths
+            .iter()
+            .map(|path| egui::DroppedFile {
+                path: Some((*path).into()),
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(shell_words::split(&dropped_file_paths(&files)?)?, paths);
+        for path in ["/tmp/a\nb.png", "/tmp/a\r.png", "/tmp/\x1b[201~.png", ""] {
+            assert!(
+                dropped_file_paths(&[egui::DroppedFile {
+                    path: Some(path.into()),
+                    ..Default::default()
+                }])
+                .is_err()
+            );
+        }
+        assert!(dropped_file_paths(&[egui::DroppedFile::default()]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn file_drop_targets_only_a_live_enabled_terminal_and_never_submits() {
+        for (inside, enabled, exited, bracketed) in [
+            (true, true, false, true),
+            (true, true, false, false),
+            (false, true, false, true),
+            (true, false, false, true),
+            (true, true, true, true),
+        ] {
+            let ctx = egui::Context::default();
+            let (tx, rx) = mpsc::sync_channel(128);
+            let screen = Arc::new(Mutex::new(ScreenState::default()));
+            screen.lock().unwrap().exited = exited;
+            if bracketed {
+                screen.lock().unwrap().parser.process(b"\x1b[?2004h");
+            }
+            let mut tab = Session {
+                id: 1,
+                root: "/project".into(),
+                shell: "/bin/sh".into(),
+                default_name: String::new(),
+                screen,
+                tx,
+                stopped: Arc::new(AtomicBool::new(false)),
+                killer: Arc::new(Mutex::new(None)),
+                size: (24, 80),
+                selection: None,
+                scroll_remainder: 0.0,
+                view: TerminalView::default(),
+            };
+            let mut focus = false;
+            let mut remaining = 0;
+            // No prior terminal focus, and an editor could have had focus.
+            for drop in [false, true, false] {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 400.0),
+                        )),
+                        events: vec![egui::Event::PointerMoved(if inside {
+                            egui::pos2(100.0, 100.0)
+                        } else {
+                            egui::pos2(700.0, 100.0)
+                        })],
+                        dropped_files: if drop {
+                            vec![egui::DroppedFile {
+                                path: Some("/tmp/Screen shot.png".into()),
+                                ..Default::default()
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.allocate_ui(egui::vec2(400.0, 300.0), |ui| {
+                                render(ui, &mut tab, enabled, &mut focus, 14.0);
+                            });
+                            if drop {
+                                remaining = ui.input(|i| i.raw.dropped_files.len());
+                            }
+                        });
+                    },
+                );
+            }
+            let inputs: Vec<_> = rx
+                .try_iter()
+                .filter_map(|command| match command {
+                    Command::Input(bytes) => Some(bytes),
+                    _ => None,
+                })
+                .collect();
+            if inside && enabled && !exited {
+                let expected = if bracketed {
+                    b"\x1b[200~'/tmp/Screen shot.png' \x1b[201~".to_vec()
+                } else {
+                    b"'/tmp/Screen shot.png' ".to_vec()
+                };
+                assert_eq!(inputs, vec![expected], "insert exactly once without Enter");
+                assert_eq!(remaining, 0);
+                assert!(ctx.memory(|m| m.has_focus(egui::Id::new(("terminal-input", 1u64)))));
+            } else {
+                assert!(inputs.is_empty());
+                assert_eq!(remaining, 1);
+            }
+        }
+    }
 
     #[test]
     fn links_detect_urls_paths_and_only_the_first_line_number() {
@@ -2009,6 +2592,7 @@ mod tests {
             size: (24, 80),
             selection: None,
             scroll_remainder: 0.0,
+            view: TerminalView::default(),
         };
         let mut focus = true;
         let mut time = 0.0;
@@ -2325,6 +2909,7 @@ mod tests {
             size: (24, 80),
             selection: None,
             scroll_remainder: 0.0,
+            view: TerminalView::default(),
         };
         let mut focus = true;
         for key in [
@@ -2516,7 +3101,7 @@ mod tests {
             parser.process(&[*byte]);
         }
         assert_eq!(parser.callbacks().replies,
-            b"\x1b]11;rgb:1b1b/1d1d/2121\x1b\\\x1b[>0;0;0c\x1b[8;30;100t\x1b[?2004;2$y\x1b[?2026;0$y\x1b[?2004;1$y\x1b[?1004;1$y");
+            b"\x1b]11;rgb:1b1b/1d1d/2121\x1b\\\x1b[>0;0;0c\x1b[8;30;100t\x1b[?2004;2$y\x1b[?2026;2$y\x1b[?2004;1$y\x1b[?1004;1$y");
         assert!(parser.callbacks().focus_reporting);
         parser.process(b"\x1b[?1004l");
         assert!(!parser.callbacks().focus_reporting);
@@ -2572,6 +3157,7 @@ mod tests {
             size: (24, 80),
             selection: None,
             scroll_remainder: 0.0,
+            view: TerminalView::default(),
         };
         let mut focus = true;
         let mut frame = |events, focused| {
@@ -2667,6 +3253,38 @@ mod tests {
         );
         parser.process(b"\x1b[?1006l");
         assert_eq!(mouse_bytes(parser.screen(), 0, (4, 9), true), b"\x1b[M#*%");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_pty_delivers_ctrl_s_and_ctrl_q_without_flow_control() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Leave the PTY's input flags intact: raw mode would mask the bug by
+        // disabling flow control on behalf of the terminal.
+        let script = r#"stty -echo -icanon min 1 time 0; printf 'READY'; bytes=$(dd bs=1 count=2 2>/dev/null | od -An -tx1); printf 'KEYS:%s:DONE\n' "$bytes""#;
+        let tab = Session::spawn(
+            1,
+            dir.path().to_path_buf(),
+            Settings {
+                shell: format!("/bin/sh -c {}", shell_words::quote(script)),
+                ..Default::default()
+            },
+            egui::Context::default(),
+        );
+        assert!(tab.send(Command::Resize(FALLBACK_SIZE)));
+        wait_for(&tab.screen, |s| {
+            s.parser.screen().contents().contains("READY")
+        });
+        let mut keys = key_bytes(Key::S, Modifiers::CTRL, false).unwrap();
+        keys.extend(key_bytes(Key::Q, Modifiers::CTRL, false).unwrap());
+        assert!(tab.send(Command::Input(keys)));
+        wait_for(&tab.screen, |s| {
+            s.parser.screen().contents().contains(":DONE")
+        });
+        let output = tab.screen.lock().unwrap().parser.screen().contents();
+        let compact: String = output.split_whitespace().collect();
+        assert!(compact.contains("KEYS:1311:DONE"), "{output}");
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -2871,6 +3489,7 @@ mod tests {
             size: (0, 0),
             selection: None,
             scroll_remainder: 0.0,
+            view: TerminalView::default(),
         };
         let (tx, rx_active) = mpsc::sync_channel(128);
         let active = Session {
@@ -2885,6 +3504,7 @@ mod tests {
             size: (24, 80),
             selection: None,
             scroll_remainder: 0.0,
+            view: TerminalView::default(),
         };
         let mut terminal = Terminal {
             tabs: vec![active, background],
@@ -2939,6 +3559,7 @@ mod tests {
             size: (24, 80),
             selection: None,
             scroll_remainder: 0.0,
+            view: TerminalView::default(),
         };
         let mut focus = true;
         let mut frame = |events, size| {
