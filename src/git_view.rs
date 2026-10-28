@@ -138,7 +138,12 @@ impl GitTool {
                     self.generation = self.generation.wrapping_add(1);
                     self.note = None;
                 }
-                Err(error) => self.note = Some(error),
+                Err(error) => {
+                    // Keep the label aligned with the displayed data when a
+                    // requested revision does not exist (for example HEAD~1).
+                    self.selected_base = self.repo.as_ref().map(|repo| repo.base.clone());
+                    self.note = Some(error);
+                }
             }
         }
         if let Some(result) = received(&self.file_rx) {
@@ -535,7 +540,7 @@ impl GitTool {
                         ui.add_enabled_ui(self.repo_rx.is_none(), |ui| {
                             ui.spacing_mut().button_padding = egui::vec2(10.0, 8.0);
                             egui::ComboBox::from_id_salt("git-base")
-                                .selected_text(RichText::new(&base).color(chrome::BLUE))
+                                .selected_text(RichText::new(match base.as_str() { "HEAD" => "HEAD · Last commit", "HEAD~1" => "HEAD~1 · Previous commit", _ => &base }).color(chrome::BLUE))
                                 .width(ui.available_width())
                                 .height(260.0)
                                 .wrap_mode(egui::TextWrapMode::Truncate)
@@ -544,36 +549,41 @@ impl GitTool {
                                     ui.set_max_width(ui.available_width());
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.base_filter)
-                                            .hint_text("Find a branch…")
+                                            .hint_text("Find a comparison…")
                                             .desired_width(ui.available_width()),
                                     );
                                     ui.separator();
                                     let filter = chrome::CaseFilter::new(self.base_filter.trim());
                                     let mut found = false;
-                                    for branch in &repo.branches {
-                                        if !filter.matches(branch) {
+                                    for (reference, label) in [("HEAD", "HEAD · Last commit"), ("HEAD~1", "HEAD~1 · Previous commit")].into_iter()
+                                        .chain(repo.branches.iter().filter(|branch| branch.as_str() != "HEAD").map(|branch| (branch.as_str(), branch.as_str()))) {
+                                        if !filter.matches(label) {
                                             continue;
                                         }
                                         found = true;
                                         let response = ui
                                             .add(
                                                 egui::Button::selectable(
-                                                    base == *branch,
-                                                    RichText::new(branch).size(12.0),
+                                                    base == reference,
+                                                    RichText::new(label).size(12.0),
                                                 )
                                                 .min_size(egui::vec2(ui.available_width(), 30.0))
                                                 .wrap_mode(egui::TextWrapMode::Truncate),
                                             )
-                                            .on_hover_text(branch);
+                                            .on_hover_text(if reference == "HEAD" {
+                                                "Compare staged, unstaged, untracked and unsaved changes with the latest commit"
+                                            } else if reference == "HEAD~1" {
+                                                "Compare the latest commit and local changes with its first parent"
+                                            } else { reference });
                                         if response.clicked() {
-                                            base.clone_from(branch);
+                                            base = reference.to_owned();
                                             self.base_filter.clear();
                                             ui.close();
                                         }
                                     }
                                     if !found {
                                         ui.label(
-                                            RichText::new("No matching branches")
+                                            RichText::new("No matching comparisons")
                                                 .color(chrome::MUTED),
                                         );
                                     }
@@ -599,7 +609,8 @@ impl GitTool {
                             if let Some(base) = &repo.merge_base {
                                 ui.label(
                                     RichText::new(format!(
-                                        "Merge base {}",
+                                        "{} {}",
+                                        match repo.base.as_str() { "HEAD" => "HEAD", "HEAD~1" => "HEAD~1", _ => "Merge base" },
                                         &base[..base.len().min(10)]
                                     ))
                                     .size(11.0)
@@ -2921,7 +2932,13 @@ mod tests {
 
     #[test]
     fn comparison_selector_fits_narrow_panels_and_branch_selection_updates_base() {
-        for width in [160.0_f32, 240.0, 360.0] {
+        for (width, label, reference) in [160.0_f32, 240.0, 360.0].into_iter().flat_map(|width| {
+            [
+                (width, "main", "main"),
+                (width, "HEAD · Last commit", "HEAD"),
+                (width, "HEAD~1 · Previous commit", "HEAD~1"),
+            ]
+        }) {
             let ctx = egui::Context::default();
             chrome::install(&ctx);
             let mut tool = GitTool {
@@ -3017,14 +3034,14 @@ mod tests {
                 .shapes
                 .iter()
                 .find_map(|shape| match &shape.shape {
-                    egui::Shape::Text(text) if text.galley.text() == "main" => {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
                         Some(text.pos + text.galley.size() / 2.0)
                     }
                     _ => None,
                 })
                 .expect("branch menu must open");
             click(&mut tool, branch);
-            assert_eq!(tool.selected_base.as_deref(), Some("main"));
+            assert_eq!(tool.selected_base.as_deref(), Some(reference));
         }
     }
 

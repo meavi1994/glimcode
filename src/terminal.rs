@@ -3,6 +3,7 @@ use crate::chrome;
 mod https;
 #[cfg(target_os = "macos")]
 mod macos;
+mod mobile;
 mod qr;
 mod share;
 mod tls;

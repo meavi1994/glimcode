@@ -233,7 +233,7 @@ pub fn repository(project: &Path, requested_base: Option<&str>) -> Result<Reposi
     .map(str::to_owned)
     .collect();
     let base = requested_base
-        .filter(|b| branches.iter().any(|r| r == b))
+        .filter(|b| matches!(*b, "HEAD" | "HEAD~1") || branches.iter().any(|r| r == b))
         .map(str::to_owned)
         .or_else(|| {
             ["origin/main", "origin/master", "main", "master"]
@@ -249,8 +249,23 @@ pub fn repository(project: &Path, requested_base: Option<&str>) -> Result<Reposi
                 "HEAD".into()
             }
         });
-    let merge_base = if head.is_empty() {
+    let merge_base = if base == "HEAD~1" {
+        if head.is_empty() {
+            bail!("HEAD~1 is unavailable: this repository has no previous commit.");
+        }
+        Some(
+            text(
+                &root,
+                &["rev-parse", "--verify", &format!("{head}~1^{{commit}}")],
+            )
+            .context("HEAD~1 is unavailable: the current commit has no previous commit")?,
+        )
+    } else if head.is_empty() {
         None
+    } else if base == "HEAD" {
+        // Pin this refresh to the current commit so the file list and diffs
+        // share a consistent baseline even if HEAD moves in the meantime.
+        Some(head.clone())
     } else {
         Some(
             text(&root, &["merge-base", &base, "HEAD"])
@@ -258,7 +273,9 @@ pub fn repository(project: &Path, requested_base: Option<&str>) -> Result<Reposi
         )
     };
     let mut files = BTreeMap::new();
-    if let Some(base) = &merge_base {
+    if let Some(base) = &merge_base
+        && base != &head
+    {
         parse_changes(
             &git(
                 &root,
@@ -805,6 +822,156 @@ pub(crate) mod tests {
         assert!(deleted.text.is_empty());
         Ok(())
     }
+    #[test]
+    fn head_comparison_uses_latest_commit_and_only_lists_local_changes() -> Result<()> {
+        let dir = setup()?;
+        let root = dir.path();
+        let committed = "fn main() {\n    committed();\n}\n";
+        std::fs::write(root.join("src/code.rs"), committed)?;
+        std::fs::write(root.join("committed-only.txt"), "already committed\n")?;
+        git(root, &["add", "."])?;
+        git(root, &["commit", "-m", "Feature commit"])?;
+        let head = text(root, &["rev-parse", "HEAD"])?;
+        let working = "fn main() {\n    working();\n}\n";
+        std::fs::write(root.join("src/code.rs"), working)?;
+        std::fs::write(root.join("staged.txt"), "staged addition\n")?;
+        git(root, &["add", "staged.txt"])?;
+        git(root, &["mv", "rename me.txt", "renamed.txt"])?;
+        std::fs::remove_file(root.join("deleted.txt"))?;
+        std::fs::write(root.join("untracked.txt"), "untracked\n")?;
+        let repo = repository(root, Some("HEAD"))?;
+        assert_eq!(repo.base, "HEAD");
+        assert_eq!(repo.merge_base.as_deref(), Some(head.as_str()));
+        assert!(
+            repo.files
+                .iter()
+                .all(|file| !file.committed && file.uncommitted)
+        );
+        assert!(
+            !repo
+                .files
+                .iter()
+                .any(|file| file.path == Path::new("committed-only.txt"))
+        );
+        for path in [
+            "src/code.rs",
+            "staged.txt",
+            "renamed.txt",
+            "deleted.txt",
+            "untracked.txt",
+        ] {
+            assert!(
+                repo.files.iter().any(|file| file.path == Path::new(path)),
+                "missing {path}"
+            );
+        }
+        let data = file_data(&repo, &root.join("src/code.rs"), None, false)?;
+        assert_eq!(data.base, committed);
+        assert_eq!(data.text, working);
+        let buffer = "fn main() {\n    unsaved();\n}\n";
+        let data = file_data(&repo, &root.join("src/code.rs"), Some(buffer.into()), false)?;
+        assert_eq!(data.base, committed);
+        assert_eq!(data.text, buffer);
+        assert_eq!(
+            file_data(&repo, &root.join("renamed.txt"), None, false)?.base,
+            "rename content\n"
+        );
+        assert_eq!(
+            file_data(&repo, &root.join("deleted.txt"), None, false)?.base,
+            "remove me\n"
+        );
+        git(root, &["add", "."])?;
+        git(root, &["commit", "-m", "Commit local changes"])?;
+        let refreshed = repository(root, Some("HEAD"))?;
+        assert_eq!(refreshed.base, "HEAD");
+        assert_ne!(refreshed.head, head);
+        assert_eq!(
+            refreshed.merge_base.as_deref(),
+            Some(refreshed.head.as_str())
+        );
+        assert!(refreshed.files.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn previous_commit_comparison_includes_the_last_commit_and_local_edits() -> Result<()> {
+        let dir = setup()?;
+        let root = dir.path();
+        let previous = text(root, &["rev-parse", "HEAD"])?;
+        let committed = "fn main() {\n    committed();\n}\n";
+        std::fs::write(root.join("src/code.rs"), committed)?;
+        std::fs::write(root.join("last-commit.txt"), "latest commit addition\n")?;
+        git(root, &["add", "."])?;
+        git(root, &["commit", "-m", "Latest commit"])?;
+        let latest = text(root, &["rev-parse", "HEAD"])?;
+        let working = "fn main() {\n    working();\n}\n";
+        std::fs::write(root.join("src/code.rs"), working)?;
+        let repo = repository(root, Some("HEAD~1"))?;
+        assert_eq!(repo.base, "HEAD~1");
+        assert_eq!(repo.merge_base.as_deref(), Some(previous.as_str()));
+        let changed = repo
+            .files
+            .iter()
+            .find(|file| file.path == Path::new("src/code.rs"))
+            .unwrap();
+        assert!(changed.committed && changed.uncommitted);
+        assert!(
+            repo.files
+                .iter()
+                .any(|file| file.path == Path::new("last-commit.txt") && file.committed)
+        );
+        let data = file_data(&repo, &root.join("src/code.rs"), None, false)?;
+        assert_eq!(data.base, "fn main() {\n    old();\n}\n");
+        assert_eq!(data.text, working);
+        let data = file_data(
+            &repo,
+            &root.join("src/code.rs"),
+            Some("unsaved\n".into()),
+            false,
+        )?;
+        assert_eq!(data.base, "fn main() {\n    old();\n}\n");
+        assert_eq!(data.text, "unsaved\n");
+        git(root, &["add", "."])?;
+        git(root, &["commit", "-m", "Another commit"])?;
+        assert_eq!(
+            repository(root, Some("HEAD~1"))?.merge_base.as_deref(),
+            Some(latest.as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn previous_commit_comparison_reports_missing_history() -> Result<()> {
+        let dir = setup()?;
+        let error = repository(dir.path(), Some("HEAD~1")).unwrap_err();
+        assert!(error.to_string().contains("no previous commit"));
+        let empty = tempfile::tempdir()?;
+        git(empty.path(), &["init", "-b", "main"])?;
+        assert!(
+            repository(empty.path(), Some("HEAD~1"))
+                .unwrap_err()
+                .to_string()
+                .contains("no previous commit")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn head_comparison_also_handles_a_repository_without_commits() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        git(dir.path(), &["init", "-b", "main"])?;
+        std::fs::write(dir.path().join("new.txt"), "first change\n")?;
+        let repo = repository(dir.path(), Some("HEAD"))?;
+        assert_eq!(repo.base, "HEAD");
+        assert!(repo.merge_base.is_none());
+        assert!(
+            repo.files
+                .iter()
+                .any(|file| file.path == Path::new("new.txt") && file.added)
+        );
+        Ok(())
+    }
+
     #[test]
     fn merge_base_diff_and_blame_include_unsaved_editor_lines() -> Result<()> {
         let dir = setup()?;

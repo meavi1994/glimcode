@@ -173,7 +173,7 @@ fn command(
         .stdin(Stdio::null());
     command
 }
-struct Server(Child);
+pub(super) struct Server(pub(super) Child);
 impl Drop for Server {
     fn drop(&mut self) {
         if matches!(self.0.try_wait(), Ok(Some(_))) {
@@ -245,13 +245,25 @@ fn run(
     if stop.load(Ordering::Relaxed) {
         return Ok(());
     }
+    // Keep the installed ttyd's own frontend and add our touch controls. The
+    // temporary page must outlive the server (ttyd reopens it on each request).
+    let page = mobile::prepare(executable, options.writable, credential, stop)?;
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     let log = tempfile::NamedTempFile::new()?;
     let mut child = Server(
-        command(executable, session, &launch_options, credential)
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(log.reopen()?))
-            .spawn()
-            .context("Could not start ttyd")?,
+        command_with_page(
+            executable,
+            session,
+            &launch_options,
+            credential,
+            page.path(),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log.reopen()?))
+        .spawn()
+        .context("Could not start ttyd")?,
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut ready = false;
@@ -293,6 +305,25 @@ fn run(
             100
         }));
     }
+}
+
+fn command_with_page(
+    executable: &Path,
+    session: &tmux::Persistent,
+    options: &Options,
+    credential: &str,
+    page: &Path,
+) -> Process {
+    let process = command(executable, session, options, credential);
+    // Options must precede the tmux command, whose own arguments may start '-'.
+    let args: Vec<_> = process.get_args().map(|arg| arg.to_owned()).collect();
+    let mut with_page = Process::new(executable);
+    with_page.arg("--index").arg(page).args(args);
+    with_page
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .stdin(Stdio::null());
+    with_page
 }
 
 /// URL setters escape credentials instead of interpolating them into a URL.
@@ -648,6 +679,23 @@ mod tests {
             args.contains(&"-r".into()),
             "read-only must also apply to the tmux client"
         );
+        let page = command_with_page(
+            Path::new("ttyd"),
+            &session,
+            &options,
+            "glimcode:secret",
+            Path::new("/temporary page/index.html"),
+        );
+        let args: Vec<_> = page
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(&args[..2], &["--index", "/temporary page/index.html"]);
+        assert!(
+            args.windows(2)
+                .any(|v| v == ["--credential", "glimcode:secret"])
+        );
+        assert!(args.ends_with(&["-t".into(), "=glimcode-share-test".into()]));
         Ok(())
     }
 }
