@@ -1,4 +1,4 @@
-//! Worktree management. Git operations run off the UI thread and never force removal.
+//! Worktree management. Git operations run off the UI thread; force removal is opt-in.
 use crate::chrome;
 use anyhow::{Result, bail};
 use eframe::egui::{self, FontId, RichText, Stroke};
@@ -61,16 +61,17 @@ pub fn create(root: &Path, path: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn remove(root: &Path, path: &Path) -> Result<()> {
+pub fn remove(root: &Path, path: &Path, force: bool) -> Result<()> {
     let trees = list(root)?;
     if !trees.iter().any(|t| t.path == path && !t.protected) {
         bail!("This worktree cannot be removed");
     }
-    let output = Command::new("git")
-        .current_dir(root)
-        .args(["worktree", "remove", "--"])
-        .arg(path)
-        .output()?;
+    let mut command = Command::new("git");
+    command.current_dir(root).args(["worktree", "remove"]);
+    if force {
+        command.arg("--force");
+    }
+    let output = command.arg("--").arg(path).output()?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -88,6 +89,8 @@ pub struct Manager {
     path: String,
     custom_path: bool,
     delete: Option<PathBuf>,
+    deleting: bool,
+    delete_force: bool,
     error: Option<String>,
     create_open: bool,
     create_focus: bool,
@@ -96,7 +99,7 @@ pub struct Manager {
 }
 impl Manager {
     pub fn modal(&self) -> bool {
-        self.create_open
+        self.create_open || self.delete.is_some()
     }
 
     fn open_create(&mut self, root: &Path) {
@@ -115,6 +118,10 @@ impl Manager {
                     match result {
                         Ok(trees) => {
                             self.trees = trees;
+                            if self.deleting {
+                                self.delete = None;
+                                self.delete_force = false;
+                            }
                             if self.creating {
                                 self.create_open = false;
                                 self.name.clear();
@@ -127,10 +134,12 @@ impl Manager {
                         Err(error) => self.error = Some(error.to_string()),
                     }
                     self.creating = false;
+                    self.deleting = false;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.rx = None;
                     self.creating = false;
+                    self.deleting = false;
                     self.error = Some("Worktree operation interrupted".into());
                 }
                 _ => {}
@@ -140,6 +149,10 @@ impl Manager {
 
     pub fn dialog(&mut self, ctx: &egui::Context) {
         self.poll();
+        if self.delete.is_some() {
+            self.delete_dialog(ctx);
+            return;
+        }
         if !self.create_open {
             return;
         }
@@ -274,6 +287,82 @@ impl Manager {
         }
     }
 
+    fn delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.delete.clone() else {
+            return;
+        };
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("delete-worktree-dialog"))
+            .frame(chrome::popup_frame())
+            .show(ctx, |ui| {
+                chrome::modal_style(ui, 480.0);
+                cancel = ui
+                    .add_enabled_ui(!self.deleting, |ui| {
+                        chrome::dialog_header(
+                            ui,
+                            "!",
+                            "Delete worktree?",
+                            "The folder will be removed from disk. The branch is kept.",
+                            chrome::DANGER,
+                        )
+                    })
+                    .inner;
+                egui::ScrollArea::vertical()
+                    .max_height((ctx.content_rect().height() - 280.0).max(140.0))
+                    .show(ui, |ui| {
+                        ui.label(path.display().to_string());
+                        ui.add_enabled_ui(!self.deleting, |ui| {
+                            ui.checkbox(&mut self.delete_force, "Force delete (--force)");
+                        });
+                        if self.delete_force {
+                            ui.colored_label(
+                                chrome::WARNING,
+                                "Uncommitted changes and untracked files in this worktree will be permanently deleted.",
+                            );
+                        }
+                        if let Some(error) = &self.error {
+                            chrome::dialog_card(ui, |ui| {
+                                ui.colored_label(chrome::DANGER, error);
+                            });
+                        }
+                    });
+                chrome::dialog_divider(ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    submit = ui
+                        .add_enabled_ui(self.rx.is_none(), |ui| {
+                            chrome::dialog_button(ui, "Delete worktree", Some(chrome::DANGER))
+                        })
+                        .inner
+                        .clicked();
+                    if self.deleting {
+                        ui.spinner();
+                        ui.label("Deleting worktree…");
+                    }
+                    cancel |= ui
+                        .add_enabled_ui(!self.deleting, |ui| {
+                            chrome::dialog_button(ui, "Cancel", None)
+                        })
+                        .inner
+                        .clicked();
+                });
+                if !self.deleting {
+                    cancel |=
+                        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+                }
+            });
+        if cancel && !self.deleting {
+            self.delete = None;
+            self.delete_force = false;
+            self.error = None;
+        } else if submit {
+            self.deleting = true;
+            let root = self.project.clone();
+            let force = self.delete_force;
+            self.run(&root, move |root| remove(root, &path, force), ctx);
+        }
+    }
+
     fn update_default_path(&mut self, root: &Path) {
         if !self.custom_branch {
             self.branch = self.name.trim().to_owned();
@@ -326,6 +415,7 @@ impl Manager {
                 self.project = root.to_path_buf();
                 self.trees.clear();
                 self.delete = None;
+                self.delete_force = false;
                 self.run(root, |_| Ok(()), ui.ctx());
             }
             self.update_default_path(root);
@@ -364,10 +454,9 @@ impl Manager {
                 self.open_create(root);
             }
             ui.add_space(4.0);
-            let reserved = if self.delete.is_some() { 110.0 } else { 8.0 };
             egui::ScrollArea::vertical()
                 .id_salt("worktree-list")
-                .max_height((ui.available_height() - reserved).max(80.0))
+                .max_height((ui.available_height() - 8.0).max(80.0))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for tree in &self.trees {
@@ -507,6 +596,8 @@ impl Manager {
                                 .clicked()
                             {
                                 self.delete = Some(tree.path.clone());
+                                self.delete_force = false;
+                                self.error = None;
                                 ui.close();
                             }
                         };
@@ -539,23 +630,8 @@ impl Manager {
                         ui.label(RichText::new("No worktrees to display.").color(chrome::MUTED));
                     }
                 });
-            if let Some(path) = self.delete.clone() {
-                ui.separator();
-                ui.label(format!(
-                    "Delete {} from disk? The branch is kept.",
-                    path.display()
-                ));
-                ui.horizontal(|ui| {
-                    if ui.button("Confirm delete").clicked() {
-                        self.delete = None;
-                        self.run(root, move |root| remove(root, &path), ui.ctx());
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.delete = None;
-                    }
-                });
-            }
             if !self.create_open
+                && self.delete.is_none()
                 && let Some(error) = &self.error
             {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
@@ -568,6 +644,100 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deletion_dialog_stays_open_on_failure_and_closes_on_success() {
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let path = PathBuf::from("/projects/feature");
+        let mut manager = Manager {
+            project: "/projects/main".into(),
+            delete: Some(path.clone()),
+            deleting: true,
+            delete_force: true,
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        manager.rx = Some(rx);
+        let frame = |manager: &mut Manager, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| manager.dialog(ctx),
+            )
+        };
+        let escape = || {
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        frame(&mut manager, vec![]);
+        frame(&mut manager, escape());
+        assert!(
+            manager.modal(),
+            "deletion cannot be dismissed while running"
+        );
+        tx.send(Err(anyhow::anyhow!("Worktree contains modified files")))
+            .unwrap();
+        frame(&mut manager, vec![]);
+        let output = frame(&mut manager, vec![]);
+        assert!(manager.modal());
+        assert_eq!(manager.delete.as_ref(), Some(&path));
+        assert!(!manager.deleting);
+        assert!(
+            manager.delete_force,
+            "a failed attempt retains the force option"
+        );
+        assert!(
+            output.shapes.iter().any(|shape| matches!(
+                &shape.shape,
+                egui::Shape::Text(text)
+                    if text.galley.text() == "Worktree contains modified files"
+            )),
+            "the deletion error must appear inside the dialog"
+        );
+
+        // A retry clears the error and closes the dialog only after success.
+        let (tx, rx) = mpsc::channel();
+        manager.error = None;
+        manager.deleting = true;
+        manager.rx = Some(rx);
+        frame(&mut manager, vec![]);
+        assert!(manager.modal());
+        tx.send(Ok(vec![])).unwrap();
+        frame(&mut manager, vec![]);
+        assert!(!manager.modal());
+        assert!(!manager.deleting);
+        assert!(!manager.delete_force);
+
+        // Interrupted operations also retain the target and permit cancellation.
+        manager.delete = Some(path.clone());
+        manager.deleting = true;
+        manager.delete_force = true;
+        let (tx, rx) = mpsc::channel();
+        manager.rx = Some(rx);
+        drop(tx);
+        frame(&mut manager, vec![]);
+        assert!(manager.modal());
+        assert_eq!(
+            manager.error.as_deref(),
+            Some("Worktree operation interrupted")
+        );
+        frame(&mut manager, escape());
+        assert!(!manager.modal());
+        assert!(manager.error.is_none());
+        assert!(!manager.delete_force);
+    }
+
     #[test]
     fn workspace_actions_do_not_switch_tabs_and_creation_stays_above_the_list() {
         let ctx = egui::Context::default();
@@ -754,12 +924,35 @@ mod tests {
         assert!(trees[0].protected);
         assert_eq!(trees[1].branch, "feature/test");
         assert_eq!(list(&path)?.len(), 2);
-        assert!(remove(&path, &root).is_err());
+        assert!(remove(&path, &root, false).is_err());
+        assert!(remove(&path, &root, true).is_err());
         std::fs::write(path.join("unsaved.txt"), "keep me")?;
-        assert!(remove(&root, &path).is_err());
+        assert!(remove(&root, &path, false).is_err());
         assert!(path.join("unsaved.txt").exists());
-        std::fs::remove_file(path.join("unsaved.txt"))?;
-        remove(&root, &path)?;
+        remove(&root, &path, true)?;
+        assert!(!path.exists(), "force removal deletes a dirty worktree");
+        create(&root, &path, "feature/clean")?;
+        assert!(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["worktree", "lock", "--"])
+                .arg(&path)
+                .output()?
+                .status
+                .success()
+        );
+        assert!(remove(&root, &path, true).is_err());
+        assert!(path.exists(), "locked worktrees remain protected");
+        assert!(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["worktree", "unlock", "--"])
+                .arg(&path)
+                .output()?
+                .status
+                .success()
+        );
+        remove(&root, &path, false)?;
         assert_eq!(list(&root)?.len(), 1);
         assert!(create(&root, &path, "-invalid").is_err());
         // Exercise the modal with real Git: creation closes it, failure preserves it.

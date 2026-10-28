@@ -355,14 +355,7 @@ impl Document {
     /// hashing a large text every frame is wasteful.
     pub fn can_reload(&mut self) -> bool {
         if self.disk_checked.elapsed() >= Duration::from_millis(500) {
-            self.disk_checked = Instant::now();
-            let stamp = disk_stamp(&self.path);
-            if stamp != self.disk_stamp {
-                self.disk_stamp = stamp;
-                self.disk_hash = navigation::read_text(&self.path)
-                    .ok()
-                    .map(|text| content_hash(&text));
-            }
+            self.check_disk();
         }
         let Some(disk) = self.disk_hash else {
             return false;
@@ -371,6 +364,26 @@ impl Document {
             return self.original_hash() != disk;
         }
         self.buffer_hash() != disk
+    }
+
+    fn check_disk(&mut self) {
+        self.disk_checked = Instant::now();
+        let stamp = disk_stamp(&self.path);
+        if stamp != self.disk_stamp {
+            self.disk_stamp = stamp;
+            self.disk_hash = navigation::read_text(&self.path)
+                .ok()
+                .map(|text| content_hash(&text));
+        }
+    }
+
+    /// Navigation must see external changes even inside the idle polling interval.
+    pub fn refresh_if_clean(&mut self, headers: bool) -> Result<bool> {
+        if self.dirty {
+            return Ok(false);
+        }
+        self.check_disk();
+        self.reload_if_clean(headers)
     }
 
     /// Adopt external edits only while the editor buffer is clean. Failed loads

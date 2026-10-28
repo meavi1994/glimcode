@@ -12,6 +12,8 @@ const DEFAULT_FONT_SIZE: f32 = 14.0;
 pub struct Settings {
     pub shell: String,
     pub tab_name: String,
+    pub terminal_tls_certificate: String,
+    pub terminal_tls_private_key: String,
     pub editor_font_size: f32,
     pub terminal_font_size: f32,
     pub dialog_font_size: f32,
@@ -35,6 +37,8 @@ impl Default for Settings {
                     .into()
                 }),
             tab_name: String::new(),
+            terminal_tls_certificate: String::new(),
+            terminal_tls_private_key: String::new(),
             editor_font_size: DEFAULT_FONT_SIZE,
             terminal_font_size: DEFAULT_FONT_SIZE,
             dialog_font_size: DEFAULT_FONT_SIZE,
@@ -48,6 +52,15 @@ pub fn path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|home| PathBuf::from(home).join(".glimcode/settings.json"))
+}
+
+pub fn expand_home_path(value: &str) -> PathBuf {
+    if let Some(relative) = value.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(relative);
+    }
+    PathBuf::from(value)
 }
 
 pub fn global_ignore_path() -> Option<PathBuf> {
@@ -94,6 +107,27 @@ fn json(path: &Path) -> Result<serde_json::Value> {
     Ok(value)
 }
 impl Settings {
+    pub fn validate_terminal_tls(&self) -> Result<()> {
+        let certificate = self.terminal_tls_certificate.trim();
+        let private_key = self.terminal_tls_private_key.trim();
+        if certificate.is_empty() && private_key.is_empty() {
+            return Ok(());
+        }
+        if certificate.is_empty() || private_key.is_empty() {
+            bail!(
+                "Set both the HTTPS certificate and private key, or clear both to use the generated certificate."
+            );
+        }
+        for (label, value) in [
+            ("HTTPS certificate", certificate),
+            ("HTTPS private key", private_key),
+        ] {
+            if !expand_home_path(value).is_file() {
+                bail!("{label} file does not exist: {value}");
+            }
+        }
+        Ok(())
+    }
     pub fn load(path: &Path) -> Result<Self> {
         let value = json(path)?;
         let defaults = Self::default();
@@ -107,6 +141,14 @@ impl Settings {
         Ok(Self {
             shell: value["shell"].as_str().unwrap_or(&defaults.shell).into(),
             tab_name: value["tab_name"].as_str().unwrap_or("").into(),
+            terminal_tls_certificate: value["terminal_tls_certificate"]
+                .as_str()
+                .unwrap_or("")
+                .into(),
+            terminal_tls_private_key: value["terminal_tls_private_key"]
+                .as_str()
+                .unwrap_or("")
+                .into(),
             editor_font_size: size("editor_font_size"),
             terminal_font_size: size("terminal_font_size"),
             dialog_font_size: size("dialog_font_size"),
@@ -125,6 +167,8 @@ impl Settings {
         };
         value["shell"] = self.shell.clone().into();
         value["tab_name"] = self.tab_name.clone().into();
+        value["terminal_tls_certificate"] = self.terminal_tls_certificate.clone().into();
+        value["terminal_tls_private_key"] = self.terminal_tls_private_key.clone().into();
         value["editor_font_size"] = self.editor_font_size.into();
         value["terminal_font_size"] = self.terminal_font_size.into();
         value["dialog_font_size"] = self.dialog_font_size.into();
@@ -293,6 +337,41 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path)?, "broken json");
         Ok(())
     }
+    #[test]
+    fn https_preferences_roundtrip_and_can_be_reset_to_generated_defaults() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let certificate = directory.path().join("certificate with spaces.pem");
+        let private_key = directory.path().join("private key.pem");
+        std::fs::write(&certificate, "certificate")?;
+        std::fs::write(&private_key, "key")?;
+        let mut settings = Settings {
+            terminal_tls_certificate: certificate.to_string_lossy().into_owned(),
+            terminal_tls_private_key: private_key.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        settings.validate_terminal_tls()?;
+        let path = directory.path().join("settings.json");
+        settings.save(&path)?;
+        let loaded = Settings::load(&path)?;
+        assert_eq!(
+            loaded.terminal_tls_certificate,
+            settings.terminal_tls_certificate
+        );
+        assert_eq!(
+            loaded.terminal_tls_private_key,
+            settings.terminal_tls_private_key
+        );
+        settings.terminal_tls_private_key.clear();
+        assert!(settings.validate_terminal_tls().is_err());
+        settings.terminal_tls_certificate.clear();
+        settings.validate_terminal_tls()?;
+        settings.save(&path)?;
+        let reset = Settings::load(&path)?;
+        assert!(reset.terminal_tls_certificate.is_empty());
+        assert!(reset.terminal_tls_private_key.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn legacy_settings_migrate_once_and_defaults_are_saved() -> Result<()> {
         let dir = tempfile::tempdir()?;

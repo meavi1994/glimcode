@@ -1454,6 +1454,7 @@ dependencies = [
  "pulldown-cmark",
  "regex",
  "rfd",
+ "rustls",
  "serde_json",
  "shell-words",
  "streaming-iterator",

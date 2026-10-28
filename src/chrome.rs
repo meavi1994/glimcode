@@ -1367,6 +1367,7 @@ pub enum TabKind<'a> {
 pub struct TabResponse {
     pub activate: bool,
     pub close: bool,
+    pub response: egui::Response,
 }
 
 pub fn workspace_tab(
@@ -1507,9 +1508,11 @@ pub fn workspace_tab(
     }
     let close = icon_at(ui, close_rect, id.with("close"), Icon::Close, "Close tab").clicked()
         || response.clicked_by(egui::PointerButton::Middle);
+    let response = response.on_hover_text(tooltip);
     TabResponse {
-        activate: response.on_hover_text(tooltip).clicked(),
+        activate: response.clicked(),
         close,
+        response,
     }
 }
 

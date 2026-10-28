@@ -72,7 +72,7 @@ Use the left **Worktrees** panel to work on multiple branches in separate folder
 - **Remove:** Use a worktree’s `···` menu or right-click it to request deletion. Deletion requires confirmation; the main, active, locked, modified, and unsaved worktrees are protected.
 - **Make room:** Collapse the Worktrees panel using its header arrow. Reopen it with the branch icon on the left rail or **View → Worktrees tool window**.
 
-Folder sessions are saved under `~/.glimcode/projects/`. Reopening a folder restores its file tabs, active tab, cursor locations, panel visibility, and terminal tab metadata. After restarting the app, restored terminals start fresh shells on demand in their saved working directories. Unsaved file contents, terminal scrollback, and running processes are not restored after quitting.
+Folder sessions are saved under `~/.glimcode/projects/`. Reopening a folder restores its file tabs, active tab, cursor locations, panel visibility, and terminal tab metadata. On macOS and Linux, terminals use tmux when installed: shells and programs keep running after quitting Glimcode, and restored tabs reconnect on demand with their retained history. Install tmux on macOS with `brew install tmux`. Without tmux, tabs start fresh shells in their saved directories. Unsaved file contents are not restored after quitting.
 
 See the [workspace panel guide](docs/USER_GUIDE.md#workspace-panels) and [session restore details](docs/USER_GUIDE.md#project-session-restore).
 

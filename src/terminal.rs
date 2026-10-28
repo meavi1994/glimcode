@@ -1,7 +1,12 @@
 //! Native PTY sessions, with bounded scrollback and background I/O.
 use crate::chrome;
+mod https;
 #[cfg(target_os = "macos")]
 mod macos;
+mod qr;
+mod share;
+mod tls;
+mod tmux;
 mod view;
 use anyhow::{Context, Result, bail};
 use eframe::egui::{self, Color32, FontId, Key, Modifiers};
@@ -317,6 +322,8 @@ struct Session {
     selection: Option<((u16, u16), (u16, u16))>,
     scroll_remainder: f32,
     view: TerminalView,
+    persistent: Option<tmux::Persistent>,
+    notice: Option<String>,
 }
 /// The size a shell falls back to when the interface never reports one.
 const FALLBACK_SIZE: PtySize = PtySize {
@@ -355,7 +362,18 @@ fn wait_for_size(rx: &mpsc::Receiver<Command>) -> (PtySize, Vec<Command>) {
 }
 
 impl Session {
+    #[cfg(test)]
     fn spawn(id: u64, root: PathBuf, settings: Settings, ctx: egui::Context) -> Self {
+        Self::spawn_with(id, root, settings, ctx, None, None)
+    }
+    fn spawn_with(
+        id: u64,
+        root: PathBuf,
+        settings: Settings,
+        ctx: egui::Context,
+        persistent: Option<tmux::Persistent>,
+        notice: Option<String>,
+    ) -> Self {
         let screen = Arc::new(Mutex::new(ScreenState::default()));
         let stopped = Arc::new(AtomicBool::new(false));
         let killer: Killer = Arc::new(Mutex::new(None));
@@ -366,6 +384,7 @@ impl Session {
         let cwd = root.clone();
         let shell = settings.shell.clone();
         let default_name = settings.tab_name.clone();
+        let backend = persistent.clone();
         std::thread::spawn(move || {
             let result = (|| -> Result<()> {
                 // A shell reads the size of the terminal once, when it starts,
@@ -375,6 +394,9 @@ impl Session {
                 // starts. Otherwise the first prompt is laid out for the
                 // fallback size and the time sits in the middle of the line.
                 let (size, queued) = wait_for_size(&rx);
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
                 let mut queued: std::collections::VecDeque<Command> = queued.into();
                 // The pty is opened with the real size. Changing the size of
                 // an existing pty afterwards is not seen by the shell that is
@@ -391,7 +413,23 @@ impl Session {
                     .parser
                     .screen_mut()
                     .set_size(size.rows, size.cols);
-                let command = settings.command(&cwd)?;
+                let command = if let Some(backend) = &backend {
+                    let command = backend.attach(&cwd, &settings, size)?;
+                    let history = backend.history();
+                    if !history.is_empty() {
+                        let mut state = shared.lock().unwrap();
+                        state.parser.process(&history);
+                        // Move captured rows into scrollback before tmux redraws
+                        // the live screen, which clears the visible grid.
+                        state
+                            .parser
+                            .process(&b"\r\n".repeat(usize::from(size.rows)));
+                        state.parser.process(b"\x1b[0m");
+                    }
+                    command
+                } else {
+                    settings.command(&cwd)?
+                };
                 let mut child = ManagedChild(pair.slave.spawn_command(command)?);
                 drop(pair.slave);
                 *kill.lock().unwrap() = Some(child.0.clone_killer());
@@ -413,6 +451,7 @@ impl Session {
                         repaint.request_repaint();
                     }
                 });
+                let mut directory_checked = Instant::now() - Duration::from_secs(2);
                 loop {
                     if stop.load(Ordering::Relaxed) {
                         let _ = child.0.kill();
@@ -422,6 +461,15 @@ impl Session {
                     if let Some(status) = child.0.try_wait()? {
                         shared.lock().unwrap().status = format!("Exited · {status}");
                         break;
+                    }
+                    if directory_checked.elapsed() >= Duration::from_secs(2) {
+                        if let Some(directory) =
+                            backend.as_ref().and_then(|session| session.directory())
+                        {
+                            shared.lock().unwrap().parser.callbacks_mut().directory =
+                                Some(directory);
+                        }
+                        directory_checked = Instant::now();
                     }
                     // Replies have their own buffer so a busy input queue cannot drop them.
                     let replies =
@@ -481,6 +529,8 @@ impl Session {
             selection: None,
             scroll_remainder: 0.0,
             view: TerminalView::default(),
+            persistent,
+            notice,
         }
     }
     fn send(&self, command: Command) -> bool {
@@ -531,7 +581,10 @@ pub struct Terminal {
     draft: Settings,
     settings_error: Option<String>,
     tabs: Vec<Session>,
-    restored_tabs: Vec<PathBuf>,
+    restored_tabs: Vec<(PathBuf, Option<String>)>,
+    metadata_changed: bool,
+    #[cfg(test)]
+    direct_pty: bool,
     restored_active: usize,
     active: usize,
     /// The last size the panel reported, shared with the tabs in the
@@ -540,6 +593,13 @@ pub struct Terminal {
     next_id: u64,
     focus: bool,
     pending_close: Option<u64>,
+    shares: std::collections::HashMap<u64, share::Share>,
+    share_target: Option<u64>,
+    share_options: share::Options,
+    share_error: Option<String>,
+    share_qr_url: String,
+    share_qr_login: bool,
+    share_qr: Option<(String, qr::Code)>,
 }
 impl Terminal {
     pub fn snapshot(&self) -> serde_json::Value {
@@ -561,26 +621,58 @@ impl Terminal {
         } else {
             self.restored_tabs
                 .iter()
-                .map(|root| root.to_string_lossy().into_owned())
+                .map(|(root, _)| root.to_string_lossy().into_owned())
                 .collect()
         };
-        serde_json::json!({"roots": roots, "active": if self.restored_tabs.is_empty() { self.active } else { self.restored_active }, "visible": self.visible, "maximized": self.maximized})
+        let sessions: Vec<_> = if self.restored_tabs.is_empty() {
+            self.tabs
+                .iter()
+                .map(|tab| tab.persistent.as_ref().map(|session| session.name.clone()))
+                .collect()
+        } else {
+            self.restored_tabs
+                .iter()
+                .map(|(_, name)| name.clone())
+                .collect()
+        };
+        let mut value = serde_json::json!({"roots": roots, "active": if self.restored_tabs.is_empty() { self.active } else { self.restored_active }, "visible": self.visible, "maximized": self.maximized});
+        if sessions.iter().any(Option::is_some) {
+            value["sessions"] = serde_json::json!(sessions);
+        }
+        value
+    }
+
+    pub fn take_metadata_changed(&mut self) -> bool {
+        std::mem::take(&mut self.metadata_changed)
     }
 
     pub fn restore(&mut self, value: &serde_json::Value) {
-        self.tabs.clear();
+        self.shares.clear();
+        self.share_target = None;
+        self.tabs.clear(); // Drop disconnects clients; persistent shells stay alive.
         self.active = 0;
         self.restored_tabs = value["roots"]
             .as_array()
             .into_iter()
             .flatten()
             .take(32)
-            .filter_map(|root| root.as_str().map(PathBuf::from))
-            .filter(|root| root.is_dir())
+            .enumerate()
+            .filter_map(|(index, root)| {
+                let root = PathBuf::from(root.as_str()?);
+                if !root.is_dir() {
+                    return None;
+                }
+                let name = value["sessions"][index]
+                    .as_str()
+                    .filter(|name| tmux::valid_name(name))
+                    .map(str::to_owned);
+                Some((root, name))
+            })
             .collect();
         self.restored_active = value["active"].as_u64().unwrap_or(0) as usize;
         self.visible = value["visible"].as_bool().unwrap_or(false);
         self.maximized = value["maximized"].as_bool().unwrap_or(false);
+        self.metadata_changed = false;
     }
 
     fn materialize_restored_tabs(&mut self, ctx: &egui::Context) {
@@ -588,8 +680,8 @@ impl Terminal {
             return;
         }
         let visible = self.visible;
-        for root in std::mem::take(&mut self.restored_tabs) {
-            self.new_tab(&root, ctx);
+        for (root, name) in std::mem::take(&mut self.restored_tabs) {
+            self.spawn_tab(&root, ctx, name);
         }
         self.active = self.restored_active.min(self.tabs.len().saturating_sub(1));
         self.visible = visible;
@@ -617,13 +709,33 @@ impl Terminal {
     }
     pub fn new_tab(&mut self, root: &Path, ctx: &egui::Context) {
         self.materialize_restored_tabs(ctx);
+        self.spawn_tab(root, ctx, None);
+    }
+    fn spawn_tab(&mut self, root: &Path, ctx: &egui::Context, name: Option<String>) {
         self.next_id += 1;
-        self.tabs.push(Session::spawn(
+        #[cfg(test)]
+        let persistent = if self.direct_pty {
+            None
+        } else {
+            tmux::Persistent::new(name)
+        };
+        #[cfg(not(test))]
+        let persistent = tmux::Persistent::new(name);
+        let notice = if persistent.is_none() && cfg!(unix) {
+            Some("tmux unavailable — sessions will end when Glimcode quits. Install tmux and open a new tab.".into())
+        } else {
+            None
+        };
+        let tab = Session::spawn_with(
             self.next_id,
             root.to_path_buf(),
             self.settings.clone(),
             ctx.clone(),
-        ));
+            persistent,
+            notice,
+        );
+        self.tabs.push(tab);
+        self.metadata_changed = true;
         self.active = self.tabs.len() - 1;
         self.visible = true;
         self.focus = true;
@@ -638,6 +750,14 @@ impl Terminal {
                 self.focus = true;
             }
         }
+    }
+    pub fn maximize(&mut self, root: &Path, ctx: &egui::Context) {
+        if !self.visible {
+            self.toggle(root, ctx);
+        }
+        self.maximized = true;
+        self.focus = true;
+        ctx.request_repaint();
     }
     pub fn panel(&mut self, ctx: &egui::Context, root: &Path, enabled: bool) {
         if !self.visible {
@@ -670,6 +790,8 @@ impl Terminal {
         let labels = self.labels();
         let mut new = false;
         let mut close = None;
+        let mut share_tab = None;
+        let mut stop_share = None;
         egui::Frame::new()
             .fill(chrome::PANEL)
             .inner_margin(egui::Margin::symmetric(8, 6))
@@ -695,6 +817,61 @@ impl Terminal {
                                         false,
                                         &format!("{}\n{}", tab.root.display(), tab.shell),
                                     );
+                                    response.response.context_menu(|ui| {
+                                        if let Some(session) = &tab.persistent {
+                                            ui.label(
+                                                egui::RichText::new("tmux session")
+                                                    .small()
+                                                    .color(chrome::MUTED),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(&session.name).monospace(),
+                                            );
+                                            if ui.button("Copy tmux session ID").clicked() {
+                                                ui.ctx().copy_text(session.name.clone());
+                                                ui.close();
+                                            }
+                                            if ui.button("Copy tmux attach command").clicked() {
+                                                ui.ctx().copy_text(format!(
+                                                    "tmux -L glimcode attach-session -t {}",
+                                                    session.name,
+                                                ));
+                                                ui.close();
+                                            }
+                                            ui.separator();
+                                            let sharing = self
+                                                .shares
+                                                .get(&tab.id)
+                                                .is_some_and(share::Share::active);
+                                            if ui
+                                                .add_enabled(
+                                                    !exited,
+                                                    egui::Button::new(if sharing {
+                                                        "Manage ttyd sharing…"
+                                                    } else {
+                                                        "Share with ttyd…"
+                                                    }),
+                                                )
+                                                .clicked()
+                                            {
+                                                share_tab = Some(tab.id);
+                                                ui.close();
+                                            }
+                                            if sharing && ui.button("Stop sharing").clicked() {
+                                                stop_share = Some(tab.id);
+                                                ui.close();
+                                            }
+                                            ui.separator();
+                                        }
+                                        if ui.button("New terminal").clicked() {
+                                            new = true;
+                                            ui.close();
+                                        }
+                                        if ui.button("Close terminal").clicked() {
+                                            close = Some(index);
+                                            ui.close();
+                                        }
+                                    });
                                     if response.activate {
                                         self.active = index;
                                         self.focus = true;
@@ -764,6 +941,23 @@ impl Terminal {
         // for that width, and a right aligned prompt keeps it until the next
         // command.
         self.sync_background_size();
+        if let Some(id) = share_tab {
+            self.share_target = Some(id);
+            self.share_error = None;
+            self.share_qr_url.clear();
+            self.share_qr = None;
+            if let Some(server) = self.shares.get(&id) {
+                self.share_options = server.options.clone();
+            } else {
+                self.share_options = share::Options::from_settings(
+                    &self.settings,
+                    7681u16.saturating_add(self.shares.len() as u16),
+                );
+            }
+        }
+        if let Some(id) = stop_share {
+            self.shares.remove(&id);
+        }
         if new {
             self.new_tab(root, &ctx);
         }
@@ -833,7 +1027,16 @@ impl Terminal {
         }
     }
     fn close(&mut self, index: usize) {
+        let id = self.tabs[index].id;
+        self.shares.remove(&id);
+        if self.share_target == Some(id) {
+            self.share_target = None;
+        }
+        if let Some(session) = &self.tabs[index].persistent {
+            session.close();
+        }
         self.tabs.remove(index);
+        self.metadata_changed = true;
         if self.active > index {
             self.active -= 1;
         }
@@ -875,6 +1078,7 @@ impl Terminal {
             .collect()
     }
     pub fn windows(&mut self, ctx: &egui::Context) {
+        self.share_window(ctx);
         if self.settings_open {
             let mut save = false;
             let mut cancel = false;
@@ -940,6 +1144,29 @@ impl Terminal {
                                 ui.label(egui::RichText::new("Leave empty for automatic names. Duplicates get (2), (3), …").size(crate::preferences::dialog_font_size(ui.ctx())).color(chrome::MUTED));
                             });
                             ui.label(egui::RichText::new("New sessions start in the project directory. Existing sessions keep their shell and working directory.").size(crate::preferences::dialog_font_size(ui.ctx())).color(chrome::MUTED));
+                            ui.add_space(10.0);
+                            chrome::dialog_section(ui, "Terminal HTTPS", "Override the certificate used for new ttyd shares.");
+                            chrome::dialog_card(ui, |ui| {
+                                for (label, value) in [
+                                    ("Certificate file (PEM)", &mut self.draft.terminal_tls_certificate),
+                                    ("Private key file (unencrypted PEM)", &mut self.draft.terminal_tls_private_key),
+                                ] {
+                                    ui.label(egui::RichText::new(label).strong());
+                                    ui.horizontal(|ui| {
+                                        ui.add(egui::TextEdit::singleline(value).desired_width((ui.available_width() - 110.0).max(120.0))
+                                            .margin(egui::vec2(10.0, 9.0)).hint_text("Default · generated certificate in ~/.glimcode/terminal-tls"));
+                                        if chrome::dialog_button(ui, "Browse…", None).clicked()
+                                            && let Some(path) = rfd::FileDialog::new().set_title(label).pick_file() {
+                                            *value = path.to_string_lossy().into_owned();
+                                        }
+                                    });
+                                }
+                                if chrome::dialog_button(ui, "Use generated certificate", None).clicked() {
+                                    self.draft.terminal_tls_certificate.clear();
+                                    self.draft.terminal_tls_private_key.clear();
+                                }
+                                ui.label("Set both files, or leave both empty to reuse ~/.glimcode/terminal-tls. Changes apply to new shares; existing shares keep their certificate. Private keys stay on this Mac.");
+                            });
                             if let Some(error) = &self.settings_error {
                                 ui.add_space(4.0);
                                 chrome::dialog_card(ui, |ui| { ui.colored_label(chrome::DANGER, error); });
@@ -954,6 +1181,7 @@ impl Terminal {
                 });
             if save {
                 let result = self.draft.command(Path::new(".")).and_then(|_| {
+                    self.draft.validate_terminal_tls()?;
                     self.draft.save(
                         &crate::preferences::path().context("No home directory for preferences")?,
                     )
@@ -1023,8 +1251,166 @@ impl Terminal {
                 });
         }
     }
+    fn share_window(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.share_target else {
+            return;
+        };
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) else {
+            self.share_target = None;
+            return;
+        };
+        let session = tab.persistent.clone();
+        let mut dismiss = false;
+        let mut start = false;
+        let mut stop = false;
+        egui::Modal::new(egui::Id::new("share-terminal-dialog"))
+            .frame(chrome::popup_frame()).show(ctx, |ui| {
+                chrome::modal_style(ui, 540.0);
+                dismiss |= chrome::dialog_header(ui, ">_", "Share terminal with ttyd",
+                    "Use this terminal from a browser", chrome::BLUE);
+                ui.label(egui::RichText::new(session.as_ref().map_or("No tmux session", |s| s.name.as_str())).monospace());
+                egui::ScrollArea::vertical()
+                    .id_salt("share-terminal-body")
+                    .max_height((ctx.content_rect().height() - 240.0).max(140.0))
+                    .show(ui, |ui| {
+                if let Some(server) = self.shares.get(&id) {
+                    match server.status() {
+                        share::Status::Starting => { ui.label("Starting ttyd…"); }
+                        share::Status::Running => {
+                            ui.label(if server.options.writable { "Sharing is active · browser control enabled" } else { "Sharing is active · view only" });
+                            let url = server.local_url();
+                            ui.horizontal(|ui| {
+                                if ui.button("Open in browser").clicked() { ctx.open_url(egui::OpenUrl::new_tab(&url)); }
+                                if ui.button("Copy local link").clicked() { ctx.copy_text(url.clone()); }
+                            });
+                            if server.options.network {
+                                let urls = share::network_urls(server.options.port, server.options.https);
+                                if urls.is_empty() {
+                                    ui.label("No LAN or Tailscale IPv4 address was found. Connect to your network to show a mobile QR code.");
+                                } else {
+                                    if !urls.contains(&self.share_qr_url) { self.share_qr_url = urls[0].clone(); }
+                                    ui.label("Scan to connect from your phone:");
+                                    egui::ComboBox::from_id_salt("terminal-share-address")
+                                        .selected_text(&self.share_qr_url).show_ui(ui, |ui| {
+                                            for url in &urls { ui.selectable_value(&mut self.share_qr_url, url.clone(), url); }
+                                        });
+                                    ui.checkbox(&mut self.share_qr_login, "Include login details in the QR code");
+                                    let payload = if self.share_qr_login {
+                                        share::login_url(&self.share_qr_url, &server.password)
+                                    } else { Ok(self.share_qr_url.clone()) };
+                                    match payload {
+                                        Ok(payload) => {
+                                            if self.share_qr.as_ref().is_none_or(|(previous, _)| previous != &payload) {
+                                                match qr::Code::encode(&payload) {
+                                                    Ok(code) => self.share_qr = Some((payload.clone(), code)),
+                                                    Err(error) => { self.share_qr = None; ui.colored_label(chrome::DANGER, error.to_string()); }
+                                                }
+                                            }
+                                            if let Some((_, code)) = &self.share_qr { code.show(ui); }
+                                            if ui.button(if self.share_qr_login { "Copy link with login details" } else { "Copy mobile link" }).clicked() {
+                                                ctx.copy_text(payload);
+                                            }
+                                        }
+                                        Err(error) => { ui.colored_label(chrome::DANGER, error.to_string()); }
+                                    }
+                                    if self.share_qr_login {
+                                        ui.label("Anyone who scans this code gets this terminal’s login details. Some browsers still ask for a username and password.");
+                                    }
+                                }
+                                if !server.options.https { ui.label("Use a trusted network or Tailscale. This link uses HTTP."); }
+                            } else {
+                                ui.label("Enable access from other devices when starting sharing to show a mobile QR code.");
+                            }
+                            if server.options.https {
+                                if !server.options.custom_tls {
+                                    ui.label("HTTPS uses the self-signed certificate saved in ~/.glimcode/terminal-tls. Your browser will show a trust warning. Verify the certificate fingerprint before accepting it.");
+                                } else { ui.label("HTTPS is active. The certificate must cover the address you open."); }
+                                if let Some(fingerprint) = server.fingerprint() {
+                                    ui.label("Certificate SHA-256 fingerprint:");
+                                    ui.add(egui::Label::new(egui::RichText::new(&fingerprint).monospace()).wrap());
+                                    if ui.button("Copy certificate fingerprint").clicked() { ctx.copy_text(fingerprint); }
+                                }
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label("Username: glimcode");
+                                if ui.button("Copy password").clicked() { ctx.copy_text(server.password.clone()); }
+                            });
+                            ui.label("The browser asks for this username and password before connecting.");
+                        }
+                        share::Status::Failed(error) => { ui.colored_label(chrome::DANGER, error); }
+                        share::Status::Stopped => { ui.label("Sharing stopped."); }
+                    }
+                    if server.active() {
+                        if ui.button("Stop sharing").clicked() { stop = true; }
+                        ctx.request_repaint_after(Duration::from_millis(250));
+                    } else if ui.button("Set up sharing again").clicked() { stop = true; }
+                } else {
+                    ui.checkbox(&mut self.share_options.network, "Allow access from other devices (LAN / Tailscale)");
+                    ui.checkbox(&mut self.share_options.writable, "Allow typing in the browser");
+                    ui.horizontal(|ui| {
+                        ui.label("Port");
+                        ui.add(egui::DragValue::new(&mut self.share_options.port).range(1024..=65535));
+                    });
+                    ui.checkbox(&mut self.share_options.https, "Use HTTPS (encrypted connection)");
+                    if self.share_options.https {
+                        ui.checkbox(&mut self.share_options.custom_tls, "Use my own certificate and private key");
+                        if self.share_options.custom_tls {
+                            ui.label("Certificate (PEM, including intermediate certificates if needed)");
+                            ui.horizontal(|ui| {
+                                ui.text_edit_singleline(&mut self.share_options.certificate);
+                                if ui.button("Browse…").clicked()
+                                    && let Some(path) = rfd::FileDialog::new().set_title("Choose HTTPS certificate").pick_file() {
+                                    self.share_options.certificate = path.to_string_lossy().into_owned();
+                                }
+                            });
+                            ui.label("Private key (unencrypted PEM; stays on this Mac)");
+                            ui.horizontal(|ui| {
+                                ui.text_edit_singleline(&mut self.share_options.private_key);
+                                if ui.button("Browse…").clicked()
+                                    && let Some(path) = rfd::FileDialog::new().set_title("Choose HTTPS private key").pick_file() {
+                                    self.share_options.private_key = path.to_string_lossy().into_owned();
+                                }
+                            });
+                        } else {
+                            ui.label("A certificate and private key are saved in ~/.glimcode/terminal-tls and reused. Browsers will show a self-signed certificate warning.");
+                        }
+                    }
+                    ui.label(if self.share_options.network {
+                        "Listens on all IPv4 interfaces. A password is required."
+                    } else { "Only this computer can connect. A password is required." });
+                    if tmux::find_executable("ttyd").is_none() {
+                        ui.colored_label(chrome::WARNING, "Install ttyd first: brew install ttyd");
+                    }
+                    if let Some(error) = &self.share_error { ui.colored_label(chrome::DANGER, error); }
+                    start = chrome::dialog_button(ui, "Start sharing", Some(chrome::BLUE)).clicked();
+                }
+                ui.label(egui::RichText::new("Sharing stops when this tab closes or Glimcode quits. Stopping sharing keeps the terminal running.").small().color(chrome::MUTED));
+                    });
+                chrome::dialog_divider(ui);
+                dismiss |= chrome::dialog_button(ui, "Done", None).clicked();
+                dismiss |= ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+            });
+        if stop {
+            self.shares.remove(&id);
+        }
+        if start {
+            if let Some(session) = session {
+                match share::Share::start(session, self.share_options.clone(), ctx.clone()) {
+                    Ok(server) => {
+                        self.shares.insert(id, server);
+                        self.share_error = None;
+                    }
+                    Err(error) => self.share_error = Some(format!("{error:#}")),
+                }
+            }
+        }
+        if dismiss {
+            self.share_target = None;
+            self.share_qr = None;
+        }
+    }
     pub fn modal(&self) -> bool {
-        self.settings_open || self.pending_close.is_some()
+        self.settings_open || self.pending_close.is_some() || self.share_target.is_some()
     }
 }
 
@@ -2167,7 +2553,7 @@ fn render(
                 origin, cell,
             )));
     }
-    if let Some(error) = &state.error {
+    if let Some(error) = state.error.as_ref().or(tab.notice.as_ref()) {
         painter.text(
             rect.left_bottom(),
             egui::Align2::LEFT_BOTTOM,
@@ -2379,6 +2765,8 @@ mod tests {
                 selection: None,
                 scroll_remainder: 0.0,
                 view: TerminalView::default(),
+                persistent: None,
+                notice: None,
             };
             let mut focus = false;
             let mut remaining = 0;
@@ -2584,6 +2972,8 @@ mod tests {
             selection: None,
             scroll_remainder: 0.0,
             view: TerminalView::default(),
+            persistent: None,
+            notice: None,
         };
         let mut focus = true;
         let mut time = 0.0;
@@ -2836,6 +3226,7 @@ mod tests {
         let root = dir.path().canonicalize()?;
         let ctx = egui::Context::default();
         let mut terminal = Terminal::default();
+        terminal.direct_pty = true;
         terminal.settings.shell = "/bin/sh".into();
         terminal.new_tab(&root, &ctx);
         let frame = |terminal: &mut Terminal, key: Option<Key>| {
@@ -2901,6 +3292,8 @@ mod tests {
             selection: None,
             scroll_remainder: 0.0,
             view: TerminalView::default(),
+            persistent: None,
+            notice: None,
         };
         let mut focus = true;
         for key in [
@@ -3154,6 +3547,200 @@ mod tests {
     }
 
     #[test]
+    fn persistent_terminal_metadata_preserves_ids_and_rejects_foreign_targets() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let value = serde_json::json!({"roots": [dir.path(), dir.path()],
+            "sessions": ["glimcode-test-123", "personal:0"], "active": 1, "visible": false});
+        let mut terminal = Terminal::default();
+        terminal.restore(&value);
+        assert!(terminal.tabs.is_empty());
+        assert_eq!(
+            terminal.snapshot()["sessions"],
+            serde_json::json!(["glimcode-test-123", null])
+        );
+        assert!(!terminal.take_metadata_changed());
+        for name in [
+            "",
+            "glimcode-",
+            "other-session",
+            "glimcode-x:0",
+            "glimcode-x;kill-server",
+            "glimcode-x\n",
+        ] {
+            assert!(!tmux::valid_name(name), "{name:?}");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires tmux and permission to create local Unix sockets; run outside a sandbox"]
+    fn tmux_sessions_survive_editor_disconnect_and_restore_the_running_shell() -> Result<()> {
+        if tmux::executable().is_none() {
+            eprintln!("tmux not installed; skipping integration test");
+            return Ok(());
+        }
+        struct Cleanup(Vec<tmux::Persistent>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for session in &self.0 {
+                    session.close();
+                }
+            }
+        }
+        let dir = tempfile::tempdir()?;
+        let nested = dir.path().join("nested directory");
+        std::fs::create_dir(&nested)?;
+        let marker = dir.path().join("background-finished");
+        let ctx = egui::Context::default();
+        let mut terminal = Terminal::default();
+        terminal.settings.shell = "/bin/sh".into();
+        terminal.new_tab(dir.path(), &ctx);
+        let backend = terminal.tabs[0].persistent.clone().expect("tmux backend");
+        let mut cleanup = Cleanup(vec![backend.clone()]);
+        assert!(terminal.take_metadata_changed());
+        assert!(terminal.tabs[0].send(Command::Resize(FALLBACK_SIZE)));
+        wait_for(&terminal.tabs[0].screen, |s| {
+            s.status == "Running" || s.error.is_some()
+        });
+        {
+            let state = terminal.tabs[0].screen.lock().unwrap();
+            assert!(state.error.is_none(), "{:?}", state.error);
+        }
+        let input = format!(
+            "export GLIMCODE_RESUME=kept; cd {}; i=0; while [ $i -lt 60 ]; do printf 'HISTORY_KEEP_%s\\n' \"$i\"; i=$((i+1)); done; printf 'PID:%s:READY\\n' \"$$\"; (sleep 0.3; printf done > {}) &\n",
+            shell_words::quote(&nested.to_string_lossy()),
+            shell_words::quote(&marker.to_string_lossy())
+        );
+        assert!(terminal.tabs[0].send(Command::Input(input.into_bytes())));
+        wait_for(&terminal.tabs[0].screen, |s| {
+            s.parser.screen().contents().contains(":READY")
+        });
+        // Read the actual shell PID from tmux, independently of terminal echo.
+        let pane = backend.run_for_test(&[
+            "display-message",
+            "-p",
+            "-t",
+            &format!("={}", backend.name),
+            "#{pane_pid}",
+        ])?;
+        let pid = String::from_utf8(pane.stdout)?.trim().to_owned();
+        let saved = terminal.snapshot();
+        let screen = terminal.tabs[0].screen.clone();
+        drop(terminal); // Same disconnect path as quitting the editor.
+        wait_for(&screen, |s| s.exited);
+        assert!(backend.exists(), "quitting must leave the tmux shell alive");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&marker)?,
+            "done",
+            "background process continued while detached"
+        );
+        assert_eq!(
+            backend.directory().and_then(|p| p.canonicalize().ok()),
+            Some(nested.canonicalize()?)
+        );
+
+        let mut restored = Terminal::default();
+        // Existing sessions must reconnect even if new-shell preferences are invalid.
+        restored.settings.shell = "/does/not/exist".into();
+        restored.restore(&saved);
+        restored.materialize_restored_tabs(&ctx);
+        assert_eq!(restored.snapshot()["sessions"], saved["sessions"]);
+        let size = PtySize {
+            rows: 31,
+            cols: 101,
+            ..FALLBACK_SIZE
+        };
+        assert!(restored.tabs[0].send(Command::Resize(size)));
+        wait_for(&restored.tabs[0].screen, |s| {
+            s.status == "Running" || s.error.is_some()
+        });
+        assert!(restored.tabs[0].send(Command::Input(
+            b"printf 'RESTORED:%s:%s:END\\n' \"$GLIMCODE_RESUME\" \"$$\"\n".to_vec()
+        )));
+        wait_for(&restored.tabs[0].screen, |s| {
+            s.parser
+                .screen()
+                .contents()
+                .contains(&format!("RESTORED:kept:{pid}:END"))
+        });
+        assert!(restored.tabs[0].screen.lock().unwrap().error.is_none());
+        {
+            let mut state = restored.tabs[0].screen.lock().unwrap();
+            assert!(
+                !state.parser.screen().alternate_screen(),
+                "tmux must preserve native scrollback"
+            );
+            state.parser.screen_mut().set_scrollback(5000);
+            assert!(
+                state.parser.screen().contents().contains("HISTORY_KEEP_0"),
+                "retained history must reconnect too"
+            );
+            state.parser.screen_mut().set_scrollback(0);
+        }
+        let geometry = backend.run_for_test(&[
+            "display-message",
+            "-p",
+            "-t",
+            &format!("={}", backend.name),
+            "#{pane_width}x#{pane_height}",
+        ])?;
+        assert_eq!(String::from_utf8(geometry.stdout)?.trim(), "101x31");
+
+        restored.settings.shell = "/bin/sh".into();
+        restored.new_tab(dir.path(), &ctx);
+        let other = restored.tabs[1].persistent.clone().unwrap();
+        cleanup.0.push(other.clone());
+        assert_ne!(backend.name, other.name);
+        assert!(restored.tabs[1].send(Command::Resize(FALLBACK_SIZE)));
+        wait_for(&restored.tabs[1].screen, |s| {
+            s.status == "Running" || s.error.is_some()
+        });
+        restored.close(0);
+        assert!(restored.take_metadata_changed());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while backend.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !backend.exists(),
+            "explicit close must terminate the persistent session"
+        );
+        assert!(
+            other.exists(),
+            "closing one tab must leave other sessions alive"
+        );
+        restored.close(0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while other.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!other.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_close_before_startup_does_not_leave_a_session() -> Result<()> {
+        if tmux::executable().is_none() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let mut terminal = Terminal::default();
+        terminal.new_tab(dir.path(), &egui::Context::default());
+        let backend = terminal.tabs[0].persistent.clone().unwrap();
+        let screen = terminal.tabs[0].screen.clone();
+        terminal.close(0);
+        wait_for(&screen, |s| s.exited);
+        assert!(!backend.exists());
+        Ok(())
+    }
+
+    #[test]
     fn restored_terminal_metadata_is_lazy_and_roundtrips_without_spawning_shells() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut terminal = Terminal::default();
@@ -3235,6 +3822,8 @@ mod tests {
             selection: None,
             scroll_remainder: 0.0,
             view: TerminalView::default(),
+            persistent: None,
+            notice: None,
         };
         let mut focus = true;
         let mut frame = |events, focused| {
@@ -3457,6 +4046,7 @@ mod tests {
         let root = dir.path().canonicalize()?;
         let ctx = egui::Context::default();
         let mut terminal = Terminal::default();
+        terminal.direct_pty = true;
         terminal.settings.shell = "/bin/sh -c 'stty size'".into();
         terminal.settings.tab_name = "Local".into();
         terminal.new_tab(&root, &ctx);
@@ -3507,6 +4097,7 @@ mod tests {
         let other = second.path().canonicalize()?;
         let ctx = egui::Context::default();
         let mut terminal = Terminal::default();
+        terminal.direct_pty = true;
         terminal.settings.shell = "/bin/sh".into();
         terminal.settings.tab_name = "Local".into();
         terminal.new_tab(&root, &ctx);
@@ -3567,6 +4158,8 @@ mod tests {
             selection: None,
             scroll_remainder: 0.0,
             view: TerminalView::default(),
+            persistent: None,
+            notice: None,
         };
         let (tx, rx_active) = mpsc::sync_channel(128);
         let active = Session {
@@ -3582,6 +4175,8 @@ mod tests {
             selection: None,
             scroll_remainder: 0.0,
             view: TerminalView::default(),
+            persistent: None,
+            notice: None,
         };
         let mut terminal = Terminal {
             tabs: vec![active, background],
@@ -3637,6 +4232,8 @@ mod tests {
             selection: None,
             scroll_remainder: 0.0,
             view: TerminalView::default(),
+            persistent: None,
+            notice: None,
         };
         let mut focus = true;
         let mut frame = |events, size| {

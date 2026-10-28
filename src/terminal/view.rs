@@ -471,6 +471,8 @@ mod tests {
             selection: None,
             scroll_remainder: 0.0,
             view: TerminalView::default(),
+            persistent: None,
+            notice: None,
         });
         terminal.tabs[0]
             .screen

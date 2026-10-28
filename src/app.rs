@@ -689,6 +689,9 @@ impl Coder {
         let canonical = path.canonicalize().unwrap_or(path);
         if let Some(index) = self.documents.iter().position(|d| d.path == canonical) {
             self.active = index;
+            if let Err(error) = self.documents[index].refresh_if_clean(self.csv_headers) {
+                self.status = format!("Could not reload {}: {error}", canonical.display());
+            }
         } else {
             match Document::open(canonical, self.csv_headers) {
                 Ok(doc) => {
@@ -910,11 +913,7 @@ impl Coder {
             .chain((0..self.documents.len()).filter(|index| *index != self.active))
             .filter_map(|index| self.documents.get(index))
             .map(|doc| {
-                let source = match &doc.content {
-                    Content::Text(text) if doc.dirty => Some(text.to_string()),
-                    Content::Text(_) => None,
-                    Content::Csv(sheet) => Some(sheet.serialize().unwrap_or_default()),
-                };
+                let source = doc.dirty.then(|| doc.source_text().unwrap_or_default());
                 (doc.path.clone(), source)
             })
             .collect::<Vec<_>>();
@@ -2408,13 +2407,12 @@ impl Coder {
         let document = self
             .documents
             .iter()
-            .find(|doc| doc.path == location.path && matches!(doc.content, Content::Text(_)));
+            .find(|doc| doc.path == location.path && doc.dirty);
         let revision = document.map(Document::revision);
         if self.preview.needs(&location.path, dark, revision) {
-            let source = document.and_then(|doc| match &doc.content {
-                Content::Text(text) => Some(text.to_string()),
-                Content::Csv(_) => None,
-            });
+            // Match the search worker: clean files come from disk, while
+            // unsaved edits (including CSV grids) come from the editor.
+            let source = document.map(|doc| doc.source_text().unwrap_or_default());
             self.preview
                 .request(location.path.clone(), source, dark, revision);
         }
@@ -2661,35 +2659,51 @@ impl Coder {
                         bottom: 0,
                     })
                     .show(ui, |ui| {
-                        egui::ScrollArea::horizontal()
-                            .id_salt("tabs")
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    for (index, doc) in self.documents.iter().enumerate() {
-                                        let title = doc
-                                            .path
-                                            .file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy();
-                                        let tab = chrome::workspace_tab(
-                                            ui,
-                                            ui.make_persistent_id(("editor-tab", &doc.path)),
-                                            &title,
-                                            chrome::TabKind::File(&doc.path),
-                                            index == self.active,
-                                            doc.dirty,
-                                            &doc.path.display().to_string(),
-                                        );
-                                        if tab.activate {
-                                            activate = Some(index);
+                        ui.horizontal(|ui| {
+                            egui::ScrollArea::horizontal()
+                                .id_salt("tabs")
+                                .max_width((ui.available_width() - 40.0).max(0.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        for (index, doc) in self.documents.iter().enumerate() {
+                                            let title = doc
+                                                .path
+                                                .file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy();
+                                            let tab = chrome::workspace_tab(
+                                                ui,
+                                                ui.make_persistent_id(("editor-tab", &doc.path)),
+                                                &title,
+                                                chrome::TabKind::File(&doc.path),
+                                                index == self.active,
+                                                doc.dirty,
+                                                &doc.path.display().to_string(),
+                                            );
+                                            if tab.activate {
+                                                activate = Some(index);
+                                            }
+                                            if tab.close {
+                                                close = Some(index);
+                                            }
                                         }
-                                        if tab.close {
-                                            close = Some(index);
-                                        }
-                                    }
+                                    });
                                 });
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                if chrome::icon_button(
+                                    ui,
+                                    chrome::Icon::HideDown,
+                                    "Minimize editor · show terminal",
+                                )
+                                .clicked()
+                                {
+                                    self.commit_current_sheet();
+                                    self.focus_editor = false;
+                                    self.terminal.maximize(&self.root, ctx);
+                                }
                             });
+                        });
                     });
                 if let Some(index) = activate {
                     self.queue_action(FrameAction::Activate(index));
@@ -3840,7 +3854,23 @@ impl Coder {
             chrome::clear_resize_cursor(ctx);
         }
         self.dialogs(ctx);
+        let editing_preferences = self.terminal.settings_open;
         self.terminal.windows(ctx);
+        if editing_preferences && !self.terminal.settings_open {
+            // Certificate overrides are global even for cached worktree terminals.
+            for session in self.worktree_sessions.values_mut() {
+                session
+                    .terminal
+                    .settings
+                    .terminal_tls_certificate
+                    .clone_from(&self.terminal.settings.terminal_tls_certificate);
+                session
+                    .terminal
+                    .settings
+                    .terminal_tls_private_key
+                    .clone_from(&self.terminal.settings.terminal_tls_private_key);
+            }
+        }
         self.worktrees.dialog(ctx);
         let mut panels = Vec::new();
         if self.show_worktrees {
@@ -3875,6 +3905,10 @@ impl Coder {
 impl eframe::App for Coder {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.draw(ctx);
+        // Persist session IDs immediately, so an editor crash can reconnect too.
+        if self.terminal.take_metadata_changed() {
+            self.save_session();
+        }
         #[cfg(feature = "ui-capture")]
         if let Ok(path) = std::env::var("CODER_CAPTURE_TO") {
             let screenshot = ctx.input(|i| {
@@ -6356,7 +6390,7 @@ mod tests {
                 .rect
         };
         let docked = frame(&mut app);
-        app.terminal.maximized = true;
+        app.terminal.maximize(dir.path(), &ctx);
         let expanded = frame(&mut app);
         assert!(expanded.height() > docked.height() + 200.0);
         assert!(expanded.top() < docked.top());
@@ -6369,6 +6403,18 @@ mod tests {
         let restored = frame(&mut app);
         assert!((restored.height() - docked.height()).abs() < 1.0);
         assert_eq!(app.documents[app.active].path, path);
+        app.terminal.visible = false;
+        app.terminal.maximize(dir.path(), &ctx);
+        let expanded_from_hidden = frame(&mut app);
+        assert!(app.terminal.visible);
+        assert!(app.terminal.focused(&ctx));
+        assert!((expanded_from_hidden.height() - expanded.height()).abs() < 1.0);
+        assert_eq!(app.documents[app.active].path, path);
+        assert_eq!(
+            app.terminal.snapshot()["roots"].as_array().unwrap().len(),
+            1,
+            "showing the terminal must reuse its existing session"
+        );
         Ok(())
     }
 
@@ -7534,6 +7580,85 @@ mod tests {
         frame(&mut app, Some(Key::ArrowUp));
         assert_eq!(app.result_selection, 39);
         assert!(frame(&mut app, None).1 > 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn search_preview_and_navigation_use_disk_for_clean_tabs_and_buffers_for_edits()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let path = root.join("changed.rs");
+        let other = root.join("other.rs");
+        std::fs::write(&path, "fn needle() {}\n")?;
+        std::fs::write(&other, "fn other() {}\n")?;
+        let mut app = Coder::empty(root);
+        app.open(path.clone(), None);
+        app.open(other, None);
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+
+        for (disk, buffer) in [
+            ("// external\n\nfn needle() {}\n", None),
+            ("// changed again\n\n\nfn needle() {}\n", None),
+            (
+                "// disk differs\n\n\n\nfn needle() {}\n",
+                Some("// unsaved\nfn needle() {}\n"),
+            ),
+        ] {
+            app.active = 1; // Leave the changed file in an inactive tab.
+            std::fs::write(&path, disk)?;
+            if let Some(buffer) = buffer {
+                app.documents[0].content = Content::Text(buffer.into());
+                app.documents[0].dirty = true;
+                app.documents[0].mark_changed();
+            }
+            let expected = buffer.unwrap_or(disk);
+            app.query = "needle".into();
+            app.run_search(SearchKind::References, false);
+            wait_for_search(&mut app, &ctx);
+            assert!(app.search_rx.is_none());
+            assert_eq!(app.results.len(), 1);
+            let location = app.results[0].clone();
+            assert_eq!(location.path, path);
+            let line = expected
+                .lines()
+                .position(|line| line.contains("needle"))
+                .unwrap()
+                + 1;
+            assert_eq!(location.line, line);
+
+            let started = Instant::now();
+            loop {
+                app.preview.poll();
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        app.search_preview(ui, &location, 300.0);
+                    });
+                });
+                if app
+                    .preview
+                    .current
+                    .as_ref()
+                    .is_some_and(|preview| preview.source() == expected)
+                {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "preview must use the same content as search"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                app.preview.current.as_ref().unwrap().line_text(line - 1),
+                "fn needle() {}"
+            );
+            app.navigate(location);
+            assert_eq!(app.documents[app.active].source_text()?, expected);
+            assert_eq!(app.documents[app.active].jump, Some((line, 4)));
+            assert_eq!(app.documents[app.active].dirty, buffer.is_some());
+        }
         Ok(())
     }
 
