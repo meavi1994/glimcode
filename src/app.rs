@@ -5061,6 +5061,12 @@ fn text_editor(
                 } else {
                     Color32::from_gray(212)
                 };
+                // Keep the active scope distinct from blue Git change markers.
+                let active_guide_color = if ui.visuals().dark_mode {
+                    Color32::from_rgb(156, 150, 138)
+                } else {
+                    Color32::from_rgb(116, 110, 98)
+                };
                 let small_structure = if large {
                     crate::editor_structure::Structure::default()
                 } else {
@@ -5114,7 +5120,7 @@ fn text_editor(
                                     if active_guide
                                         .is_some_and(|active| std::ptr::eq(active, guide))
                                     {
-                                        chrome::BLUE
+                                        active_guide_color
                                     } else {
                                         guide_color
                                     },
