@@ -3767,11 +3767,22 @@ mod tests {
         ])?;
         assert_eq!(String::from_utf8(mouse_state.stdout)?.trim(), "off:0");
         let bindings = backend.run_for_test(&["list-keys"])?;
+        let bindings = String::from_utf8(bindings.stdout)?;
+        let root: Vec<_> = bindings
+            .lines()
+            .filter(|line| line.split_whitespace().any(|word| word == "root"))
+            .collect();
+        assert_eq!(
+            root.len(),
+            2,
+            "only wheel forwarding belongs in the root table"
+        );
         assert!(
-            !String::from_utf8(bindings.stdout)?.lines().any(|line| {
-                line.split_whitespace()
-                    .any(|word| word == "root" || word == "prefix")
-            }),
+            root.iter().all(|line| line.ends_with("send-keys -M")
+                && (line.contains("WheelUpPane") || line.contains("WheelDownPane")))
+                && !bindings
+                    .lines()
+                    .any(|line| line.split_whitespace().any(|word| word == "prefix")),
             "tmux must not intercept selection"
         );
         assert!(restored.tabs[0].send(Command::Input(
@@ -3805,6 +3816,34 @@ mod tests {
             "#{pane_width}x#{pane_height}",
         ])?;
         assert_eq!(String::from_utf8(geometry.stdout)?.trim(), "101x31");
+
+        // Exercise a mouse-aware program through the actual client PTY and
+        // tmux, rather than only checking egui's outgoing wheel bytes. Removing
+        // every root binding silently swallowed these events inside tmux.
+        let report = dir.path().join("wheel-events");
+        let wheel = b"\x1b[<64;3;4M\x1b[<65;3;4M";
+        let capture = format!(
+            "stty raw -echo; printf '\\033[?1000h\\033[?1006h'; dd bs=1 count={} of={} 2>/dev/null; printf '\\033[?1000l\\033[?1006l'; stty sane\n",
+            wheel.len(),
+            shell_words::quote(&report.to_string_lossy())
+        );
+        assert!(restored.tabs[0].send(Command::Input(capture.into_bytes())));
+        wait_for(&restored.tabs[0].screen, |s| {
+            s.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+        });
+        assert!(restored.tabs[0].send(Command::Input(wheel.to_vec())));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while std::fs::read(&report).unwrap_or_default() != wheel && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read(&report)?,
+            wheel,
+            "wheel events must reach the application through tmux"
+        );
+        wait_for(&restored.tabs[0].screen, |s| {
+            s.parser.screen().mouse_protocol_mode() == vt100::MouseProtocolMode::None
+        });
 
         restored.settings.shell = "/bin/sh".into();
         restored.new_tab(dir.path(), &ctx);

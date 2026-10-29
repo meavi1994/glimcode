@@ -109,6 +109,8 @@ set -g prefix None
 set -g prefix2 None
 unbind-key -q -a -T prefix
 unbind-key -q -a -T root
+bind-key -T root WheelUpPane send-keys -M
+bind-key -T root WheelDownPane send-keys -M
 set -g mouse off
 set -g default-shell /bin/sh
 set -g default-terminal xterm-256color
@@ -227,6 +229,7 @@ esac
             r#"#!/bin/sh
 shift 3
 if [ "$1" = has-session ]; then exit 0; fi
+wheels=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         set-option)
@@ -241,6 +244,11 @@ while [ "$#" -gt 0 ]; do
                 exit 1
             fi
             shift 5 ;;
+        bind-key)
+            [ "$2" = -T ] && [ "$3" = root ] && [ "$5" = send-keys ] && [ "$6" = -M ] || exit 4
+            case "$4" in WheelUpPane|WheelDownPane) ;; *) exit 5 ;; esac
+            wheels=$((wheels + 1))
+            shift 6 ;;
         if-shell)
             [ "$3" = '=glimcode-test:' ] || exit 2
             shift 6 ;;
@@ -248,6 +256,7 @@ while [ "$#" -gt 0 ]; do
         *) exit 3 ;;
     esac
 done
+[ "$wheels" -eq 2 ] || exit 6
 "#,
         )?;
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
@@ -422,7 +431,9 @@ impl Persistent {
         // -f is read only when the server first starts. Repair restored sessions
         // too: tmux's root mouse bindings can enter copy-mode and copy into its
         // private buffer on mouse-up, bypassing Glimcode's selection/clipboard.
-        // With mouse off, mouse-aware programs still request their own events.
+        // Keep wheel forwarding: tmux dispatches application mouse events
+        // through root bindings too, even with its own mouse controls off.
+        // These bindings only pass events to the program, never enter copy-mode.
         // Session options use a literal session name. Unlike has-session,
         // their lookup does not reliably accept the '=' exact-match prefix.
         // Pane commands need the ':' separator to disambiguate the session
@@ -465,6 +476,20 @@ impl Persistent {
             "-a",
             "-T",
             "root",
+            ";",
+            "bind-key",
+            "-T",
+            "root",
+            "WheelUpPane",
+            "send-keys",
+            "-M",
+            ";",
+            "bind-key",
+            "-T",
+            "root",
+            "WheelDownPane",
+            "send-keys",
+            "-M",
             ";",
             "if-shell",
             "-t",
