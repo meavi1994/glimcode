@@ -303,7 +303,8 @@ impl Coder {
                     app.terminal.settings.editor_font_size = 18.0;
                     app.terminal.settings.terminal_font_size = 16.0;
                     app.terminal.settings.apply(&cc.egui_ctx);
-                    app.terminal.open_settings();
+                    app.terminal
+                        .open_settings_page(crate::preferences::SettingsPage::Appearance);
                 }
                 return app;
             }
@@ -1402,9 +1403,11 @@ impl Coder {
                         }
                     });
                     ui.menu_button("Settings", |ui| {
-                        if ui.button("Preferences…").clicked() {
-                            self.terminal.open_settings();
-                            ui.close();
+                        for page in crate::preferences::SettingsPage::ALL {
+                            if ui.button(format!("{}…", page.title())).clicked() {
+                                self.terminal.open_settings_page(page);
+                                ui.close();
+                            }
                         }
                     });
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -3885,8 +3888,19 @@ impl Coder {
         let editing_preferences = self.terminal.settings_open;
         self.terminal.windows(ctx);
         if editing_preferences && !self.terminal.settings_open {
-            // Certificate overrides are global even for cached worktree terminals.
+            // tmux and certificate preferences also apply to cached worktrees.
             for session in self.worktree_sessions.values_mut() {
+                session.terminal.settings.tmux_enabled = self.terminal.settings.tmux_enabled;
+                session
+                    .terminal
+                    .settings
+                    .tmux_client_args
+                    .clone_from(&self.terminal.settings.tmux_client_args);
+                session
+                    .terminal
+                    .settings
+                    .tmux_options
+                    .clone_from(&self.terminal.settings.tmux_options);
                 session
                     .terminal
                     .settings

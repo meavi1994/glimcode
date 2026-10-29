@@ -3,6 +3,8 @@ use super::*;
 use std::process::{Command as Process, Output};
 
 const SERVER: &str = "glimcode";
+#[cfg(test)]
+pub(super) use crate::preferences::tmux::MOUSE_EVENTS;
 const SESSION_FORMAT: &str =
     "#{session_id}\t#{session_name}\t#{session_attached}\t#{session_windows}\t#{pane_current_path}";
 
@@ -103,27 +105,6 @@ fn kill_session_with(executable: &Path, session: &SessionInfo) -> Result<()> {
     }
     Ok(())
 }
-const CONFIG: &str = "\
-set -g status off
-set -g prefix None
-set -g prefix2 None
-unbind-key -q -a -T prefix
-unbind-key -q -a -T root
-bind-key -T root WheelUpPane send-keys -M
-bind-key -T root WheelDownPane send-keys -M
-set -g mouse off
-set -g default-shell /bin/sh
-set -g default-terminal xterm-256color
-set -g history-limit 5000
-set -g destroy-unattached off
-set -g set-titles on
-set -g set-titles-string '#{pane_title}'
-set -g focus-events on
-set -s escape-time 0
-set -s extended-keys on
-set -as terminal-overrides ',xterm-256color:smcup@:rmcup@:XT:RGB'
-";
-
 #[derive(Clone)]
 pub(super) struct Persistent {
     pub name: String,
@@ -136,6 +117,48 @@ pub(super) struct Persistent {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn reconnect_history_waits_for_our_client_and_reports_capture_failures() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let executable = dir.path().join("tmux");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+shift 3
+case "$1" in
+list-clients)
+    marker="$(dirname "$0")/attached"
+    if [ -f "$marker" ]; then printf '123\n'; else touch "$marker"; fi ;;
+capture-pane)
+    [ "$5" = '=glimcode-history:' ] || { echo "invalid pane target" >&2; exit 1; }
+    [ -f "$(dirname "$0")/attached" ] || exit 2
+    [ ! -f "$(dirname "$0")/fail" ] || { echo "capture failed" >&2; exit 3; }
+    i=0; while [ "$i" -lt 50 ]; do printf 'restored line %s\n' "$i"; i=$((i + 1)); done ;;
+*) exit 4 ;;
+esac
+"#,
+        )?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+        let backend = Persistent {
+            name: "glimcode-history".into(),
+            executable,
+            closed: Arc::new(AtomicBool::new(false)),
+            lifecycle: Arc::new(Mutex::new(())),
+        };
+        let history = backend.history(Some(123))?;
+        assert_eq!(String::from_utf8(history)?.lines().count(), 50);
+        std::fs::write(dir.path().join("fail"), "")?;
+        assert!(
+            backend
+                .history(Some(123))
+                .unwrap_err()
+                .to_string()
+                .contains("capture failed"),
+            "history errors must not masquerade as an empty scrollback"
+        );
+        Ok(())
+    }
 
     #[test]
     fn session_inventory_marks_detached_sorts_first_and_ignores_foreign_names() -> Result<()> {
@@ -218,45 +241,20 @@ esac
     }
 
     #[test]
-    fn restored_session_configuration_accepts_missing_tables_and_literal_targets() -> Result<()> {
+    fn restored_sessions_apply_the_editable_config_without_forced_overrides() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let executable = dir.path().join("tmux");
-        // Model tmux's distinct session-option and pane target lookup rules,
-        // with key tables already removed by startup or a previous reconnect.
-        // No socket is needed, so this also covers reconnect in the sandbox.
         std::fs::write(
             &executable,
             r#"#!/bin/sh
 shift 3
-if [ "$1" = has-session ]; then exit 0; fi
-wheels=0
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        set-option)
-            if [ "$3" != glimcode-test ]; then
-                echo "no such session: $3" >&2
-                exit 1
-            fi
-            shift 5 ;;
-        unbind-key)
-            if [ "$2" != -q ]; then
-                echo "table prefix doesn't exist yet" >&2
-                exit 1
-            fi
-            shift 5 ;;
-        bind-key)
-            [ "$2" = -T ] && [ "$3" = root ] && [ "$5" = send-keys ] && [ "$6" = -M ] || exit 4
-            case "$4" in WheelUpPane|WheelDownPane) ;; *) exit 5 ;; esac
-            wheels=$((wheels + 1))
-            shift 6 ;;
-        if-shell)
-            [ "$3" = '=glimcode-test:' ] || exit 2
-            shift 6 ;;
-        ';') shift ;;
-        *) exit 3 ;;
-    esac
-done
-[ "$wheels" -eq 2 ] || exit 6
+case "$1" in
+has-session) exit 0 ;;
+source-file)
+    [ "$2" = -t ] && [ "$3" = '=glimcode-test:' ] || exit 1
+    cat "$4" > "$(dirname "$0")/applied" ;;
+*) exit 2 ;;
+esac
 "#,
         )?;
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
@@ -266,13 +264,31 @@ done
             closed: Arc::new(AtomicBool::new(false)),
             lifecycle: Arc::new(Mutex::new(())),
         };
-        let settings = Settings {
+        let mut settings = Settings {
             shell: "/does/not/exist".into(),
-            ..Settings::default()
+            ..Default::default()
         };
         backend.attach(dir.path(), &settings, FALLBACK_SIZE)?;
         backend.attach(dir.path(), &settings, FALLBACK_SIZE)?;
-        assert_eq!(backend.name, "glimcode-test");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("applied"))?,
+            settings.tmux_config()?
+        );
+        settings.tmux_options = vec![
+            crate::preferences::tmux::Entry {
+                enabled: true,
+                command: "set -g mouse on".into(),
+            },
+            crate::preferences::tmux::Entry {
+                enabled: false,
+                command: "unbind-key -q -a -T root".into(),
+            },
+        ];
+        backend.attach(dir.path(), &settings, FALLBACK_SIZE)?;
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("applied"))?,
+            "set -g mouse on\n"
+        );
         Ok(())
     }
 }
@@ -341,6 +357,15 @@ impl Persistent {
     fn process(&self) -> Process {
         server_process(&self.executable)
     }
+    fn configured_process(&self, settings: &Settings) -> Result<Process> {
+        let mut command = Process::new(&self.executable);
+        command
+            .args(["-L", SERVER])
+            .args(settings.tmux_arguments()?)
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE");
+        Ok(command)
+    }
     fn run(&self, args: &[&str]) -> Result<Output> {
         let output = self
             .process()
@@ -370,6 +395,9 @@ impl Persistent {
         if self.closed.load(Ordering::Relaxed) {
             bail!("Terminal session was closed");
         }
+        let mut config = tempfile::NamedTempFile::new()?;
+        config.write_all(settings.tmux_config()?.as_bytes())?;
+        config.flush()?;
         if !self.exists() {
             // Validate the configured shell only when creating a session. Reconnecting
             // must also work after the user's shell preferences have changed.
@@ -389,11 +417,8 @@ impl Persistent {
             // The outer editor PTY's termios does not configure tmux's pane PTY.
             // Disable flow control there too so Ctrl+S/Ctrl+Q reach the program.
             let shell = format!("stty -ixon; exec {}", shell_words::join(shell));
-            let mut config = tempfile::NamedTempFile::new()?;
-            config.write_all(CONFIG.as_bytes())?;
-            config.flush()?;
             let output = self
-                .process()
+                .configured_process(settings)?
                 .arg("-f")
                 .arg(config.path())
                 .args([
@@ -428,88 +453,32 @@ impl Persistent {
                 );
             }
         }
-        // -f is read only when the server first starts. Repair restored sessions
-        // too: tmux's root mouse bindings can enter copy-mode and copy into its
-        // private buffer on mouse-up, bypassing Glimcode's selection/clipboard.
-        // Keep wheel forwarding: tmux dispatches application mouse events
-        // through root bindings too, even with its own mouse controls off.
-        // These bindings only pass events to the program, never enter copy-mode.
-        // Session options use a literal session name. Unlike has-session,
-        // their lookup does not reliably accept the '=' exact-match prefix.
-        // Pane commands need the ':' separator to disambiguate the session
-        // component from a window/pane name.
-        let target = self.name.as_str();
+        // The user owns the entire configuration. Reapply it on reconnect,
+        // with an explicit pane context for commands and format expansion.
         let pane_target = format!("={}:", self.name);
-        self.run(&[
-            "set-option",
-            "-t",
-            target,
-            "mouse",
-            "off",
-            ";",
-            "set-option",
-            "-t",
-            target,
-            "prefix",
-            "None",
-            ";",
-            "set-option",
-            "-t",
-            target,
-            "prefix2",
-            "None",
-            ";",
-            "set-option",
-            "-t",
-            target,
-            "status",
-            "off",
-            ";",
-            "unbind-key",
-            "-q",
-            "-a",
-            "-T",
-            "prefix",
-            ";",
-            "unbind-key",
-            "-q",
-            "-a",
-            "-T",
-            "root",
-            ";",
-            "bind-key",
-            "-T",
-            "root",
-            "WheelUpPane",
-            "send-keys",
-            "-M",
-            ";",
-            "bind-key",
-            "-T",
-            "root",
-            "WheelDownPane",
-            "send-keys",
-            "-M",
-            ";",
-            "if-shell",
-            "-t",
-            &pane_target,
-            "-F",
-            "#{==:#{pane_mode},copy-mode}",
-            &format!(
-                "send-keys -t {} -X cancel",
-                shell_words::quote(&pane_target)
-            ),
-        ])?;
+        let output = self
+            .configured_process(settings)?
+            .args([
+                "source-file",
+                "-t",
+                &pane_target,
+                config
+                    .path()
+                    .to_str()
+                    .context("tmux configuration path is not UTF-8")?,
+            ])
+            .output()
+            .context("Could not apply tmux configuration")?;
+        if !output.status.success() {
+            bail!(
+                "tmux configuration: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
         let mut command = CommandBuilder::new(&self.executable);
-        command.args([
-            "-L",
-            SERVER,
-            "-u",
-            "attach-session",
-            "-t",
-            &format!("={}", self.name),
-        ]);
+        command.args(["-L", SERVER]);
+        command.args(settings.tmux_arguments()?);
+        command.args(["attach-session", "-t", &format!("={}", self.name)]);
         command.cwd(root);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
@@ -523,7 +492,7 @@ impl Persistent {
                 "display-message",
                 "-p",
                 "-t",
-                &format!("={}", self.name),
+                &format!("={}:", self.name),
                 "#{pane_current_path}",
             ])
             .ok()?;
@@ -534,24 +503,45 @@ impl Persistent {
         );
         path.is_absolute().then_some(path)
     }
-    pub fn history(&self) -> Vec<u8> {
-        self.run(&[
+    pub fn history(&self, client_pid: Option<u32>) -> Result<Vec<u8>> {
+        // Attaching can shrink/reflow an old pane and move visible rows into
+        // tmux history. Capturing before our client attaches misses those rows.
+        if let Some(pid) = client_pid {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let clients = self.run(&[
+                    "list-clients",
+                    "-t",
+                    &format!("={}", self.name),
+                    "-F",
+                    "#{client_pid}",
+                ])?;
+                if String::from_utf8_lossy(&clients.stdout)
+                    .lines()
+                    .any(|line| line.trim().parse::<u32>() == Ok(pid))
+                {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    bail!("Timed out waiting for the tmux client to attach");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let output = self.run(&[
             "capture-pane",
             "-p",
             "-e",
             "-t",
-            &format!("={}", self.name),
+            &format!("={}:", self.name),
             "-S",
             "-5000",
             "-E",
             "-1",
-        ])
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .replace('\n', "\r\n")
-                .into_bytes()
-        })
-        .unwrap_or_default()
+        ])?;
+        Ok(String::from_utf8(output.stdout)?
+            .replace('\n', "\r\n")
+            .into_bytes())
     }
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);

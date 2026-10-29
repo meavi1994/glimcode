@@ -5,6 +5,7 @@ type HistorySelection = (Position, Position);
 
 #[derive(Default)]
 pub(super) struct TerminalView {
+    pub scrollbar: scrollbar::Scrollbar,
     pub find: Find,
     pub selection: Option<HistorySelection>,
     pub selection_screen: bool,

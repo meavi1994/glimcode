@@ -7,6 +7,38 @@ use std::{
 };
 
 const DEFAULT_FONT_SIZE: f32 = 14.0;
+pub mod tmux;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SettingsPage {
+    #[default]
+    Appearance,
+    Terminal,
+    Tmux,
+    Sharing,
+}
+
+impl SettingsPage {
+    pub const ALL: [Self; 4] = [Self::Appearance, Self::Terminal, Self::Tmux, Self::Sharing];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::Terminal => "Terminal",
+            Self::Tmux => "tmux settings",
+            Self::Sharing => "Terminal sharing",
+        }
+    }
+
+    pub fn subtitle(self) -> &'static str {
+        match self {
+            Self::Appearance => "Fonts for the editor, dialogs, search and terminal",
+            Self::Terminal => "Shell and terminal tab defaults",
+            Self::Tmux => "Persistence, client flags and tmux configuration",
+            Self::Sharing => "HTTPS certificates for ttyd browser sharing",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Settings {
@@ -14,6 +46,9 @@ pub struct Settings {
     pub tab_name: String,
     pub terminal_tls_certificate: String,
     pub terminal_tls_private_key: String,
+    pub tmux_enabled: bool,
+    pub tmux_client_args: String,
+    pub tmux_options: Vec<tmux::Entry>,
     pub editor_font_size: f32,
     pub terminal_font_size: f32,
     pub dialog_font_size: f32,
@@ -39,6 +74,9 @@ impl Default for Settings {
             tab_name: String::new(),
             terminal_tls_certificate: String::new(),
             terminal_tls_private_key: String::new(),
+            tmux_enabled: true,
+            tmux_client_args: "-u".into(),
+            tmux_options: tmux::defaults(),
             editor_font_size: DEFAULT_FONT_SIZE,
             terminal_font_size: DEFAULT_FONT_SIZE,
             dialog_font_size: DEFAULT_FONT_SIZE,
@@ -139,6 +177,27 @@ impl Settings {
                 .unwrap_or(DEFAULT_FONT_SIZE)
         };
         Ok(Self {
+            tmux_enabled: value["tmux_enabled"].as_bool().unwrap_or(true),
+            tmux_client_args: value["tmux_client_args"].as_str().unwrap_or("-u").into(),
+            tmux_options: match value.get("tmux_options") {
+                None => defaults.tmux_options,
+                Some(value) => value
+                    .as_array()
+                    .context("tmux_options must be an array")?
+                    .iter()
+                    .map(|entry| {
+                        Ok(tmux::Entry {
+                            enabled: entry["enabled"]
+                                .as_bool()
+                                .context("tmux entry needs an enabled flag")?,
+                            command: entry["command"]
+                                .as_str()
+                                .context("tmux entry needs a command")?
+                                .into(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            },
             shell: value["shell"].as_str().unwrap_or(&defaults.shell).into(),
             tab_name: value["tab_name"].as_str().unwrap_or("").into(),
             terminal_tls_certificate: value["terminal_tls_certificate"]
@@ -157,6 +216,7 @@ impl Settings {
         })
     }
     pub fn save(&self, path: &Path) -> Result<()> {
+        self.tmux_config()?;
         let parent = path.parent().context("No preferences directory")?;
         std::fs::create_dir_all(parent)?;
         // Preserve keys owned by other preferences and future versions.
@@ -167,6 +227,14 @@ impl Settings {
         };
         value["shell"] = self.shell.clone().into();
         value["tab_name"] = self.tab_name.clone().into();
+        value["tmux_enabled"] = self.tmux_enabled.into();
+        value["tmux_client_args"] = self.tmux_client_args.clone().into();
+        value["tmux_options"] = self
+            .tmux_options
+            .iter()
+            .map(|entry| serde_json::json!({"enabled": entry.enabled, "command": entry.command}))
+            .collect::<Vec<_>>()
+            .into();
         value["terminal_tls_certificate"] = self.terminal_tls_certificate.clone().into();
         value["terminal_tls_private_key"] = self.terminal_tls_private_key.clone().into();
         value["editor_font_size"] = self.editor_font_size.into();
@@ -175,7 +243,11 @@ impl Settings {
         value["search_results_font_size"] = self.search_results_font_size.into();
         value["search_filters_font_size"] = self.search_filters_font_size.into();
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-        serde_json::to_writer_pretty(&mut temp, &value)?;
+        let bytes = serde_json::to_vec_pretty(&value)?;
+        if bytes.len() > 65536 {
+            bail!("Preferences file is too large");
+        }
+        temp.write_all(&bytes)?;
         temp.flush()?;
         temp.persist(path)?;
         Ok(())

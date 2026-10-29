@@ -5,6 +5,7 @@ mod https;
 mod macos;
 mod mobile;
 mod qr;
+mod scrollbar;
 mod sessions;
 mod share;
 mod tls;
@@ -26,6 +27,7 @@ use std::{
 use view::{TerminalView, named_link};
 
 pub use crate::preferences::Settings;
+use crate::preferences::SettingsPage;
 
 impl Settings {
     fn command(&self, root: &Path) -> Result<CommandBuilder> {
@@ -269,6 +271,21 @@ struct ScreenState {
     revision: u64,
 }
 impl ScreenState {
+    fn restore_history(&mut self, history: &[u8]) {
+        if history.is_empty() {
+            return;
+        }
+        // capture-pane terminates each retained row, including the last one.
+        // Its final terminator is not another empty row of history.
+        let history = history.strip_suffix(b"\r\n").unwrap_or(history);
+        self.parser.process(history);
+        let rows = self.parser.screen().size().0;
+        // Put every captured row in scrollback, including captures shorter
+        // than the viewport, before parsing the client's live-screen redraw.
+        self.parser.process(&b"\r\n".repeat(usize::from(rows)));
+        self.parser.process(b"\x1b[0m\x1b[H");
+    }
+
     fn expire_synchronized_output(&mut self) {
         if self
             .parser
@@ -416,25 +433,22 @@ impl Session {
                     .screen_mut()
                     .set_size(size.rows, size.cols);
                 let command = if let Some(backend) = &backend {
-                    let command = backend.attach(&cwd, &settings, size)?;
-                    let history = backend.history();
-                    if !history.is_empty() {
-                        let mut state = shared.lock().unwrap();
-                        state.parser.process(&history);
-                        // Move captured rows into scrollback before tmux redraws
-                        // the live screen, which clears the visible grid.
-                        state
-                            .parser
-                            .process(&b"\r\n".repeat(usize::from(size.rows)));
-                        state.parser.process(b"\x1b[0m");
-                    }
-                    command
+                    backend.attach(&cwd, &settings, size)?
                 } else {
                     settings.command(&cwd)?
                 };
                 let mut child = ManagedChild(pair.slave.spawn_command(command)?);
                 drop(pair.slave);
                 *kill.lock().unwrap() = Some(child.0.clone_killer());
+                if let Some(backend) = &backend {
+                    match backend.history(child.0.process_id()) {
+                        Ok(history) => shared.lock().unwrap().restore_history(&history),
+                        Err(error) => {
+                            shared.lock().unwrap().error =
+                                Some(format!("Could not restore terminal history: {error:#}"))
+                        }
+                    }
+                }
                 shared.lock().unwrap().status = "Running".into();
                 let output = shared.clone();
                 let repaint = ctx.clone();
@@ -579,6 +593,7 @@ pub struct Terminal {
     pub visible: bool,
     pub maximized: bool,
     pub settings_open: bool,
+    settings_page: SettingsPage,
     pub settings: Settings,
     draft: Settings,
     settings_error: Option<String>,
@@ -734,8 +749,9 @@ impl Terminal {
                     || tab.view.find.focused(ctx)
             })
     }
-    pub fn open_settings(&mut self) {
+    pub fn open_settings_page(&mut self, page: SettingsPage) {
         self.draft = self.settings.clone();
+        self.settings_page = page;
         self.settings_open = true;
     }
     pub fn new_tab(&mut self, root: &Path, ctx: &egui::Context) {
@@ -744,15 +760,20 @@ impl Terminal {
     }
     fn spawn_tab(&mut self, root: &Path, ctx: &egui::Context, name: Option<String>) {
         self.next_id += 1;
+        let use_tmux = self.settings.tmux_enabled || name.is_some();
         #[cfg(test)]
-        let persistent = if self.direct_pty {
+        let persistent = if self.direct_pty || !use_tmux {
             None
         } else {
             tmux::Persistent::new(name)
         };
         #[cfg(not(test))]
-        let persistent = tmux::Persistent::new(name);
-        let notice = if persistent.is_none() && cfg!(unix) {
+        let persistent = if use_tmux {
+            tmux::Persistent::new(name)
+        } else {
+            None
+        };
+        let notice = if persistent.is_none() && cfg!(unix) && self.settings.tmux_enabled {
             Some("tmux unavailable — sessions will end when Glimcode quits. Install tmux and open a new tab.".into())
         } else {
             None
@@ -1132,15 +1153,17 @@ impl Terminal {
         }
         self.share_window(ctx);
         if self.settings_open {
+            let page = self.settings_page;
             let mut save = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::new("preferences-dialog"))
+            egui::Modal::new(egui::Id::new(("settings-dialog", page)))
                 .frame(chrome::popup_frame()).show(ctx, |ui| {
-                    chrome::modal_style(ui, 560.0);
-                    cancel |= chrome::dialog_header(ui, "⚙", "Preferences", "Make this workspace feel like yours", chrome::BLUE);
-                    egui::ScrollArea::vertical().id_salt("preferences-body")
+                    chrome::modal_style(ui, 840.0);
+                    cancel |= chrome::dialog_header(ui, "⚙", page.title(), page.subtitle(), chrome::BLUE);
+                    egui::ScrollArea::vertical().id_salt(("settings-body", page))
                         .max_height((ctx.content_rect().height() - 250.0).max(180.0))
                         .show(ui, |ui| {
+                            if page == SettingsPage::Appearance {
                             chrome::dialog_section(ui, "Typography", "Set independent sizes for your editor, terminal, and search.");
                             chrome::dialog_card(ui, |ui| {
                                 for (label, detail, size) in [
@@ -1165,7 +1188,8 @@ impl Terminal {
                                 ui.add_space(4.0);
                                 ui.label(egui::RichText::new("Font changes apply to open editors, dialogs, search, and terminal sessions when saved.").size(crate::preferences::dialog_font_size(ui.ctx())).color(chrome::MUTED));
                             });
-                            ui.add_space(10.0);
+                            }
+                            if page == SettingsPage::Terminal {
                             chrome::dialog_section(ui, "Shell & sessions", "Choose how new terminal sessions start.");
                             chrome::dialog_card(ui, |ui| {
                                 ui.label(egui::RichText::new("Shell executable").strong());
@@ -1196,7 +1220,11 @@ impl Terminal {
                                 ui.label(egui::RichText::new("Leave empty for automatic names. Duplicates get (2), (3), …").size(crate::preferences::dialog_font_size(ui.ctx())).color(chrome::MUTED));
                             });
                             ui.label(egui::RichText::new("New sessions start in the project directory. Existing sessions keep their shell and working directory.").size(crate::preferences::dialog_font_size(ui.ctx())).color(chrome::MUTED));
-                            ui.add_space(10.0);
+                            }
+                            if page == SettingsPage::Tmux {
+                            self.draft.tmux_preferences(ui);
+                            }
+                            if page == SettingsPage::Sharing {
                             chrome::dialog_section(ui, "Terminal HTTPS", "Override the certificate used for new ttyd shares.");
                             chrome::dialog_card(ui, |ui| {
                                 for (label, value) in [
@@ -1219,6 +1247,7 @@ impl Terminal {
                                 }
                                 ui.label("Set both files, or leave both empty to reuse ~/.glimcode/terminal-tls. Changes apply to new shares; existing shares keep their certificate. Private keys stay on this Mac.");
                             });
+                            }
                             if let Some(error) = &self.settings_error {
                                 ui.add_space(4.0);
                                 chrome::dialog_card(ui, |ui| { ui.colored_label(chrome::DANGER, error); });
@@ -1232,12 +1261,21 @@ impl Terminal {
                     cancel |= ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
                 });
             if save {
-                let result = self.draft.command(Path::new(".")).and_then(|_| {
-                    self.draft.validate_terminal_tls()?;
+                let result = (|| -> Result<()> {
+                    match page {
+                        SettingsPage::Terminal => {
+                            self.draft.command(Path::new("."))?;
+                        }
+                        SettingsPage::Sharing => self.draft.validate_terminal_tls()?,
+                        SettingsPage::Tmux => {
+                            self.draft.tmux_config()?;
+                        }
+                        SettingsPage::Appearance => {}
+                    }
                     self.draft.save(
                         &crate::preferences::path().context("No home directory for preferences")?,
                     )
-                });
+                })();
                 match result {
                     Ok(()) => {
                         self.settings = self.draft.clone();
@@ -2010,7 +2048,18 @@ fn render(
     }
     let font = FontId::monospace(font_size);
     let cell = ui.fonts_mut(|f| egui::vec2(f.glyph_width(&font, 'M'), f.row_height(&font) + 2.0));
-    let (_, rect) = ui.allocate_space(ui.available_size().max(egui::vec2(10.0, 30.0)));
+    let (_, panel_rect) = ui.allocate_space(ui.available_size().max(egui::vec2(10.0, 30.0)));
+    let scrollbar_rect = egui::Rect::from_min_max(
+        egui::pos2(panel_rect.right() - scrollbar::WIDTH, panel_rect.top()),
+        panel_rect.max,
+    );
+    let rect = egui::Rect::from_min_max(
+        panel_rect.min,
+        egui::pos2(
+            (scrollbar_rect.left() - 2.0).max(panel_rect.left()),
+            panel_rect.bottom(),
+        ),
+    );
     let response = ui
         .interact(rect, id, egui::Sense::click_and_drag())
         .on_hover_cursor(egui::CursorIcon::Text);
@@ -2077,13 +2126,20 @@ fn render(
                 .clamp(0.0, f32::from(size.1 - 1)) as u16,
         )
     };
-    let mouse_mode = tab
-        .screen
-        .lock()
-        .unwrap()
-        .parser
-        .screen()
-        .mouse_protocol_mode();
+    let (mouse_mode, browsing_history) = {
+        let mut state = tab.screen.lock().unwrap();
+        tab.view.scrollbar.show(
+            ui,
+            scrollbar_rect,
+            state.parser.screen_mut(),
+            enabled,
+            cell.y,
+        );
+        (
+            state.parser.screen().mouse_protocol_mode(),
+            state.parser.screen().scrollback() > 0,
+        )
+    };
     let command = enabled && ui.input(|i| i.modifiers.command);
     let hovered_link = if command && response.hovered() {
         response.hover_pos().and_then(|pos| {
@@ -2135,6 +2191,7 @@ fn render(
         ui.memory_mut(|m| m.surrender_focus(id));
     }
     let report_mouse = enabled
+        && !browsing_history
         && !command
         && ui.input(|i| i.focused)
         && !tab.screen.lock().unwrap().exited
@@ -2227,6 +2284,7 @@ fn render(
             Err(error) => state.error = Some(error.to_string()),
         }
     }
+    let pasted = !outgoing.is_empty();
     let terminal_focused = focused && ui.input(|i| i.focused);
     if !state.exited
         && state.parser.callbacks().focus_reporting
@@ -2345,6 +2403,7 @@ fn render(
         tab.selection = tab.view.visible_selection(state.parser.screen());
     }
     let mut copy = false;
+    let view_input_len = outgoing.len();
     if focused {
         let events = ui.input_mut(|i| {
             let mut events = vec![];
@@ -2497,10 +2556,7 @@ fn render(
         outgoing.clear();
     }
     if !outgoing.is_empty() {
-        state.parser.screen_mut().set_scrollback(0);
-        tab.selection = None;
-        tab.view.selection = None;
-        selection = None;
+        let resume_live = pasted || outgoing.len() > view_input_len;
         if outgoing.len() > 1024 * 1024 {
             state.error = Some("Paste is limited to 1 MiB. Paste a smaller section.".into());
         } else if !tab.send(Command::Input(outgoing)) {
@@ -2508,6 +2564,15 @@ fn render(
                 Some("Terminal input is busy. Try again after the command catches up.".into());
         } else {
             state.error = None;
+            // Focus reports and application mouse events are protocol traffic,
+            // not a request to abandon the user's history position/selection.
+            if resume_live {
+                state.parser.screen_mut().set_scrollback(0);
+                tab.selection = None;
+                tab.view.selection = None;
+                selection = None;
+                ui.ctx().request_repaint();
+            }
         }
     }
     state.expire_synchronized_output();
@@ -2660,6 +2725,97 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_has_four_separate_dialogs_and_cancelling_preserves_saved_values() {
+        let sections = [
+            "Typography",
+            "Shell & sessions",
+            "tmux client flags",
+            "Terminal HTTPS",
+        ];
+        assert_eq!(SettingsPage::ALL.len(), 4);
+        for (index, page) in SettingsPage::ALL.into_iter().enumerate() {
+            let ctx = egui::Context::default();
+            let mut terminal = Terminal::default();
+            terminal.open_settings_page(page);
+            assert!(terminal.modal());
+            let mut labels = Vec::new();
+            for _ in 0..3 {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1200.0, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| terminal.windows(ctx),
+                );
+                labels = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                        _ => None,
+                    })
+                    .collect();
+            }
+            for (section_index, section) in sections.iter().enumerate() {
+                assert_eq!(
+                    labels.iter().any(|label| label == section),
+                    index == section_index,
+                    "{page:?} should only show its own controls: {section}"
+                );
+            }
+            let original = terminal.settings.tmux_client_args.clone();
+            terminal.draft.tmux_client_args = "unsaved change".into();
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| terminal.windows(ctx),
+            );
+            assert!(!terminal.settings_open);
+            assert_eq!(terminal.settings.tmux_client_args, original);
+        }
+    }
+
+    #[test]
+    fn reconnect_restores_fifty_lines_even_when_the_new_viewport_is_larger() {
+        for rows in [12, 24, 80] {
+            let mut state = ScreenState::default();
+            state.parser.screen_mut().set_size(rows, 100);
+            let history: Vec<u8> = (0..50)
+                .flat_map(|row| format!("restored line {row}\r\n").into_bytes())
+                .collect();
+            state.restore_history(&history);
+            // Initial tmux redraw replaces the live screen; history must survive.
+            state.parser.process(b"\x1b[H\x1b[2Jlive prompt");
+            assert_eq!(state.parser.screen().scrollback(), 0);
+            assert_eq!(
+                state.parser.screen().history_bounds().1,
+                usize::from(rows) + 50
+            );
+            state.parser.screen_mut().set_scrollback(5000);
+            assert!(state.parser.screen().contents().contains("restored line 0"));
+            assert_eq!(
+                view::selected_history(state.parser.screen(), ((0, 0), (49, 15)))
+                    .lines()
+                    .count(),
+                50
+            );
+            state.parser.screen_mut().set_scrollback(0);
+            assert!(state.parser.screen().contents().contains("live prompt"));
+        }
+    }
 
     #[test]
     fn shifted_enter_is_distinct_and_other_modifiers_are_preserved() {
@@ -3677,7 +3833,13 @@ mod tests {
         let backend = terminal.tabs[0].persistent.clone().expect("tmux backend");
         let mut cleanup = Cleanup(vec![backend.clone()]);
         assert!(terminal.take_metadata_changed());
-        assert!(terminal.tabs[0].send(Command::Resize(FALLBACK_SIZE)));
+        // The old screen can hold all 60 output rows. Reconnecting to the
+        // smaller 31-row pane must capture rows moved to history by the resize.
+        assert!(terminal.tabs[0].send(Command::Resize(PtySize {
+            rows: 80,
+            cols: 101,
+            ..FALLBACK_SIZE
+        })));
         wait_for(&terminal.tabs[0].screen, |s| {
             s.status == "Running" || s.error.is_some()
         });
@@ -3774,12 +3936,14 @@ mod tests {
             .collect();
         assert_eq!(
             root.len(),
-            2,
-            "only wheel forwarding belongs in the root table"
+            tmux::MOUSE_EVENTS.len(),
+            "only application mouse forwarding belongs in the root table"
         );
         assert!(
             root.iter().all(|line| line.ends_with("send-keys -M")
-                && (line.contains("WheelUpPane") || line.contains("WheelDownPane")))
+                && tmux::MOUSE_EVENTS
+                    .iter()
+                    .any(|event| line.split_whitespace().any(|word| word == *event)))
                 && !bindings
                     .lines()
                     .any(|line| line.split_whitespace().any(|word| word == "prefix")),
@@ -3895,6 +4059,22 @@ mod tests {
     }
 
     #[test]
+    fn disabling_tmux_starts_new_tabs_without_a_persistent_backend() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut terminal = Terminal::default();
+        terminal.settings.tmux_enabled = false;
+        terminal.settings.shell = "/bin/sh".into();
+        terminal.new_tab(dir.path(), &egui::Context::default());
+        assert!(terminal.tabs[0].persistent.is_none());
+        assert!(
+            terminal.tabs[0].notice.is_none(),
+            "tmux was intentionally disabled, not missing"
+        );
+        terminal.close(0);
+        Ok(())
+    }
+
+    #[test]
     fn restored_terminal_metadata_is_lazy_and_roundtrips_without_spawning_shells() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut terminal = Terminal::default();
@@ -3951,6 +4131,125 @@ mod tests {
             key_bytes(Key::F5, Modifiers::ALT, false),
             Some(b"\x1b[15;3~".to_vec())
         );
+    }
+
+    #[test]
+    fn browsing_history_survives_focus_mouse_copy_and_output_until_typing() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::sync_channel(128);
+        let screen = Arc::new(Mutex::new(ScreenState::default()));
+        let mut tab = Session {
+            id: 1,
+            root: "/project".into(),
+            shell: "test".into(),
+            default_name: String::new(),
+            screen: screen.clone(),
+            tx,
+            stopped: Arc::new(AtomicBool::new(false)),
+            killer: Arc::new(Mutex::new(None)),
+            size: (24, 80),
+            selection: None,
+            scroll_remainder: 0.0,
+            view: TerminalView::default(),
+            persistent: None,
+            notice: None,
+        };
+        let mut focus = true;
+        let mut frame = |tab: &mut Session, events, focused| {
+            ctx.run(
+                egui::RawInput {
+                    events,
+                    focused,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| render(ui, tab, true, &mut focus, 14.0));
+                },
+            )
+        };
+        frame(&mut tab, vec![], true);
+        let (top, selected) = {
+            let mut state = screen.lock().unwrap();
+            for row in 0..100 {
+                state.parser.process(format!("line {row}\r\n").as_bytes());
+            }
+            state.parser.process(b"\x1b[?1003h\x1b[?1006h\x1b[?1004h");
+            state.parser.screen_mut().set_scrollback(20);
+            tab.view
+                .capture_selection(state.parser.screen(), Some(((0, 0), (0, 5))));
+            (
+                state.parser.screen().history_bounds().2,
+                view::selected_history(state.parser.screen(), tab.view.selection.unwrap()),
+            )
+        };
+        let selection = tab.view.selection;
+        for focused in [true, false, true] {
+            frame(&mut tab, vec![], focused);
+            assert_eq!(
+                screen.lock().unwrap().parser.screen().history_bounds().2,
+                top,
+                "focus reports must not jump to live output"
+            );
+            assert_eq!(tab.view.selection, selection);
+        }
+        frame(
+            &mut tab,
+            vec![egui::Event::PointerMoved(egui::pos2(100.0, 100.0))],
+            true,
+        );
+        assert_eq!(
+            screen.lock().unwrap().parser.screen().history_bounds().2,
+            top
+        );
+        let output = frame(
+            &mut tab,
+            vec![egui::Event::Key {
+                key: Key::C,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::MAC_CMD,
+            }],
+            true,
+        );
+        assert!(output.platform_output.commands.iter().any(
+            |command| matches!(command, egui::OutputCommand::CopyText(text) if text == &selected)
+        ));
+        assert_eq!(
+            screen.lock().unwrap().parser.screen().history_bounds().2,
+            top
+        );
+        screen
+            .lock()
+            .unwrap()
+            .parser
+            .process(b"\r\nbackground output");
+        frame(&mut tab, vec![], true);
+        assert_eq!(
+            screen.lock().unwrap().parser.screen().history_bounds().2,
+            top,
+            "incoming output keeps the viewed rows anchored"
+        );
+        let inputs: Vec<u8> = rx
+            .try_iter()
+            .filter_map(|command| match command {
+                Command::Input(bytes) => Some(bytes),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(
+            inputs, b"\x1b[I\x1b[O\x1b[I",
+            "only focus reports should reach the application while browsing"
+        );
+        frame(&mut tab, vec![egui::Event::Text("x".into())], true);
+        assert_eq!(screen.lock().unwrap().parser.screen().scrollback(), 0);
+        assert!(tab.view.selection.is_none(), "typing resumes live input");
     }
 
     #[test]
