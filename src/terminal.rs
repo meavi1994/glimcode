@@ -269,8 +269,36 @@ struct ScreenState {
     exited: bool,
     error: Option<String>,
     revision: u64,
+    last_output: Option<Instant>,
+    last_tmux_activity: Option<u64>,
 }
+const ACTIVITY_WINDOW: Duration = Duration::from_secs(5);
+
 impl ScreenState {
+    fn process_output(&mut self, bytes: &[u8], direct_pty: bool) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.parser.process(bytes);
+        self.revision = self.revision.wrapping_add(1);
+        // A tmux client also emits redraws when other sessions are created or
+        // global options change. Only a direct PTY's bytes are actual output.
+        if direct_pty {
+            self.last_output = Some(Instant::now());
+        }
+    }
+
+    fn update_tmux_activity(&mut self, activity: u64) -> bool {
+        let previous = self.last_tmux_activity.replace(activity);
+        // The first sample establishes a baseline; old output on reconnect is
+        // not new work. Unchanged timestamps include client-only redraws.
+        if previous.is_some_and(|previous| activity > previous) {
+            self.last_output = Some(Instant::now());
+            return true;
+        }
+        false
+    }
+
     fn restore_history(&mut self, history: &[u8]) {
         if history.is_empty() {
             return;
@@ -310,6 +338,8 @@ impl Default for ScreenState {
             exited: false,
             error: None,
             revision: 0,
+            last_output: None,
+            last_tmux_activity: None,
         }
     }
 }
@@ -452,6 +482,7 @@ impl Session {
                 shared.lock().unwrap().status = "Running".into();
                 let output = shared.clone();
                 let repaint = ctx.clone();
+                let direct_pty = backend.is_none();
                 std::thread::spawn(move || {
                     let mut buffer = [0u8; 8192];
                     loop {
@@ -461,8 +492,7 @@ impl Session {
                         };
                         {
                             let mut state = output.lock().unwrap();
-                            state.parser.process(&buffer[..count]);
-                            state.revision = state.revision.wrapping_add(1);
+                            state.process_output(&buffer[..count], direct_pty);
                         }
                         repaint.request_repaint();
                     }
@@ -479,11 +509,15 @@ impl Session {
                         break;
                     }
                     if directory_checked.elapsed() >= Duration::from_secs(2) {
-                        if let Some(directory) =
-                            backend.as_ref().and_then(|session| session.directory())
+                        if let Some((directory, activity)) =
+                            backend.as_ref().and_then(|session| session.pane_status())
                         {
-                            shared.lock().unwrap().parser.callbacks_mut().directory =
-                                Some(directory);
+                            let mut state = shared.lock().unwrap();
+                            state.parser.callbacks_mut().directory = Some(directory);
+                            if activity.is_some_and(|activity| state.update_tmux_activity(activity))
+                            {
+                                ctx.request_repaint();
+                            }
                         }
                         directory_checked = Instant::now();
                     }
@@ -620,6 +654,32 @@ pub struct Terminal {
     sessions: sessions::Manager,
 }
 impl Terminal {
+    /// Output from any live tab counts, including tabs in hidden workspaces.
+    pub fn recent_activity_remaining(&self, now: Instant) -> Option<Duration> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| {
+                let state = tab.screen.lock().unwrap();
+                if state.exited {
+                    return None;
+                }
+                let elapsed = now.saturating_duration_since(state.last_output?);
+                ACTIVITY_WINDOW
+                    .checked_sub(elapsed)
+                    .filter(|remaining| !remaining.is_zero())
+            })
+            .max()
+    }
+
+    /// The selected live tab, even while its workspace or panel is hidden.
+    pub fn active_title(&self) -> Option<String> {
+        let tab = self.tabs.get(self.active)?;
+        if tab.screen.lock().unwrap().exited {
+            return None;
+        }
+        self.labels().into_iter().nth(self.active)
+    }
+
     pub fn open_sessions(&mut self, ctx: &egui::Context) {
         self.sessions.open(ctx);
     }
@@ -4594,6 +4654,79 @@ mod tests {
         wait_for(&first_state, |s| s.exited);
         Ok(())
     }
+    #[test]
+    fn tmux_client_redraws_do_not_mark_idle_worktrees_active() {
+        let mut idle = ScreenState::default();
+        let mut working = ScreenState::default();
+        // Initial timestamps may describe hours of output before reconnect.
+        assert!(!idle.update_tmux_activity(100));
+        assert!(!working.update_tmux_activity(200));
+        // Opening another terminal causes clients to redraw their existing
+        // screens, including text, without output from the underlying panes.
+        for state in [&mut idle, &mut working] {
+            state.process_output(b"\x1b[H\x1b[2Jexisting shell prompt", false);
+            assert!(state.last_output.is_none());
+        }
+        assert!(!idle.update_tmux_activity(100));
+        assert!(working.update_tmux_activity(201));
+        let genuine_output = working.last_output;
+        assert!(genuine_output.is_some());
+        assert!(idle.last_output.is_none());
+        // More redraws must neither activate idle panes nor extend the signal.
+        working.process_output(b"\x1b[?25l\x1b[Hredrawn text\x1b[?25h", false);
+        assert!(!working.update_tmux_activity(201));
+        assert_eq!(working.last_output, genuine_output);
+    }
+
+    #[test]
+    fn worktree_activity_tracks_background_output_expires_and_ignores_exited_tabs() {
+        let (tx, _rx) = mpsc::sync_channel(128);
+        let screen = Arc::new(Mutex::new(ScreenState::default()));
+        let tab = Session {
+            id: 1,
+            root: "/project".into(),
+            shell: "/bin/sh".into(),
+            default_name: String::new(),
+            screen: screen.clone(),
+            tx,
+            stopped: Arc::new(AtomicBool::new(false)),
+            killer: Arc::new(Mutex::new(None)),
+            size: (24, 80),
+            selection: None,
+            scroll_remainder: 0.0,
+            view: TerminalView::default(),
+            persistent: None,
+            notice: None,
+        };
+        let terminal = Terminal {
+            tabs: vec![tab],
+            // Activity must not depend on the selected tab or panel visibility.
+            active: 1,
+            visible: false,
+            ..Default::default()
+        };
+        assert!(terminal.recent_activity_remaining(Instant::now()).is_none());
+        screen.lock().unwrap().restore_history(b"old output\r\n");
+        assert!(terminal.recent_activity_remaining(Instant::now()).is_none());
+        screen.lock().unwrap().process_output(b"new output", true);
+        let last = screen.lock().unwrap().last_output.unwrap();
+        assert_eq!(
+            terminal.recent_activity_remaining(last),
+            Some(ACTIVITY_WINDOW)
+        );
+        assert_eq!(
+            terminal.recent_activity_remaining(last + Duration::from_secs(4)),
+            Some(Duration::from_secs(1))
+        );
+        assert!(
+            terminal
+                .recent_activity_remaining(last + ACTIVITY_WINDOW)
+                .is_none()
+        );
+        screen.lock().unwrap().exited = true;
+        assert!(terminal.recent_activity_remaining(last).is_none());
+    }
+
     #[test]
     fn a_background_tab_is_resized_once_per_size_change() {
         let (tx, rx) = mpsc::sync_channel(128);

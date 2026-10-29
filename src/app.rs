@@ -243,6 +243,11 @@ impl Coder {
             app.tree =
                 crate::explorer::FileTree::build_with_folders(&app.root, &app.files, &app.folders);
             app.files_rx = None;
+            if mode == "worktrees" {
+                app.worktrees.seed_preview(&app.root);
+                app.open(app.root.join("src/worktrees.rs"), None);
+                return app;
+            }
             if mode == "workspace-search" {
                 app.show_project = false;
                 app.query =
@@ -1500,7 +1505,38 @@ impl Coder {
                 if self.documents.iter().any(|doc| doc.dirty) {
                     dirty.push(self.root.clone());
                 }
-                if let Some(root) = self.worktrees.content(ui, &self.root, &dirty) {
+                let terminal_title = |path: &Path| {
+                    #[cfg(feature = "ui-capture")]
+                    if std::env::var("CODER_UI_PREVIEW").as_deref() == Ok("worktrees") {
+                        return match path.file_name().and_then(|name| name.to_str()) {
+                            Some("feature-search") => {
+                                (Some("Claude Code · improving search".into()), true)
+                            }
+                            Some("fix-terminal") => (Some("cargo test".into()), true),
+                            Some("docs") => (None, false),
+                            _ => (Some("zsh".into()), false),
+                        };
+                    }
+                    let terminal = if path == self.root {
+                        Some(&self.terminal)
+                    } else {
+                        self.worktree_sessions
+                            .get(path)
+                            .map(|session| &session.terminal)
+                    };
+                    let Some(terminal) = terminal else {
+                        return (None, false);
+                    };
+                    let remaining = terminal.recent_activity_remaining(Instant::now());
+                    if let Some(remaining) = remaining {
+                        ctx.request_repaint_after(remaining);
+                    }
+                    (terminal.active_title(), remaining.is_some())
+                };
+                if let Some(root) = self
+                    .worktrees
+                    .content(ui, &self.root, &dirty, terminal_title)
+                {
                     self.switch_worktree(root);
                 }
             });

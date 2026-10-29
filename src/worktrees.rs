@@ -3,10 +3,62 @@ use crate::chrome;
 use anyhow::{Result, bail};
 use eframe::egui::{self, FontId, RichText, Stroke};
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc::{self, Receiver},
+    time::{Duration, Instant},
 };
+
+const STATUS_INTERVAL: Duration = Duration::from_secs(3);
+const CURRENT_ACCENT: egui::Color32 = egui::Color32::from_rgb(194, 176, 255);
+
+fn status_badge(
+    ui: &mut egui::Ui,
+    path: &Path,
+    pos: egui::Pos2,
+    label: &str,
+    color: egui::Color32,
+    hint: &str,
+) -> f32 {
+    let text = ui
+        .painter()
+        .layout_no_wrap(label.into(), FontId::proportional(10.0), color);
+    let width = text.size().x + 14.0;
+    let rect = egui::Rect::from_min_size(pos, egui::vec2(width, 18.0));
+    ui.painter()
+        .rect_filled(rect, 4, color.gamma_multiply(0.10));
+    ui.painter().galley(
+        pos + egui::vec2(7.0, (18.0 - text.size().y) / 2.0),
+        text,
+        color,
+    );
+    ui.interact(
+        rect,
+        ui.make_persistent_id(("worktree-badge", path, label)),
+        egui::Sense::hover(),
+    )
+    .on_hover_text(hint);
+    width
+}
+
+fn has_uncommitted_changes(root: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ])
+        .output()?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(!output.stdout.is_empty())
+}
 
 #[derive(Clone, Debug)]
 pub struct Worktree {
@@ -83,6 +135,9 @@ pub struct Manager {
     project: PathBuf,
     trees: Vec<Worktree>,
     rx: Option<Receiver<Result<Vec<Worktree>>>>,
+    statuses: BTreeMap<PathBuf, Option<bool>>,
+    status_rx: Option<Receiver<BTreeMap<PathBuf, Option<bool>>>>,
+    status_checked: Option<Instant>,
     name: String,
     branch: String,
     custom_branch: bool,
@@ -98,6 +153,28 @@ pub struct Manager {
     create_root: PathBuf,
 }
 impl Manager {
+    #[cfg(feature = "ui-capture")]
+    pub fn seed_preview(&mut self, root: &Path) {
+        self.project = root.into();
+        self.trees = [
+            (root.to_owned(), "main", false),
+            (root.join("feature-search"), "feature/search-ranking", true),
+            (root.join("fix-terminal"), "fix/terminal-scrollback", true),
+            (root.join("docs"), "docs/readme", false),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (path, branch, changed))| {
+            self.statuses.insert(path.clone(), Some(changed));
+            Worktree {
+                path,
+                branch: branch.into(),
+                protected: index == 0,
+            }
+        })
+        .collect();
+    }
+
     pub fn modal(&self) -> bool {
         self.create_open || self.delete.is_some()
     }
@@ -111,6 +188,16 @@ impl Manager {
     }
 
     pub fn poll(&mut self) {
+        if let Some(rx) = &self.status_rx {
+            match rx.try_recv() {
+                Ok(statuses) => {
+                    self.statuses = statuses;
+                    self.status_rx = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.status_rx = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if let Some(rx) = &self.rx {
             match rx.try_recv() {
                 Ok(result) => {
@@ -118,6 +205,7 @@ impl Manager {
                     match result {
                         Ok(trees) => {
                             self.trees = trees;
+                            self.status_checked = None;
                             if self.deleting {
                                 self.delete = None;
                                 self.delete_force = false;
@@ -145,6 +233,39 @@ impl Manager {
                 _ => {}
             }
         }
+    }
+
+    fn refresh_statuses(&mut self, ctx: &egui::Context) {
+        #[cfg(feature = "ui-capture")]
+        if std::env::var("CODER_UI_PREVIEW").as_deref() == Ok("worktrees") {
+            return;
+        }
+        if self.trees.is_empty() || self.status_rx.is_some() {
+            return;
+        }
+        if let Some(remaining) = self
+            .status_checked
+            .and_then(|checked| STATUS_INTERVAL.checked_sub(checked.elapsed()))
+        {
+            ctx.request_repaint_after(remaining);
+            return;
+        }
+        let paths: Vec<_> = self.trees.iter().map(|tree| tree.path.clone()).collect();
+        let (tx, rx) = mpsc::channel();
+        self.status_rx = Some(rx);
+        self.status_checked = Some(Instant::now());
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let statuses = paths
+                .into_iter()
+                .map(|path| {
+                    let changed = has_uncommitted_changes(&path).ok();
+                    (path, changed)
+                })
+                .collect();
+            let _ = tx.send(statuses);
+            ctx.request_repaint();
+        });
     }
 
     pub fn dialog(&mut self, ctx: &egui::Context) {
@@ -406,6 +527,7 @@ impl Manager {
         ui: &mut egui::Ui,
         root: &Path,
         dirty: &[PathBuf],
+        terminal_title: impl Fn(&Path) -> (Option<String>, bool),
     ) -> Option<PathBuf> {
         self.poll();
         let mut switch = None;
@@ -413,12 +535,18 @@ impl Manager {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             if self.project != root && self.rx.is_none() {
                 self.project = root.to_path_buf();
-                self.trees.clear();
+                if !self.trees.iter().any(|tree| tree.path == root) {
+                    self.trees.clear();
+                    self.statuses.clear();
+                    self.status_rx = None;
+                }
+                self.status_checked = None;
                 self.delete = None;
                 self.delete_force = false;
                 self.run(root, |_| Ok(()), ui.ctx());
             }
             self.update_default_path(root);
+            self.refresh_statuses(ui.ctx());
             ui.spacing_mut().item_spacing.y = 6.0;
             ui.horizontal(|ui| {
                 ui.label(
@@ -462,12 +590,16 @@ impl Manager {
                     for tree in &self.trees {
                         let current = root == tree.path;
                         let unsaved = dirty.contains(&tree.path);
+                        let (terminal, active) = terminal_title(&tree.path);
+                        let terminal = terminal.or_else(|| active.then(|| "Terminal activity".into()));
                         let folder = tree
                             .path
                             .file_name()
                             .unwrap_or(tree.path.as_os_str())
                             .to_string_lossy();
-                        let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 56.0));
+                        let height = 104.0;
+                        let changed = self.statuses.get(&tree.path).copied().flatten();
+                        let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), height));
                         let body =
                             egui::Rect::from_min_max(rect.min, rect.max - egui::vec2(42.0, 0.0));
                         let response = ui.interact(
@@ -481,53 +613,80 @@ impl Manager {
                                 ui.is_enabled(),
                                 current,
                                 format!(
-                                    "{folder}, branch {}{}",
+                                    "{folder}, branch {}{}{}{}{}",
                                     tree.branch,
-                                    if unsaved { ", unsaved changes" } else { "" }
+                                    terminal
+                                        .as_ref()
+                                        .map(|title| format!(", terminal {title}"))
+                                        .unwrap_or_default(),
+                                    if active { ", recent terminal activity" } else { "" },
+                                    if unsaved { ", unsaved changes" } else { "" },
+                                    if changed == Some(true) { ", uncommitted changes" } else { "" }
                                 ),
                             )
                         });
-                        let fill = if current {
-                            chrome::SELECTED
+                        let fill = if active {
+                            egui::Color32::from_rgb(30, 47, 41)
+                        } else if current {
+                            egui::Color32::from_rgb(48, 43, 59)
                         } else if response.hovered() || response.has_focus() {
                             chrome::HEADER
                         } else {
-                            egui::Color32::TRANSPARENT
+                            chrome::PANEL
                         };
                         ui.painter().rect(
                             rect,
-                            5,
+                            7,
                             fill,
                             Stroke::new(
-                                1.0_f32,
-                                if current || response.has_focus() {
-                                    chrome::BLUE.gamma_multiply(0.4)
+                                if current { 2.0_f32 } else { 1.0_f32 },
+                                if current {
+                                    CURRENT_ACCENT.gamma_multiply(0.8)
+                                } else if active {
+                                    chrome::GREEN.gamma_multiply(0.45)
+                                } else if response.has_focus() {
+                                    chrome::BLUE.gamma_multiply(0.55)
                                 } else {
-                                    egui::Color32::TRANSPARENT
+                                    chrome::BORDER.gamma_multiply(0.6)
                                 },
                             ),
                             egui::StrokeKind::Inside,
                         );
-                        if current {
+                        if current || active {
                             ui.painter().rect_filled(
                                 egui::Rect::from_min_size(
                                     rect.min + egui::vec2(0.0, 11.0),
-                                    egui::vec2(3.0, 34.0),
+                                    egui::vec2(if current { 5.0 } else { 3.0 }, height - 22.0),
                                 ),
                                 2,
-                                chrome::BLUE,
+                                if current { CURRENT_ACCENT } else { chrome::GREEN },
                             );
                         }
+                        let current_badge_width = if current {
+                            let width = ui.painter().layout_no_wrap(
+                                "Current".into(), FontId::proportional(10.0), CURRENT_ACCENT,
+                            ).size().x + 14.0;
+                            status_badge(
+                                ui, &tree.path,
+                                egui::pos2(rect.right() - 48.0 - width, rect.top() + 8.0),
+                                "Current", CURRENT_ACCENT, "You are working in this worktree.",
+                            );
+                            width + 6.0
+                        } else {
+                            0.0
+                        };
                         let title =
                             egui::WidgetText::from(RichText::new(folder).strong().size(13.0))
                                 .into_galley(
                                     ui,
                                     Some(egui::TextWrapMode::Truncate),
-                                    (rect.width() - 58.0).max(1.0),
+                                    (rect.width() - 58.0 - current_badge_width).max(1.0),
                                     FontId::proportional(13.0),
                                 );
-                        ui.painter()
-                            .galley(rect.min + egui::vec2(13.0, 9.0), title, chrome::TEXT);
+                        ui.painter().galley(
+                            rect.min + egui::vec2(13.0, 9.0), title,
+                            chrome::TEXT,
+                        );
                         chrome::paint_icon(
                             ui.painter(),
                             rect.min + egui::vec2(20.0, 36.0),
@@ -546,17 +705,40 @@ impl Manager {
                             branch,
                             chrome::MUTED,
                         );
-                        if current || unsaved {
-                            ui.painter().circle_filled(
-                                egui::pos2(rect.right() - 22.0, rect.top() + 38.0),
-                                3.0,
-                                if unsaved {
-                                    chrome::WARNING
-                                } else {
-                                    chrome::GREEN
-                                },
-                            );
+                        chrome::paint_icon(
+                            ui.painter(),
+                            rect.min + egui::vec2(20.0, 56.0),
+                            chrome::Icon::Terminal,
+                            if active { chrome::GREEN } else { chrome::MUTED },
+                        );
+                        let terminal_label = egui::WidgetText::from(
+                            RichText::new(terminal.as_deref().unwrap_or("No terminal")).size(11.0)
+                        ).into_galley(
+                            ui,
+                            Some(egui::TextWrapMode::Truncate),
+                            (rect.width() - 48.0).max(1.0),
+                            FontId::proportional(11.0),
+                        );
+                        ui.painter().galley(
+                            rect.min + egui::vec2(34.0, 50.0), terminal_label,
+                            if active { chrome::TEXT } else { chrome::MUTED },
+                        );
+                        let mut badge_pos = rect.min + egui::vec2(13.0, 77.0);
+                        if active {
+                            badge_pos.x += status_badge(
+                                ui, &tree.path, badge_pos, "Output", chrome::GREEN,
+                                "Recent terminal output · within 5 seconds\nIncludes all terminal tabs in this worktree. Output can include background logs.",
+                            ) + 6.0;
                         }
+                        let (label, color, hint) = match (changed, unsaved) {
+                            (Some(true), _) => ("Changes", chrome::WARNING, "Uncommitted changes: staged, unstaged, or untracked files."),
+                            (_, true) => ("Unsaved", chrome::WARNING, "This worktree has unsaved editor changes."),
+                            (Some(false), false) => ("Clean", chrome::MUTED, "No uncommitted changes."),
+                            (None, false) if self.statuses.contains_key(&tree.path) =>
+                                ("Unavailable", chrome::MUTED, "Could not read Git status. Retrying automatically."),
+                            _ => ("Checking…", chrome::MUTED, "Checking for uncommitted changes…"),
+                        };
+                        status_badge(ui, &tree.path, badge_pos, label, color, hint);
                         if response.clicked() && !current && self.rx.is_none() {
                             switch = Some(tree.path.clone());
                         }
@@ -603,7 +785,21 @@ impl Manager {
                         };
                         response
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text(format!("{}\n{}", tree.path.display(), tree.branch))
+                            .on_hover_text(format!(
+                                "{}\n{}{}{}{}",
+                                tree.path.display(),
+                                tree.branch,
+                                terminal
+                                    .as_ref()
+                                    .map(|title| format!("\nTerminal: {title}"))
+                                    .unwrap_or_default(),
+                                if active {
+                                    "\nRecent terminal output · within 5 seconds"
+                                } else {
+                                    ""
+                                },
+                                if changed == Some(true) { "\nUncommitted changes" } else { "" }
+                            ))
                             .context_menu(&mut actions);
                         let menu_rect = egui::Rect::from_min_size(
                             egui::pos2(rect.right() - 36.0, rect.top() + 7.0),
@@ -644,6 +840,84 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn status_refresh_keeps_cards_visible_and_preserves_unknown_status() {
+        let path = PathBuf::from("/projects/main");
+        let mut manager = Manager {
+            trees: vec![Worktree {
+                path: path.clone(),
+                branch: "main".into(),
+                protected: true,
+            }],
+            statuses: BTreeMap::from([(path.clone(), Some(true))]),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        manager.status_rx = Some(rx);
+        manager.poll();
+        assert_eq!(manager.statuses[&path], Some(true));
+        assert_eq!(manager.trees.len(), 1);
+        tx.send(BTreeMap::from([(path.clone(), Some(false))]))
+            .unwrap();
+        manager.poll();
+        assert_eq!(manager.statuses[&path], Some(false));
+        assert_eq!(manager.trees.len(), 1);
+        let (tx, rx) = mpsc::channel();
+        manager.status_rx = Some(rx);
+        tx.send(BTreeMap::from([(path.clone(), None)])).unwrap();
+        manager.poll();
+        assert_eq!(
+            manager.statuses[&path], None,
+            "a Git error must not show Clean"
+        );
+    }
+
+    #[test]
+    fn uncommitted_status_includes_staged_unstaged_and_untracked_but_not_ignored_files()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let git = |args: &[&str]| -> Result<()> {
+            let output = Command::new("git").current_dir(root).args(args).output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(())
+        };
+        git(&["init"])?;
+        std::fs::write(root.join("tracked.txt"), "original")?;
+        std::fs::write(root.join(".gitignore"), "ignored/\n")?;
+        git(&["add", "."])?;
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "initial",
+        ])?;
+        assert!(!has_uncommitted_changes(root)?);
+        std::fs::create_dir(root.join("ignored"))?;
+        std::fs::write(root.join("ignored/file"), "ignored")?;
+        assert!(!has_uncommitted_changes(root)?);
+        std::fs::write(root.join("new file.txt"), "new")?;
+        assert!(has_uncommitted_changes(root)?);
+        std::fs::remove_file(root.join("new file.txt"))?;
+        std::fs::write(root.join("tracked.txt"), "modified")?;
+        assert!(has_uncommitted_changes(root)?);
+        git(&["add", "tracked.txt"])?;
+        assert!(has_uncommitted_changes(root)?);
+        git(&["reset", "--hard", "HEAD"])?;
+        assert!(!has_uncommitted_changes(root)?);
+        std::fs::remove_file(root.join("tracked.txt"))?;
+        assert!(has_uncommitted_changes(root)?);
+        assert!(has_uncommitted_changes(&root.join("missing")).is_err());
+        Ok(())
+    }
+
     #[test]
     fn deletion_dialog_stays_open_on_failure_and_closes_on_success() {
         let ctx = egui::Context::default();
@@ -745,6 +1019,11 @@ mod tests {
         let root = Path::new("/projects/main");
         let mut manager = Manager {
             project: root.into(),
+            statuses: BTreeMap::from([
+                (root.into(), Some(false)),
+                (PathBuf::from("/projects/feature-1"), Some(true)),
+            ]),
+            status_checked: Some(Instant::now()),
             trees: (0..10)
                 .map(|index| Worktree {
                     path: if index == 0 {
@@ -771,7 +1050,12 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        action = manager.content(ui, root, &[]);
+                        action = manager.content(ui, root, &[], |path| {
+                            (
+                                Some("Claude Code".into()),
+                                path == root || path.ends_with("feature-1"),
+                            )
+                        });
                     });
                 },
             );
@@ -789,8 +1073,23 @@ mod tests {
         };
         let create = label(&output, "+  New worktree").unwrap();
         let first = label(&output, "main").unwrap();
+        let terminal = label(&output, "Claude Code").expect("active terminal title is shown");
+        let branch = label(&output, "branch-0").unwrap();
+        assert!(terminal.y > branch.y && branch.y > first.y);
         assert!(create.y < first.y);
         let second = label(&output, "feature-1").unwrap();
+        assert!(label(&output, "Output").is_some());
+        assert!(label(&output, "Changes").is_some());
+        assert!(label(&output, "Clean").is_some());
+        assert!(
+            output.shapes.iter().any(|shape| matches!(
+                &shape.shape,
+                egui::Shape::Rect(card) if card.rect.contains(second)
+                    && card.fill == egui::Color32::from_rgb(30, 47, 41)
+            )),
+            "background worktrees with output must have a highlighted card"
+        );
+        assert!(second.y > terminal.y + 15.0);
         assert!(second.y - first.y >= 56.0, "worktree rows must not overlap");
         let menu = label(&output, "···").unwrap();
         let click = |manager: &mut Manager, point| {
@@ -846,7 +1145,7 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        manager.content(ui, root, &[]);
+                        manager.content(ui, root, &[], |_| (None, false));
                     });
                     manager.dialog(ctx);
                 },

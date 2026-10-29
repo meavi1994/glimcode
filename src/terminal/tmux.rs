@@ -119,6 +119,33 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn pane_status_reads_activity_and_directory_from_the_target_session() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let executable = dir.path().join("tmux");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+[ "$1" = -L ] && [ "$2" = glimcode ] && [ "$3" = -u ] || exit 1
+shift 3
+[ "$1" = display-message ] && [ "$2" = -p ] && [ "$3" = -t ] && [ "$4" = '=glimcode-test:' ] || exit 2
+printf '12345\t/project with spaces\tand tab\n'
+"#,
+        )?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+        let backend = Persistent {
+            name: "glimcode-test".into(),
+            executable,
+            closed: Arc::new(AtomicBool::new(false)),
+            lifecycle: Arc::new(Mutex::new(())),
+        };
+        assert_eq!(
+            backend.pane_status(),
+            Some((PathBuf::from("/project with spaces\tand tab"), Some(12345)))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn reconnect_history_waits_for_our_client_and_reports_capture_failures() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let executable = dir.path().join("tmux");
@@ -486,22 +513,24 @@ impl Persistent {
         command.env_remove("TMUX_PANE");
         Ok(command)
     }
-    pub fn directory(&self) -> Option<PathBuf> {
+    pub fn pane_status(&self) -> Option<(PathBuf, Option<u64>)> {
         let output = self
             .run(&[
                 "display-message",
                 "-p",
                 "-t",
                 &format!("={}:", self.name),
-                "#{pane_current_path}",
+                "#{window_activity}\t#{pane_current_path}",
             ])
             .ok()?;
-        let path = PathBuf::from(
-            String::from_utf8(output.stdout)
-                .ok()?
-                .trim_end_matches('\n'),
-        );
-        path.is_absolute().then_some(path)
+        let output = String::from_utf8(output.stdout).ok()?;
+        let (activity, path) = output.trim_end_matches('\n').split_once('\t')?;
+        let path = PathBuf::from(path);
+        path.is_absolute().then_some((path, activity.parse().ok()))
+    }
+    #[cfg(test)]
+    pub fn directory(&self) -> Option<PathBuf> {
+        self.pane_status().map(|(path, _)| path)
     }
     pub fn history(&self, client_pid: Option<u32>) -> Result<Vec<u8>> {
         // Attaching can shrink/reflow an old pane and move visible rows into
