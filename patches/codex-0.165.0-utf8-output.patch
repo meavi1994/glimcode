@@ -1,0 +1,59 @@
+diff --git a/codex-rs/protocol/src/exec_output.rs b/codex-rs/protocol/src/exec_output.rs
+index 63675fe..9156ed1 100644
+--- a/codex-rs/protocol/src/exec_output.rs
++++ b/codex-rs/protocol/src/exec_output.rs
+@@ -65,8 +65,20 @@ pub fn bytes_to_string_smart(bytes: &[u8]) -> String {
+         return String::new();
+     }
+ 
+-    if let Ok(utf8_str) = std::str::from_utf8(bytes) {
+-        return utf8_str.to_owned();
++    match std::str::from_utf8(bytes) {
++        Ok(utf8_str) => return utf8_str.to_owned(),
++        Err(error) if error.error_len().is_none() => {
++            // A capture limit may bisect the last UTF-8 character. If the
++            // preceding text already contains valid multibyte UTF-8, preserve
++            // that encoding instead of reinterpreting the entire output as a
++            // legacy code page. ASCII-only prefixes remain ambiguous (for
++            // example, Latin-1 "caf\xE9") and still use the detector below.
++            let prefix = &bytes[..error.valid_up_to()];
++            if !prefix.is_ascii() {
++                return String::from_utf8_lossy(bytes).into_owned();
++            }
++        }
++        Err(_) => {}
+     }
+ 
+     let encoding = detect_encoding(bytes);
+diff --git a/codex-rs/protocol/src/exec_output_tests.rs b/codex-rs/protocol/src/exec_output_tests.rs
+index 8871daf..a4e08d2 100644
+--- a/codex-rs/protocol/src/exec_output_tests.rs
++++ b/codex-rs/protocol/src/exec_output_tests.rs
+@@ -75,3 +75,27 @@ fn decode_shell_output(bytes: &[u8]) -> String {
+     .from_utf8_lossy()
+     .text
+ }
++
++#[test]
++fn truncated_large_utf8_tree_preserves_branch_characters() {
++    let tree = (0..60000)
++        .map(|i| format!("│   ├── file-{i}.rs\n"))
++        .collect::<String>();
++    for limit in [65536, 1024 * 1024] {
++        for cap in limit - 16..limit + 16 {
++            let bytes = &tree.as_bytes()[..cap];
++            assert_eq!(decode_shell_output(bytes), String::from_utf8_lossy(bytes));
++        }
++    }
++}
++
++#[test]
++fn truncated_utf8_multibyte_suffix_preserves_valid_prefix() {
++    for ending in ["├", "é", "😀"] {
++        let text = format!("日本語 and café: {ending}");
++        for missing in 1..ending.len() {
++            let bytes = &text.as_bytes()[..text.len() - missing];
++            assert_eq!(decode_shell_output(bytes), String::from_utf8_lossy(bytes));
++        }
++    }
++}

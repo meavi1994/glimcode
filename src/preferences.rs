@@ -47,6 +47,7 @@ pub struct Settings {
     pub terminal_tls_certificate: String,
     pub terminal_tls_private_key: String,
     pub tmux_enabled: bool,
+    pub terminal_backend: String,
     pub tmux_client_args: String,
     pub tmux_options: Vec<tmux::Entry>,
     pub editor_font_size: f32,
@@ -75,6 +76,7 @@ impl Default for Settings {
             terminal_tls_certificate: String::new(),
             terminal_tls_private_key: String::new(),
             tmux_enabled: true,
+            terminal_backend: "tmux".into(),
             tmux_client_args: "-u".into(),
             tmux_options: tmux::defaults(),
             editor_font_size: DEFAULT_FONT_SIZE,
@@ -176,8 +178,14 @@ impl Settings {
                 .map(|n| n.clamp(8.0, 40.0) as f32)
                 .unwrap_or(DEFAULT_FONT_SIZE)
         };
-        Ok(Self {
+        let mut settings = Self {
             tmux_enabled: value["tmux_enabled"].as_bool().unwrap_or(true),
+            terminal_backend: if value["terminal_backend"].as_str() == Some("zmx") {
+                "zmx"
+            } else {
+                "tmux"
+            }
+            .into(),
             tmux_client_args: value["tmux_client_args"].as_str().unwrap_or("-u").into(),
             tmux_options: match value.get("tmux_options") {
                 None => defaults.tmux_options,
@@ -213,7 +221,13 @@ impl Settings {
             dialog_font_size: size("dialog_font_size"),
             search_results_font_size: size("search_results_font_size"),
             search_filters_font_size: size("search_filters_font_size"),
-        })
+        };
+        if settings.tmux_options == tmux::legacy_defaults()
+            || settings.tmux_options == tmux::previous_defaults()
+        {
+            settings.tmux_options = tmux::defaults();
+        }
+        Ok(settings)
     }
     pub fn save(&self, path: &Path) -> Result<()> {
         self.tmux_config()?;
@@ -228,6 +242,7 @@ impl Settings {
         value["shell"] = self.shell.clone().into();
         value["tab_name"] = self.tab_name.clone().into();
         value["tmux_enabled"] = self.tmux_enabled.into();
+        value["terminal_backend"] = self.terminal_backend.clone().into();
         value["tmux_client_args"] = self.tmux_client_args.clone().into();
         value["tmux_options"] = self
             .tmux_options

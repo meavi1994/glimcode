@@ -11,6 +11,9 @@ mod share;
 mod tls;
 mod tmux;
 mod view;
+mod zmx;
+#[cfg(test)]
+mod zmx_trial;
 use anyhow::{Context, Result, bail};
 use eframe::egui::{self, Color32, FontId, Key, Modifiers};
 use portable_pty::{ChildKiller, CommandBuilder, PtySize};
@@ -462,12 +465,11 @@ impl Session {
                     .parser
                     .screen_mut()
                     .set_size(size.rows, size.cols);
-                let command = if let Some(backend) = &backend {
-                    backend.attach(&cwd, &settings, size)?
+                let mut child = if let Some(backend) = &backend {
+                    backend.start(&cwd, &settings, size, pair.slave.as_ref())?
                 } else {
-                    settings.command(&cwd)?
+                    ManagedChild(pair.slave.spawn_command(settings.command(&cwd)?)?)
                 };
-                let mut child = ManagedChild(pair.slave.spawn_command(command)?);
                 drop(pair.slave);
                 *kill.lock().unwrap() = Some(child.0.clone_killer());
                 if let Some(backend) = &backend {
@@ -482,7 +484,7 @@ impl Session {
                 shared.lock().unwrap().status = "Running".into();
                 let output = shared.clone();
                 let repaint = ctx.clone();
-                let direct_pty = backend.is_none();
+                let direct_pty = backend.as_ref().is_none_or(|session| session.is_zmx());
                 std::thread::spawn(move || {
                     let mut buffer = [0u8; 8192];
                     loop {
@@ -825,16 +827,19 @@ impl Terminal {
         let persistent = if self.direct_pty || !use_tmux {
             None
         } else {
-            tmux::Persistent::new(name)
+            tmux::Persistent::new_with_backend(name, &self.settings.terminal_backend)
         };
         #[cfg(not(test))]
         let persistent = if use_tmux {
-            tmux::Persistent::new(name)
+            tmux::Persistent::new_with_backend(name, &self.settings.terminal_backend)
         } else {
             None
         };
         let notice = if persistent.is_none() && cfg!(unix) && self.settings.tmux_enabled {
-            Some("tmux unavailable — sessions will end when Glimcode quits. Install tmux and open a new tab.".into())
+            Some(format!(
+                "{} unavailable — sessions will end when Glimcode quits. Install it and open a new tab.",
+                self.settings.terminal_backend
+            ))
         } else {
             None
         };
@@ -933,22 +938,34 @@ impl Terminal {
                                     response.response.context_menu(|ui| {
                                         if let Some(session) = &tab.persistent {
                                             ui.label(
-                                                egui::RichText::new("tmux session")
-                                                    .small()
-                                                    .color(chrome::MUTED),
+                                                egui::RichText::new(format!(
+                                                    "{} session",
+                                                    session.kind()
+                                                ))
+                                                .small()
+                                                .color(chrome::MUTED),
                                             );
                                             ui.label(
                                                 egui::RichText::new(&session.name).monospace(),
                                             );
-                                            if ui.button("Copy tmux session ID").clicked() {
+                                            if ui
+                                                .button(format!(
+                                                    "Copy {} session ID",
+                                                    session.kind()
+                                                ))
+                                                .clicked()
+                                            {
                                                 ui.ctx().copy_text(session.name.clone());
                                                 ui.close();
                                             }
-                                            if ui.button("Copy tmux attach command").clicked() {
-                                                ui.ctx().copy_text(format!(
-                                                    "tmux -L glimcode attach-session -t {}",
-                                                    session.name,
-                                                ));
+                                            if ui
+                                                .button(format!(
+                                                    "Copy {} attach command",
+                                                    session.kind()
+                                                ))
+                                                .clicked()
+                                            {
+                                                ui.ctx().copy_text(session.attach_command());
                                                 ui.close();
                                             }
                                             ui.separator();
@@ -1252,6 +1269,18 @@ impl Terminal {
                             if page == SettingsPage::Terminal {
                             chrome::dialog_section(ui, "Shell & sessions", "Choose how new terminal sessions start.");
                             chrome::dialog_card(ui, |ui| {
+                                ui.checkbox(&mut self.draft.tmux_enabled, "Keep new terminal sessions running after quitting");
+                                ui.horizontal(|ui| {
+                                    ui.label("Session backend");
+                                    egui::ComboBox::from_id_salt("terminal-backend")
+                                        .selected_text(if self.draft.terminal_backend == "zmx" { "zmx 0.8.1 (experimental)" } else { "tmux" })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut self.draft.terminal_backend, "tmux".into(), "tmux");
+                                            ui.selectable_value(&mut self.draft.terminal_backend, "zmx".into(), "zmx 0.8.1 (experimental)");
+                                        });
+                                });
+                                ui.small("Applies to new tabs. Saved tabs reconnect to their original backend.");
+                                ui.add_space(8.0);
                                 ui.label(egui::RichText::new("Shell executable").strong());
                                 ui.horizontal(|ui| {
                                     ui.add(egui::TextEdit::singleline(&mut self.draft.shell)
@@ -1418,7 +1447,7 @@ impl Terminal {
                 chrome::modal_style(ui, 540.0);
                 dismiss |= chrome::dialog_header(ui, ">_", "Share terminal with ttyd",
                     "Use this terminal from a browser", chrome::BLUE);
-                ui.label(egui::RichText::new(session.as_ref().map_or("No tmux session", |s| s.name.as_str())).monospace());
+                ui.label(egui::RichText::new(session.as_ref().map_or("No persistent session", |s| s.name.as_str())).monospace());
                 egui::ScrollArea::vertical()
                     .id_salt("share-terminal-body")
                     .max_height((ctx.content_rect().height() - 240.0).max(140.0))
@@ -2188,13 +2217,18 @@ fn render(
     };
     let (mouse_mode, browsing_history) = {
         let mut state = tab.screen.lock().unwrap();
-        tab.view.scrollbar.show(
-            ui,
-            scrollbar_rect,
-            state.parser.screen_mut(),
-            enabled,
-            cell.y,
-        );
+        if state.parser.screen().alternate_screen() {
+            state.parser.screen_mut().set_scrollback(0);
+            tab.view.scrollbar = scrollbar::Scrollbar::default();
+        } else {
+            tab.view.scrollbar.show(
+                ui,
+                scrollbar_rect,
+                state.parser.screen_mut(),
+                enabled,
+                cell.y,
+            );
+        }
         (
             state.parser.screen().mouse_protocol_mode(),
             state.parser.screen().scrollback() > 0,
@@ -2409,8 +2443,26 @@ fn render(
         }
     }
     if enabled && ui.input(|i| i.focused) && !state.exited && response.hovered() {
-        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-        tab.scroll_remainder += scroll / cell.y;
+        let lines = ui.input(|i| {
+            if report_mouse || state.parser.screen().alternate_screen() {
+                i.events
+                    .iter()
+                    .filter_map(|event| {
+                        let egui::Event::MouseWheel { unit, delta, .. } = event else {
+                            return None;
+                        };
+                        Some(match unit {
+                            egui::MouseWheelUnit::Point => delta.y / cell.y,
+                            egui::MouseWheelUnit::Line => delta.y,
+                            egui::MouseWheelUnit::Page => delta.y * f32::from(size.0),
+                        })
+                    })
+                    .sum::<f32>()
+            } else {
+                i.smooth_scroll_delta.y / cell.y
+            }
+        });
+        tab.scroll_remainder += lines;
         let lines = tab.scroll_remainder.trunc() as i64;
         if lines != 0 {
             tab.scroll_remainder -= lines as f32;
@@ -3471,7 +3523,10 @@ mod tests {
         );
     }
 
-    fn wait_for(state: &Arc<Mutex<ScreenState>>, condition: impl Fn(&ScreenState) -> bool) {
+    pub(super) fn wait_for(
+        state: &Arc<Mutex<ScreenState>>,
+        condition: impl Fn(&ScreenState) -> bool,
+    ) {
         let start = std::time::Instant::now();
         loop {
             {
@@ -3913,18 +3968,18 @@ mod tests {
             shell_words::quote(&marker.to_string_lossy())
         );
         assert!(terminal.tabs[0].send(Command::Input(input.into_bytes())));
+        let pid_pattern = regex::Regex::new(r"(?m)^PID:(\d+):READY$")?;
         wait_for(&terminal.tabs[0].screen, |s| {
-            s.parser.screen().contents().contains(":READY")
+            pid_pattern.is_match(&s.parser.screen().contents())
         });
-        // Read the actual shell PID from tmux, independently of terminal echo.
-        let pane = backend.run_for_test(&[
-            "display-message",
-            "-p",
-            "-t",
-            &format!("={}", backend.name),
-            "#{pane_pid}",
-        ])?;
-        let pid = String::from_utf8(pane.stdout)?.trim().to_owned();
+        let contents = terminal.tabs[0]
+            .screen
+            .lock()
+            .unwrap()
+            .parser
+            .screen()
+            .contents();
+        let pid = pid_pattern.captures(&contents).unwrap()[1].to_owned();
         let saved = terminal.snapshot();
         let screen = terminal.tabs[0].screen.clone();
         drop(terminal); // Same disconnect path as quitting the editor.
@@ -3944,27 +3999,6 @@ mod tests {
             Some(nested.canonicalize()?)
         );
 
-        // Simulate an older server intercepting drags and leaving a selection
-        // in tmux's private copy-mode instead of the editor clipboard.
-        backend.run_for_test(&[
-            "set-option",
-            "-t",
-            &backend.name,
-            "mouse",
-            "on",
-            ";",
-            "bind-key",
-            "-T",
-            "root",
-            "MouseDrag1Pane",
-            "copy-mode",
-            "-M",
-            ";",
-            "copy-mode",
-            "-t",
-            &format!("={}:", backend.name),
-        ])?;
-
         let mut restored = Terminal::default();
         // Existing sessions must reconnect even if new-shell preferences are invalid.
         restored.settings.shell = "/does/not/exist".into();
@@ -3980,35 +4014,6 @@ mod tests {
         wait_for(&restored.tabs[0].screen, |s| {
             s.status == "Running" || s.error.is_some()
         });
-        let mouse_state = backend.run_for_test(&[
-            "display-message",
-            "-p",
-            "-t",
-            &format!("={}:", backend.name),
-            "#{mouse}:#{pane_in_mode}",
-        ])?;
-        assert_eq!(String::from_utf8(mouse_state.stdout)?.trim(), "off:0");
-        let bindings = backend.run_for_test(&["list-keys"])?;
-        let bindings = String::from_utf8(bindings.stdout)?;
-        let root: Vec<_> = bindings
-            .lines()
-            .filter(|line| line.split_whitespace().any(|word| word == "root"))
-            .collect();
-        assert_eq!(
-            root.len(),
-            tmux::MOUSE_EVENTS.len(),
-            "only application mouse forwarding belongs in the root table"
-        );
-        assert!(
-            root.iter().all(|line| line.ends_with("send-keys -M")
-                && tmux::MOUSE_EVENTS
-                    .iter()
-                    .any(|event| line.split_whitespace().any(|word| word == *event)))
-                && !bindings
-                    .lines()
-                    .any(|line| line.split_whitespace().any(|word| word == "prefix")),
-            "tmux must not intercept selection"
-        );
         assert!(restored.tabs[0].send(Command::Input(
             b"printf 'RESTORED:%s:%s:END\\n' \"$GLIMCODE_RESUME\" \"$$\"\n".to_vec()
         )));
@@ -4019,24 +4024,15 @@ mod tests {
                 .contains(&format!("RESTORED:kept:{pid}:END"))
         });
         assert!(restored.tabs[0].screen.lock().unwrap().error.is_none());
-        {
-            let mut state = restored.tabs[0].screen.lock().unwrap();
-            assert!(
-                !state.parser.screen().alternate_screen(),
-                "tmux must preserve native scrollback"
-            );
-            state.parser.screen_mut().set_scrollback(5000);
-            assert!(
-                state.parser.screen().contents().contains("HISTORY_KEEP_0"),
-                "retained history must reconnect too"
-            );
-            state.parser.screen_mut().set_scrollback(0);
-        }
+        assert!(
+            String::from_utf8_lossy(&backend.history(None)?).contains("HISTORY_KEEP_0"),
+            "tmux retains shell history across reconnects"
+        );
         let geometry = backend.run_for_test(&[
             "display-message",
             "-p",
             "-t",
-            &format!("={}", backend.name),
+            &format!("={}:", backend.name),
             "#{pane_width}x#{pane_height}",
         ])?;
         assert_eq!(String::from_utf8(geometry.stdout)?.trim(), "101x31");
@@ -4045,7 +4041,7 @@ mod tests {
         // tmux, rather than only checking egui's outgoing wheel bytes. Removing
         // every root binding silently swallowed these events inside tmux.
         let report = dir.path().join("wheel-events");
-        let wheel = b"\x1b[<64;3;4M\x1b[<65;3;4M";
+        let wheel = b"\x1b[<64;3;4M\x1b[<65;3;4M\x1b[<0;3;4M\x1b[<0;3;4m";
         let capture = format!(
             "stty raw -echo; printf '\\033[?1000h\\033[?1006h'; dd bs=1 count={} of={} 2>/dev/null; printf '\\033[?1000l\\033[?1006l'; stty sane\n",
             wheel.len(),
@@ -4055,6 +4051,14 @@ mod tests {
         wait_for(&restored.tabs[0].screen, |s| {
             s.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
         });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !report.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            report.exists(),
+            "the input reader must be ready before sending mouse events"
+        );
         assert!(restored.tabs[0].send(Command::Input(wheel.to_vec())));
         let deadline = Instant::now() + Duration::from_secs(3);
         while std::fs::read(&report).unwrap_or_default() != wheel && Instant::now() < deadline {
@@ -4065,9 +4069,6 @@ mod tests {
             wheel,
             "wheel events must reach the application through tmux"
         );
-        wait_for(&restored.tabs[0].screen, |s| {
-            s.parser.screen().mouse_protocol_mode() == vt100::MouseProtocolMode::None
-        });
 
         restored.settings.shell = "/bin/sh".into();
         restored.new_tab(dir.path(), &ctx);
@@ -4396,6 +4397,20 @@ mod tests {
             true,
         );
         assert!(String::from_utf8_lossy(&bytes).contains("\x1b[<64;"));
+        let bytes = frame(
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 1.0),
+                modifiers: Modifiers::NONE,
+            }],
+            true,
+        );
+        assert_eq!(
+            bytes.iter().filter(|byte| **byte == b'M').count(),
+            1,
+            "one physical wheel line must produce one application wheel event"
+        );
+
         assert_eq!(frame(vec![], false), b"\x1b[O");
         assert!(frame(vec![], true).starts_with(b"\x1b[I"));
         screen

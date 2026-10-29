@@ -26,6 +26,26 @@ pub struct Entry {
 }
 
 pub fn defaults() -> Vec<Entry> {
+    let mut entries = previous_defaults();
+    // -q keeps older tmux versions that lack this option usable.
+    entries.push(Entry {
+        enabled: true,
+        command: "set -gq copy-mode-position-format ''".into(),
+    });
+    entries
+}
+
+pub(super) fn previous_defaults() -> Vec<Entry> {
+    ["set -g status off", "set -g mouse on"]
+        .into_iter()
+        .map(|command| Entry {
+            enabled: true,
+            command: command.into(),
+        })
+        .collect()
+}
+
+pub(super) fn legacy_defaults() -> Vec<Entry> {
     let mut commands: Vec<String> = [
         "set -g status off",
         "set -g prefix None",
@@ -107,8 +127,7 @@ impl Settings {
             "Customize persistence, tmux options and key bindings.",
         );
         crate::chrome::dialog_card(ui, |ui| {
-            ui.checkbox(&mut self.tmux_enabled, "Use tmux for new terminal tabs");
-            ui.label("Saved tmux tabs still reconnect to their original sessions. Turning this off affects new tabs.");
+            ui.label("Choose the persistence backend in Terminal settings. These options apply only to tmux sessions.");
             ui.label("tmux client flags");
             ui.add(
                 egui::TextEdit::singleline(&mut self.tmux_client_args)
@@ -154,6 +173,36 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_backend_roundtrips_without_changing_tmux_configuration() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings::default();
+        settings.terminal_backend = "zmx".into();
+        settings.save(&path)?;
+        let loaded = Settings::load(&path)?;
+        assert_eq!(loaded.terminal_backend, "zmx");
+        assert_eq!(loaded.tmux_options, settings.tmux_options);
+        assert!(loaded.tmux_enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_defaults_migrate_but_custom_configuration_is_preserved() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings::default();
+        for entries in [legacy_defaults(), previous_defaults()] {
+            settings.tmux_options = entries;
+            settings.save(&path)?;
+            assert_eq!(Settings::load(&path)?.tmux_options, defaults());
+            settings.tmux_options[0].command = "set -g status on".into();
+            settings.save(&path)?;
+            assert_eq!(Settings::load(&path)?.tmux_options, settings.tmux_options);
+        }
+        Ok(())
+    }
 
     #[test]
     fn tmux_preferences_preserve_disabled_entries_order_flags_and_unknown_keys() -> Result<()> {

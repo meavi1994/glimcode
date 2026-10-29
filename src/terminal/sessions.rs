@@ -224,7 +224,7 @@ impl Manager {
                     .min(720.0)
                     .min((ctx.content_rect().height() - 100.0).max(180.0));
                 ui.set_min_height(height);
-                let close = chrome::dialog_header(ui, ">_", "Terminal sessions", "All sessions on Glimcode’s tmux server", chrome::BLUE);
+                let close = chrome::dialog_header(ui, ">_", "Terminal sessions", "Persistent terminal sessions owned by Glimcode", chrome::BLUE);
                 // Keep the result visible until a requested termination finishes.
                 dismiss = close && !self.killing;
                 if let Some(session) = self.pending.clone() {
@@ -247,7 +247,7 @@ impl Manager {
                         });
                     });
                 } else {
-                    ui.label("Orphan = no tmux clients attached. It may belong to a closed project and can still be restored later.");
+                    ui.label("Orphan = no terminal clients attached. It may belong to a closed project and can still be restored later.");
                     ui.horizontal(|ui| {
                         let orphans = self.sessions.iter().filter(|s| s.clients == 0).count();
                         ui.label(format!("{} sessions · {orphans} orphans", self.sessions.len()));
@@ -259,7 +259,7 @@ impl Manager {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             if self.sessions.is_empty() && !busy && self.error.is_none() {
-                                ui.label("No Glimcode tmux sessions are running.");
+                                ui.label("No Glimcode terminal sessions are running.");
                             }
                             for session in &self.sessions {
                                 ui.push_id(&session.id, |ui| {

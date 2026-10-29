@@ -3930,6 +3930,11 @@ impl Coder {
                 session
                     .terminal
                     .settings
+                    .terminal_backend
+                    .clone_from(&self.terminal.settings.terminal_backend);
+                session
+                    .terminal
+                    .settings
                     .tmux_client_args
                     .clone_from(&self.terminal.settings.tmux_client_args);
                 session

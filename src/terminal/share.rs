@@ -160,14 +160,22 @@ fn command(
     if options.writable {
         command.arg("--writable");
     }
-    command
-        .arg(session.executable())
-        .args(["-L", "glimcode", "attach-session"]);
-    if !options.writable {
-        command.arg("-r");
+    command.arg(session.executable());
+    if session.is_zmx() {
+        command
+            .args(["attach", &session.name])
+            .env("ZMX_DIR", zmx::directory())
+            .env("ZMX_NO_DETACH_KEY", "1")
+            .env_remove("ZMX_SESSION")
+            .env_remove("ZMX_SESSION_PREFIX");
+    } else {
+        command.args(["-L", "glimcode", "attach-session"]);
+        if !options.writable {
+            command.arg("-r");
+        }
+        command.args(["-t", &format!("={}", session.name)]);
     }
     command
-        .args(["-t", &format!("={}", session.name)])
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         .stdin(Stdio::null());
@@ -206,7 +214,9 @@ fn run(
     fingerprint: &Mutex<Option<String>>,
 ) -> Result<()> {
     if !session.exists() {
-        bail!("The tmux session is not running. Wait for the terminal to start, then try again.");
+        bail!(
+            "The terminal session is not running. Wait for the terminal to start, then try again."
+        );
     }
     let address = SocketAddr::from((
         if options.network {
@@ -618,6 +628,35 @@ mod tests {
             Some(libc::ECHILD)
         );
         Ok(())
+    }
+
+    #[test]
+    fn zmx_sharing_uses_the_private_namespace_and_ttyd_readonly_mode() {
+        let session =
+            tmux::Persistent::new_with_backend(Some("glimcode-zmx-share-test".into()), "zmx")
+                .unwrap();
+        let process = command(
+            Path::new("ttyd"),
+            &session,
+            &Options {
+                writable: false,
+                ..Default::default()
+            },
+            "glimcode:secret",
+        );
+        let args: Vec<_> = process
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.ends_with(&["attach".into(), session.name.clone()]));
+        assert!(!args.contains(&"--writable".into()));
+        assert!(!args.contains(&"-L".into()));
+        assert!(process.get_envs().any(|(key, value)| key == "ZMX_DIR" && value == Some(zmx::directory().as_os_str())));
+        assert!(
+            process
+                .get_envs()
+                .any(|(key, value)| key == "ZMX_SESSION" && value.is_none())
+        );
     }
 
     #[test]

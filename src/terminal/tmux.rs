@@ -3,8 +3,6 @@ use super::*;
 use std::process::{Command as Process, Output};
 
 const SERVER: &str = "glimcode";
-#[cfg(test)]
-pub(super) use crate::preferences::tmux::MOUSE_EVENTS;
 const SESSION_FORMAT: &str =
     "#{session_id}\t#{session_name}\t#{session_attached}\t#{session_windows}\t#{pane_current_path}";
 
@@ -48,8 +46,16 @@ fn valid_session_id(id: &str) -> bool {
 }
 
 pub(super) fn list_sessions() -> Result<Vec<SessionInfo>> {
-    let executable = executable().context("tmux is not installed")?;
-    list_sessions_with(&executable)
+    let mut sessions = if let Some(executable) = executable() {
+        list_sessions_with(&executable)?
+    } else {
+        Vec::new()
+    };
+    if let Some(executable) = zmx::executable() {
+        sessions.extend(zmx::list(&executable)?);
+    }
+    sessions.sort_by(|a, b| (a.clients != 0, &a.name).cmp(&(b.clients != 0, &b.name)));
+    Ok(sessions)
 }
 
 fn server_process(executable: &Path) -> Process {
@@ -76,6 +82,9 @@ fn list_sessions_with(executable: &Path) -> Result<Vec<SessionInfo>> {
 }
 
 pub(super) fn kill_session(session: &SessionInfo) -> Result<()> {
+    if session.name.starts_with(zmx::PREFIX) {
+        return zmx::kill(&zmx::executable().context("zmx is not installed")?, session);
+    }
     kill_session_with(&executable().context("tmux is not installed")?, session)
 }
 
@@ -330,6 +339,7 @@ pub(super) fn find_executable(name: &str) -> Option<PathBuf> {
     }
     let paths = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&paths)
+        .chain(std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin")))
         .chain(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(PathBuf::from))
         .map(|path| path.join(name))
         .find(|path| {
@@ -354,18 +364,33 @@ pub(super) fn valid_name(name: &str) -> bool {
 }
 
 impl Persistent {
+    #[cfg(test)]
     pub fn new(name: Option<String>) -> Option<Self> {
+        Self::new_with_backend(name, "tmux")
+    }
+    pub fn new_with_backend(name: Option<String>, backend: &str) -> Option<Self> {
+        let use_zmx = name
+            .as_ref()
+            .is_some_and(|name| name.starts_with(zmx::PREFIX))
+            || (name.is_none() && backend == "zmx");
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let executable = match executable() {
+        let executable = match if use_zmx {
+            zmx::executable()
+        } else {
+            executable()
+        } {
             Some(path) => path,
-            None if name.as_ref().is_some_and(|name| valid_name(name)) => PathBuf::from("tmux"),
+            None if name.as_ref().is_some_and(|name| valid_name(name)) => {
+                PathBuf::from(if use_zmx { "zmx" } else { "tmux" })
+            }
             None => return None,
         };
         Some(Self {
             executable,
             name: name.filter(|name| valid_name(name)).unwrap_or_else(|| {
                 format!(
-                    "glimcode-{:x}-{:x}-{:x}",
+                    "{}{:x}-{:x}-{:x}",
+                    if use_zmx { zmx::PREFIX } else { "glimcode-" },
                     std::process::id(),
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -377,6 +402,24 @@ impl Persistent {
             closed: Arc::new(AtomicBool::new(false)),
             lifecycle: Arc::new(Mutex::new(())),
         })
+    }
+    pub fn is_zmx(&self) -> bool {
+        self.name.starts_with(zmx::PREFIX)
+    }
+    pub fn kind(&self) -> &str {
+        if self.is_zmx() { "zmx" } else { "tmux" }
+    }
+    pub fn attach_command(&self) -> String {
+        if self.is_zmx() {
+            format!(
+                "env -u ZMX_SESSION -u ZMX_SESSION_PREFIX ZMX_DIR={} {} attach {}",
+                shell_words::quote(&zmx::directory().to_string_lossy()),
+                shell_words::quote(&self.executable.to_string_lossy()),
+                self.name
+            )
+        } else {
+            format!("tmux -L glimcode attach-session -t {}", self.name)
+        }
     }
     pub fn executable(&self) -> &Path {
         &self.executable
@@ -409,8 +452,44 @@ impl Persistent {
         self.run(args)
     }
     pub fn exists(&self) -> bool {
+        if self.is_zmx() {
+            return zmx::list(&self.executable)
+                .is_ok_and(|sessions| sessions.iter().any(|session| session.name == self.name));
+        }
         self.run(&["has-session", "-t", &format!("={}", self.name)])
             .is_ok()
+    }
+    pub fn start(
+        &self,
+        root: &Path,
+        settings: &Settings,
+        size: PtySize,
+        slave: &dyn portable_pty::SlavePty,
+    ) -> Result<ManagedChild> {
+        if !self.is_zmx() {
+            return Ok(ManagedChild(
+                slave.spawn_command(self.attach(root, settings, size)?)?,
+            ));
+        }
+        // Unlike tmux, zmx creates the daemon when the client starts. Keep
+        // close() serialized until that daemon exists, or a tab closed during
+        // startup could leave an orphan behind.
+        let _guard = self.lifecycle.lock().unwrap();
+        if self.closed.load(Ordering::Relaxed) {
+            bail!("Terminal session was closed");
+        }
+        let mut child = ManagedChild(slave.spawn_command(zmx::attach(self, root, settings)?)?);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.exists() {
+            if let Some(status) = child.0.try_wait()? {
+                bail!("zmx client exited during startup: {status}");
+            }
+            if Instant::now() >= deadline {
+                bail!("Timed out waiting for zmx to start");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(child)
     }
     pub fn attach(
         &self,
@@ -421,6 +500,9 @@ impl Persistent {
         let _guard = self.lifecycle.lock().unwrap();
         if self.closed.load(Ordering::Relaxed) {
             bail!("Terminal session was closed");
+        }
+        if self.is_zmx() {
+            return zmx::attach(self, root, settings);
         }
         let mut config = tempfile::NamedTempFile::new()?;
         config.write_all(settings.tmux_config()?.as_bytes())?;
@@ -514,6 +596,14 @@ impl Persistent {
         Ok(command)
     }
     pub fn pane_status(&self) -> Option<(PathBuf, Option<u64>)> {
+        if self.is_zmx() {
+            let session = zmx::list(&self.executable)
+                .ok()?
+                .into_iter()
+                .find(|s| s.name == self.name)?;
+            let directory = PathBuf::from(session.directory);
+            return directory.is_absolute().then_some((directory, None));
+        }
         let output = self
             .run(&[
                 "display-message",
@@ -533,6 +623,9 @@ impl Persistent {
         self.pane_status().map(|(path, _)| path)
     }
     pub fn history(&self, client_pid: Option<u32>) -> Result<Vec<u8>> {
+        if self.is_zmx() {
+            return Ok(Vec::new());
+        } // zmx restores its own snapshot.
         // Attaching can shrink/reflow an old pane and move visible rows into
         // tmux history. Capturing before our client attaches misses those rows.
         if let Some(pid) = client_pid {
@@ -578,7 +671,11 @@ impl Persistent {
         std::thread::spawn(move || {
             // Serialize with creation so closing during startup cannot leak a shell.
             let _guard = session.lifecycle.lock().unwrap();
-            let _ = session.run(&["kill-session", "-t", &format!("={}", session.name)]);
+            if session.is_zmx() {
+                let _ = zmx::run(&session.executable, &["kill", &session.name, "--force"]);
+            } else {
+                let _ = session.run(&["kill-session", "-t", &format!("={}", session.name)]);
+            }
         });
     }
 }
