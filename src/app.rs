@@ -1396,6 +1396,10 @@ impl Coder {
                             self.terminal.toggle(&self.root, ctx);
                             ui.close();
                         }
+                        if ui.button("Terminal sessions…").clicked() {
+                            self.terminal.open_sessions(ctx);
+                            ui.close();
+                        }
                     });
                     ui.menu_button("Settings", |ui| {
                         if ui.button("Preferences…").clicked() {
@@ -2620,7 +2624,30 @@ impl Coder {
         scroll
     }
 
-    fn editor(&mut self, ctx: &egui::Context) {
+    fn editor_file_drop(&mut self, ui: &mut egui::Ui, enabled: bool) {
+        let has_files =
+            ui.input(|i| !i.raw.hovered_files.is_empty() || !i.raw.dropped_files.is_empty());
+        if !enabled
+            || !has_files
+            || !crate::terminal::file_drop_position(ui.ctx())
+                .is_some_and(|pos| ui.max_rect().contains(pos))
+        {
+            return;
+        }
+        let files = ui.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+        for file in files {
+            if let Some(path) = file.path {
+                if path.is_dir() {
+                    self.request_project(path);
+                } else {
+                    self.open(path, None);
+                    self.focus_editor = true;
+                }
+            }
+        }
+    }
+
+    fn editor(&mut self, ctx: &egui::Context, enabled: bool) {
         let mut clicked_token = None;
         let mut clicked_blame = None;
         // Keep scrollbars outside the neighbouring panels' resize hit zones.
@@ -2648,6 +2675,7 @@ impl Coder {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(chrome::EDITOR).inner_margin(margin))
             .show(ctx, |ui| {
+                self.editor_file_drop(ui, enabled);
                 let mut close = None;
                 let mut activate = None;
                 egui::Frame::new()
@@ -3781,7 +3809,7 @@ impl Coder {
         if terminal_maximized {
             self.terminal.central_panel(ctx, &self.root, !blocked);
         } else {
-            self.editor(ctx);
+            self.editor(ctx, !blocked);
         }
         if let Some(link) = crate::terminal::take_file_link(ctx) {
             self.open_terminal_link(link);
@@ -5617,6 +5645,62 @@ fn edit_line(text: &mut String, cursor: usize, path: &Path, duplicate: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_drops_use_normal_open_actions_and_respect_target_and_modals() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("a file.rs");
+        let folder = dir.path().join("folder");
+        std::fs::write(&file, "fn main() {}")?;
+        std::fs::create_dir(&folder)?;
+        let mut app = Coder::empty(dir.path().to_path_buf());
+        app.defer_actions = true;
+        let ctx = egui::Context::default();
+        for (enabled, inside) in [(false, true), (true, false), (true, true)] {
+            let mut remaining = 0;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    events: vec![egui::Event::PointerMoved(if inside {
+                        egui::pos2(100.0, 100.0)
+                    } else {
+                        egui::pos2(900.0, 900.0)
+                    })],
+                    dropped_files: [file.clone(), folder.clone()]
+                        .into_iter()
+                        .map(|path| egui::DroppedFile {
+                            path: Some(path),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.editor_file_drop(ui, enabled));
+                    remaining = ctx.input(|i| i.raw.dropped_files.len());
+                },
+            );
+            if enabled && inside {
+                assert_eq!(remaining, 0);
+                assert!(matches!(&app.actions[0], FrameAction::Open(path, None) if path == &file));
+                assert!(
+                    matches!(&app.actions[1], FrameAction::SwitchProject(path) if path == &folder)
+                );
+            } else {
+                assert_eq!(remaining, 2);
+                assert!(app.actions.is_empty());
+            }
+        }
+        app.defer_actions = false;
+        app.open(file, None);
+        app.documents[0].dirty = true;
+        app.request_project(folder.clone());
+        assert!(matches!(&app.pending, Some(Pending::SwitchProject(path)) if path == &folder));
+        Ok(())
+    }
 
     #[test]
     fn terminal_links_resolve_from_directory_or_project_and_prefill_search() -> anyhow::Result<()> {

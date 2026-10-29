@@ -74,6 +74,8 @@ Use the left **Worktrees** panel to work on multiple branches in separate folder
 
 Folder sessions are saved under `~/.glimcode/projects/`. Reopening a folder restores its file tabs, active tab, cursor locations, panel visibility, and terminal tab metadata. On macOS and Linux, terminals use tmux when installed: shells and programs keep running after quitting Glimcode, and restored tabs reconnect on demand with their retained history. Install tmux on macOS with `brew install tmux`. Without tmux, tabs start fresh shells in their saved directories. Unsaved file contents are not restored after quitting.
 
+Open **View → Terminal sessions…**, or right-click a terminal tab and choose **Manage terminal sessions…**, to inspect running sessions across Glimcode projects. Sessions with no attached clients are marked **Orphan** and listed first; they may belong to a closed project that can reconnect later. The manager shows each session’s directory and client count, refreshes in the background, and lets you end individual sessions after confirmation.
+
 See the [workspace panel guide](docs/USER_GUIDE.md#workspace-panels) and [session restore details](docs/USER_GUIDE.md#project-session-restore).
 
 ### GitHub-style branch review

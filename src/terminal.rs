@@ -5,6 +5,7 @@ mod https;
 mod macos;
 mod mobile;
 mod qr;
+mod sessions;
 mod share;
 mod tls;
 mod tmux;
@@ -601,8 +602,37 @@ pub struct Terminal {
     share_qr_url: String,
     share_qr_login: bool,
     share_qr: Option<(String, qr::Code)>,
+    sessions: sessions::Manager,
 }
 impl Terminal {
+    pub fn open_sessions(&mut self, ctx: &egui::Context) {
+        self.sessions.open(ctx);
+    }
+
+    fn forget_session(&mut self, name: &str) {
+        // Termination already used tmux's stable numeric ID. Remove local tabs
+        // without sending a second, name-based kill to a potentially new shell.
+        for index in (0..self.tabs.len()).rev() {
+            if self.tabs[index]
+                .persistent
+                .as_ref()
+                .is_some_and(|s| s.name == name)
+            {
+                self.tabs[index].persistent = None;
+                self.close(index);
+            }
+        }
+        let before = self.restored_tabs.len();
+        self.restored_tabs
+            .retain(|(_, session)| session.as_deref() != Some(name));
+        if self.restored_tabs.len() != before {
+            self.restored_active = self
+                .restored_active
+                .min(self.restored_tabs.len().saturating_sub(1));
+            self.metadata_changed = true;
+        }
+    }
+
     pub fn snapshot(&self) -> serde_json::Value {
         let roots: Vec<_> = if self.restored_tabs.is_empty() {
             self.tabs
@@ -793,6 +823,7 @@ impl Terminal {
         let mut close = None;
         let mut share_tab = None;
         let mut stop_share = None;
+        let mut manage_sessions = false;
         egui::Frame::new()
             .fill(chrome::PANEL)
             .inner_margin(egui::Margin::symmetric(8, 6))
@@ -863,6 +894,10 @@ impl Terminal {
                                                 ui.close();
                                             }
                                             ui.separator();
+                                        }
+                                        if ui.button("Manage terminal sessions…").clicked() {
+                                            manage_sessions = true;
+                                            ui.close();
                                         }
                                         if ui.button("New terminal").clicked() {
                                             new = true;
@@ -961,6 +996,9 @@ impl Terminal {
         }
         if new {
             self.new_tab(root, &ctx);
+        }
+        if manage_sessions {
+            self.open_sessions(&ctx);
         }
         if let Some(index) = close {
             self.request_close(index);
@@ -1079,6 +1117,19 @@ impl Terminal {
             .collect()
     }
     pub fn windows(&mut self, ctx: &egui::Context) {
+        let local = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.persistent.as_ref().map(|s| s.name.clone()))
+            .chain(
+                self.restored_tabs
+                    .iter()
+                    .filter_map(|(_, name)| name.clone()),
+            )
+            .collect();
+        if let Some(name) = self.sessions.show(ctx, &local) {
+            self.forget_session(&name);
+        }
         self.share_window(ctx);
         if self.settings_open {
             let mut save = false;
@@ -1411,7 +1462,10 @@ impl Terminal {
         }
     }
     pub fn modal(&self) -> bool {
-        self.settings_open || self.pending_close.is_some() || self.share_target.is_some()
+        self.settings_open
+            || self.pending_close.is_some()
+            || self.share_target.is_some()
+            || self.sessions.open
     }
 }
 
@@ -1897,7 +1951,7 @@ fn cell_colors(
 
 /// External drags do not produce mouse-move events on macOS. Query the native
 /// cursor while dragging rather than routing a drop using a stale egui pointer.
-fn file_drop_position(ctx: &egui::Context) -> Option<egui::Pos2> {
+pub(crate) fn file_drop_position(ctx: &egui::Context) -> Option<egui::Pos2> {
     #[cfg(target_os = "macos")]
     if let Some(window) = ctx.input(|i| i.viewport().inner_rect)
         && let Some(cursor) = macos::cursor_position()
@@ -3548,6 +3602,29 @@ mod tests {
     }
 
     #[test]
+    fn ending_a_session_removes_its_saved_tab_without_recreating_it() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut terminal = Terminal::default();
+        terminal.restore(&serde_json::json!({
+            "roots": [dir.path(), dir.path()],
+            "sessions": ["glimcode-ended", "glimcode-kept"],
+            "active": 1,
+            "visible": false
+        }));
+        terminal.forget_session("glimcode-ended");
+        assert_eq!(
+            terminal.snapshot()["sessions"],
+            serde_json::json!(["glimcode-kept"])
+        );
+        assert!(terminal.take_metadata_changed());
+        terminal.forget_session("glimcode-missing");
+        assert!(!terminal.take_metadata_changed());
+        terminal.sessions.open = true;
+        assert!(terminal.modal());
+        Ok(())
+    }
+
+    #[test]
     fn persistent_terminal_metadata_preserves_ids_and_rejects_foreign_targets() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let value = serde_json::json!({"roots": [dir.path(), dir.path()],
@@ -3645,6 +3722,27 @@ mod tests {
             Some(nested.canonicalize()?)
         );
 
+        // Simulate an older server intercepting drags and leaving a selection
+        // in tmux's private copy-mode instead of the editor clipboard.
+        backend.run_for_test(&[
+            "set-option",
+            "-t",
+            &backend.name,
+            "mouse",
+            "on",
+            ";",
+            "bind-key",
+            "-T",
+            "root",
+            "MouseDrag1Pane",
+            "copy-mode",
+            "-M",
+            ";",
+            "copy-mode",
+            "-t",
+            &format!("={}:", backend.name),
+        ])?;
+
         let mut restored = Terminal::default();
         // Existing sessions must reconnect even if new-shell preferences are invalid.
         restored.settings.shell = "/does/not/exist".into();
@@ -3660,6 +3758,22 @@ mod tests {
         wait_for(&restored.tabs[0].screen, |s| {
             s.status == "Running" || s.error.is_some()
         });
+        let mouse_state = backend.run_for_test(&[
+            "display-message",
+            "-p",
+            "-t",
+            &format!("={}:", backend.name),
+            "#{mouse}:#{pane_in_mode}",
+        ])?;
+        assert_eq!(String::from_utf8(mouse_state.stdout)?.trim(), "off:0");
+        let bindings = backend.run_for_test(&["list-keys"])?;
+        assert!(
+            !String::from_utf8(bindings.stdout)?.lines().any(|line| {
+                line.split_whitespace()
+                    .any(|word| word == "root" || word == "prefix")
+            }),
+            "tmux must not intercept selection"
+        );
         assert!(restored.tabs[0].send(Command::Input(
             b"printf 'RESTORED:%s:%s:END\\n' \"$GLIMCODE_RESUME\" \"$$\"\n".to_vec()
         )));
