@@ -153,6 +153,8 @@ The **Settings** menu has four entries: **Appearance…** (fonts), **Terminal…
 
 In **Settings → tmux settings…**, customize the client flags and every configuration command. Each entry can be enabled, disabled, edited (including multiline tmux configuration), moved earlier/later, or removed. Add arbitrary commands, enable/disable all entries, copy the active configuration, or restore Glimcode’s defaults. The persistence switch controls new tabs; saved tmux tabs still reconnect to their original shells.
 
+Glimcode also disables tmux’s `scroll-on-clear` option so clearing and redrawing a prompt does not leave intermediate prompts in history. Previously saved default configurations migrate automatically; custom configurations can add `set -gq scroll-on-clear off` in tmux settings. Existing history is retained.
+
 These preferences are saved in `~/.glimcode/settings.json` under `tmux_enabled`, `tmux_client_args`, and `tmux_options`:
 
 ```json

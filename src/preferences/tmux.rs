@@ -26,6 +26,17 @@ pub struct Entry {
 }
 
 pub fn defaults() -> Vec<Entry> {
+    let mut entries = indicator_defaults();
+    // Prompt redraws at the top of the screen must replace the old prompt,
+    // rather than save each intermediate version in tmux's history.
+    entries.push(Entry {
+        enabled: true,
+        command: "set -gq scroll-on-clear off".into(),
+    });
+    entries
+}
+
+pub(super) fn indicator_defaults() -> Vec<Entry> {
     let mut entries = previous_defaults();
     // -q keeps older tmux versions that lack this option usable.
     entries.push(Entry {
@@ -193,7 +204,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("settings.json");
         let mut settings = Settings::default();
-        for entries in [legacy_defaults(), previous_defaults()] {
+        for entries in [legacy_defaults(), previous_defaults(), indicator_defaults()] {
             settings.tmux_options = entries;
             settings.save(&path)?;
             assert_eq!(Settings::load(&path)?.tmux_options, defaults());

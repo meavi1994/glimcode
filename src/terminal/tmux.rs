@@ -128,6 +128,53 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    #[ignore = "requires tmux and permission to create local Unix sockets; run outside a sandbox"]
+    fn cleared_prompt_redraws_do_not_enter_tmux_history() -> Result<()> {
+        struct Cleanup(Persistent);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.close();
+            }
+        }
+        for (scroll_on_clear, expected_history) in [(true, 2), (false, 0)] {
+            let backend = Persistent::new(None).context("tmux is not installed")?;
+            let _cleanup = Cleanup(backend.clone());
+            let dir = tempfile::tempdir()?;
+            let mut settings = Settings {
+                shell: shell_words::join([
+                    "/bin/sh",
+                    "-c",
+                    r"printf '\033[Hinstant prompt\033[H\033[Jinitial prompt\033[H\033[Jready prompt'; exec sleep 30",
+                ]),
+                ..Default::default()
+            };
+            if scroll_on_clear {
+                settings.tmux_options.push(crate::preferences::tmux::Entry {
+                    enabled: true,
+                    command: "set -g scroll-on-clear on".into(),
+                });
+            }
+            backend.attach(dir.path(), &settings, FALLBACK_SIZE)?;
+            let target = format!("={}:", backend.name);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let output = backend.run(&["capture-pane", "-p", "-t", &target])?;
+                if String::from_utf8_lossy(&output.stdout).contains("ready prompt") {
+                    break;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "prompt did not render");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = backend.run(&["display-message", "-p", "-t", &target, "#{history_size}"])?;
+            assert_eq!(
+                String::from_utf8(output.stdout)?.trim(),
+                expected_history.to_string()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn pane_status_reads_activity_and_directory_from_the_target_session() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let executable = dir.path().join("tmux");

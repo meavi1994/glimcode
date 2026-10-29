@@ -224,6 +224,7 @@ impl Settings {
         };
         if settings.tmux_options == tmux::legacy_defaults()
             || settings.tmux_options == tmux::previous_defaults()
+            || settings.tmux_options == tmux::indicator_defaults()
         {
             settings.tmux_options = tmux::defaults();
         }
