@@ -59,9 +59,16 @@ pub(super) struct Share {
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
     fingerprint: Arc<Mutex<Option<String>>>,
+    size: Arc<Mutex<Option<PtySize>>>,
 }
 impl Share {
-    pub fn start(session: tmux::Persistent, options: Options, ctx: egui::Context) -> Result<Self> {
+    pub fn start(
+        session: tmux::Persistent,
+        options: Options,
+        ctx: egui::Context,
+        sender: SyncSender<Command>,
+        desktop_size: PtySize,
+    ) -> Result<Self> {
         let executable = tmux::find_executable("ttyd").context(
             "ttyd is not installed. Install it with `brew install ttyd` on macOS, then try again.",
         )?;
@@ -78,7 +85,16 @@ impl Share {
         let stopped = stop.clone();
         let settings = options.clone();
         let credential = format!("glimcode:{password}");
+        let size = Arc::new(Mutex::new(None));
+        let worker_size = size.clone();
         let worker = std::thread::spawn(move || {
+            struct RestoreSize(SyncSender<Command>, PtySize);
+            impl Drop for RestoreSize {
+                fn drop(&mut self) {
+                    let _ = self.0.try_send(Command::Resize(self.1));
+                }
+            }
+            let _restore = RestoreSize(sender.clone(), desktop_size);
             let result = run(
                 &session,
                 &executable,
@@ -88,6 +104,9 @@ impl Share {
                 &shared,
                 &ctx,
                 &worker_fingerprint,
+                &worker_size,
+                &sender,
+                desktop_size,
             );
             *shared.lock().unwrap() = match result {
                 Ok(()) => Status::Stopped,
@@ -102,10 +121,17 @@ impl Share {
             stop,
             worker: Some(worker),
             fingerprint,
+            size,
         })
     }
     pub fn status(&self) -> Status {
         self.status.lock().unwrap().clone()
+    }
+    pub fn size(&self) -> Option<PtySize> {
+        if !self.active() {
+            return None;
+        }
+        *self.size.lock().unwrap()
     }
     pub fn active(&self) -> bool {
         matches!(self.status(), Status::Starting | Status::Running)
@@ -160,7 +186,7 @@ fn command(
     if options.writable {
         command.arg("--writable");
     }
-    command.arg(session.executable());
+    command.arg("--").arg(session.executable());
     if session.is_zmx() {
         command
             .args(["attach", &session.name])
@@ -212,6 +238,9 @@ fn run(
     status: &Mutex<Status>,
     ctx: &egui::Context,
     fingerprint: &Mutex<Option<String>>,
+    size: &Mutex<Option<PtySize>>,
+    sender: &SyncSender<Command>,
+    desktop_size: PtySize,
 ) -> Result<()> {
     if !session.exists() {
         bail!(
@@ -262,24 +291,39 @@ fn run(
         return Ok(());
     }
     let log = tempfile::NamedTempFile::new()?;
+    let size_directory = tempfile::tempdir()?;
+    let mut launch = command_with_page(
+        executable,
+        session,
+        &launch_options,
+        credential,
+        page.path(),
+    );
+    share_client::wrap(&mut launch, size_directory.path())?;
     let mut child = Server(
-        command_with_page(
-            executable,
-            session,
-            &launch_options,
-            credential,
-            page.path(),
-        )
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log.reopen()?))
-        .spawn()
-        .context("Could not start ttyd")?,
+        launch
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log.reopen()?))
+            .spawn()
+            .context("Could not start ttyd")?,
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut ready = false;
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
+        }
+        let connected = share_client::connected_size(size_directory.path());
+        {
+            let mut previous = size.lock().unwrap();
+            if *previous != connected
+                && sender
+                    .try_send(Command::Resize(connected.unwrap_or(desktop_size)))
+                    .is_ok()
+            {
+                *previous = connected;
+                ctx.request_repaint();
+            }
         }
         if let Some(exit) = child.0.try_wait()? {
             // ttyd logs can include its command line. Do not surface credentials.
@@ -329,6 +373,13 @@ fn command_with_page(
     let args: Vec<_> = process.get_args().map(|arg| arg.to_owned()).collect();
     let mut with_page = Process::new(executable);
     with_page.arg("--index").arg(page).args(args);
+    for (key, value) in process.get_envs() {
+        if let Some(value) = value {
+            with_page.env(key, value);
+        } else {
+            with_page.env_remove(key);
+        }
+    }
     with_page
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
@@ -584,6 +635,8 @@ mod tests {
                 ..Default::default()
             },
             egui::Context::default(),
+            mpsc::sync_channel(128).0,
+            FALLBACK_SIZE,
         )?;
         let deadline = Instant::now() + Duration::from_secs(6);
         while matches!(share.status(), Status::Starting) && Instant::now() < deadline {
@@ -656,6 +709,23 @@ mod tests {
             process
                 .get_envs()
                 .any(|(key, value)| key == "ZMX_SESSION" && value.is_none())
+        );
+        let mut with_page = command_with_page(
+            Path::new("ttyd"),
+            &session,
+            &Options::default(),
+            "glimcode:secret",
+            Path::new("/temporary page/index.html"),
+        );
+        assert_eq!(
+            with_page.get_envs().collect::<Vec<_>>(),
+            process.get_envs().collect::<Vec<_>>(),
+            "the mobile-page launcher must preserve the zmx namespace and nested-session exclusions"
+        );
+        share_client::wrap(&mut with_page, Path::new("/temporary client sizes")).unwrap();
+        assert_eq!(
+            with_page.get_envs().collect::<Vec<_>>(),
+            process.get_envs().collect::<Vec<_>>()
         );
     }
 

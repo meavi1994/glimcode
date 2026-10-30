@@ -26,6 +26,33 @@ pub struct Entry {
 }
 
 pub fn defaults() -> Vec<Entry> {
+    let mut entries = history_defaults();
+    // Applications inspect this option before requesting mouse input. The
+    // editor checks the pane's request to keep shell selection local.
+    entries[1].command = "set -g mouse on".into();
+    entries
+}
+
+pub(super) fn history_defaults() -> Vec<Entry> {
+    let mut entries = selection_defaults();
+    // tmux is the persistent shell's transport, so keep its outer client on
+    // the editor's main screen where output is retained and wheels browse it.
+    entries.push(Entry {
+        enabled: true,
+        command: "set -s terminal-overrides 'xterm-256color:smcup@:rmcup@'".into(),
+    });
+    entries
+}
+
+pub(super) fn selection_defaults() -> Vec<Entry> {
+    let mut entries = scroll_defaults();
+    // Let the editor select text at shell prompts. tmux still forwards mouse
+    // reporting requested by applications when its own mouse capture is off.
+    entries[1].command = "set -g mouse off".into();
+    entries
+}
+
+pub(super) fn scroll_defaults() -> Vec<Entry> {
     let mut entries = indicator_defaults();
     // Prompt redraws at the top of the screen must replace the old prompt,
     // rather than save each intermediate version in tmux's history.
@@ -204,7 +231,14 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("settings.json");
         let mut settings = Settings::default();
-        for entries in [legacy_defaults(), previous_defaults(), indicator_defaults()] {
+        for entries in [
+            legacy_defaults(),
+            previous_defaults(),
+            indicator_defaults(),
+            scroll_defaults(),
+            selection_defaults(),
+            history_defaults(),
+        ] {
             settings.tmux_options = entries;
             settings.save(&path)?;
             assert_eq!(Settings::load(&path)?.tmux_options, defaults());

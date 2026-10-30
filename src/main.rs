@@ -26,6 +26,9 @@ mod test_files;
 mod worktrees;
 
 fn main() -> eframe::Result {
+    if let Some(status) = terminal::run_share_client() {
+        std::process::exit(status);
+    }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])

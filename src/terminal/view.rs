@@ -5,6 +5,7 @@ type HistorySelection = (Position, Position);
 
 #[derive(Default)]
 pub(super) struct TerminalView {
+    pub remote_size: Option<PtySize>,
     pub scrollbar: scrollbar::Scrollbar,
     pub find: Find,
     pub selection: Option<HistorySelection>,

@@ -184,7 +184,7 @@ mod tests {
 [ "$1" = -L ] && [ "$2" = glimcode ] && [ "$3" = -u ] || exit 1
 shift 3
 [ "$1" = display-message ] && [ "$2" = -p ] && [ "$3" = -t ] && [ "$4" = '=glimcode-test:' ] || exit 2
-printf '12345\t/project with spaces\tand tab\n'
+printf '12345\t1\t/project with spaces\tand tab\n'
 "#,
         )?;
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
@@ -196,7 +196,11 @@ printf '12345\t/project with spaces\tand tab\n'
         };
         assert_eq!(
             backend.pane_status(),
-            Some((PathBuf::from("/project with spaces\tand tab"), Some(12345)))
+            Some((
+                PathBuf::from("/project with spaces\tand tab"),
+                Some(12345),
+                true
+            ))
         );
         Ok(())
     }
@@ -642,14 +646,14 @@ impl Persistent {
         command.env_remove("TMUX_PANE");
         Ok(command)
     }
-    pub fn pane_status(&self) -> Option<(PathBuf, Option<u64>)> {
+    pub fn pane_status(&self) -> Option<(PathBuf, Option<u64>, bool)> {
         if self.is_zmx() {
             let session = zmx::list(&self.executable)
                 .ok()?
                 .into_iter()
                 .find(|s| s.name == self.name)?;
             let directory = PathBuf::from(session.directory);
-            return directory.is_absolute().then_some((directory, None));
+            return directory.is_absolute().then_some((directory, None, false));
         }
         let output = self
             .run(&[
@@ -657,17 +661,33 @@ impl Persistent {
                 "-p",
                 "-t",
                 &format!("={}:", self.name),
-                "#{window_activity}\t#{pane_current_path}",
+                "#{window_activity}\t#{mouse_any_flag}\t#{pane_current_path}",
             ])
             .ok()?;
         let output = String::from_utf8(output.stdout).ok()?;
-        let (activity, path) = output.trim_end_matches('\n').split_once('\t')?;
+        let mut fields = output.trim_end_matches('\n').splitn(3, '\t');
+        let activity = fields.next()?;
+        let mouse = fields.next()? == "1";
+        let path = fields.next()?;
         let path = PathBuf::from(path);
-        path.is_absolute().then_some((path, activity.parse().ok()))
+        path.is_absolute()
+            .then_some((path, activity.parse().ok(), mouse))
+    }
+    pub fn mouse_reporting(&self) -> bool {
+        !self.is_zmx()
+            && self
+                .run(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &format!("={}:", self.name),
+                    "#{mouse_any_flag}",
+                ])
+                .is_ok_and(|output| output.stdout.trim_ascii() == b"1")
     }
     #[cfg(test)]
     pub fn directory(&self) -> Option<PathBuf> {
-        self.pane_status().map(|(path, _)| path)
+        self.pane_status().map(|(path, _, _)| path)
     }
     pub fn history(&self, client_pid: Option<u32>) -> Result<Vec<u8>> {
         if self.is_zmx() {
