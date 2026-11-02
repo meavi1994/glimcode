@@ -37,8 +37,9 @@ impl Drop for State {
     }
 }
 
+#[cfg(test)]
 pub fn key(text: &str, extension: &str, dark: bool) -> u64 {
-    egui::util::hash((text, extension, dark))
+    egui::util::hash((egui::util::hash(text), extension, dark))
 }
 
 #[derive(Default)]
@@ -59,11 +60,21 @@ fn state_for_ui(ui: &egui::Ui, path: &Path) -> Arc<Mutex<State>> {
     })
 }
 
+#[cfg(test)]
 pub fn get(ui: &egui::Ui, text: &str, path: &Path) -> Option<Arc<Analysis>> {
+    get_keyed(ui, text, path, egui::util::hash(text))
+}
+
+pub fn get_keyed(
+    ui: &egui::Ui,
+    text: &str,
+    path: &Path,
+    fingerprint: u64,
+) -> Option<Arc<Analysis>> {
     let state = state_for_ui(ui, path);
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("txt");
     let dark = ui.visuals().dark_mode;
-    let key = key(text, extension, dark);
+    let key = egui::util::hash((fingerprint, extension, dark));
     let mut state = state.lock().unwrap();
     if state.desired.is_none_or(|(old, _)| old != key) {
         state.desired = Some((key, Instant::now()));

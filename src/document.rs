@@ -76,6 +76,12 @@ fn next_revision() -> u64 {
 pub enum Content {
     Text(SharedText),
     Csv(Box<Sheet>),
+    /// A clean text tab whose contents can be read back from disk.
+    Unloaded {
+        line: usize,
+        column: usize,
+        attempted: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -96,6 +102,11 @@ pub struct Document {
     pub path: PathBuf,
     pub content: Content,
     pub dirty: bool,
+    pub(crate) last_active: Instant,
+    io_context: Option<eframe::egui::Context>,
+    load_worker: Option<(u64, Receiver<Result<Document>>)>,
+    save_worker: Option<Receiver<Result<Saved>>>,
+    observed_stamp: Option<DiskStamp>,
     csv: Option<CsvState>,
     pub csv_error: Option<String>,
     pub outline: Vec<Symbol>,
@@ -111,6 +122,7 @@ pub struct Document {
     /// Bumped whenever the text changes, so the cached cursor position is
     /// refreshed.
     revision: u64,
+    editor_snapshot: std::cell::Cell<Option<(u64, u64, bool)>>,
     /// Cached cursor position: (revision, cursor, byte, line, line start).
     cursor_position: std::cell::Cell<Option<CursorPosition>>,
     /// Fingerprint of the file on disk, used to skip needless reads.
@@ -153,17 +165,44 @@ fn disk_stamp(path: &Path) -> Option<DiskStamp> {
     Some((nanos, meta.len()))
 }
 
+struct Saved {
+    text: SharedText,
+    stamp: Option<DiskStamp>,
+    hash: u64,
+    revision: u64,
+}
+
+enum SaveSource {
+    Text(SharedText),
+    Csv(crate::sheet::SaveSnapshot, String, String),
+}
+impl SaveSource {
+    fn text(self) -> Result<SharedText> {
+        match self {
+            Self::Text(text) => Ok(text),
+            Self::Csv(grid, source, snapshot) => {
+                let text = grid.serialize()?;
+                Ok(if text == snapshot { source } else { text }.into())
+            }
+        }
+    }
+}
+
 impl Document {
     pub fn open(path: PathBuf, headers: bool) -> Result<Self> {
         // Resolve symlinks so atomic saves update the target, not the symlink itself.
         let path = path.canonicalize()?;
+        let before = disk_stamp(&path);
         let source: SharedText = navigation::read_text(&path)?.into();
+        let opened_stamp = disk_stamp(&path);
+        if before != opened_stamp {
+            bail!("The file changed while it was being read. Try loading it again.");
+        }
         let extension = path
             .extension()
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_lowercase();
-        let source_path = path.clone();
         let content = match extension.as_str() {
             "csv" => Content::Csv(Box::new(Sheet::parse(
                 &source,
@@ -193,6 +232,11 @@ impl Document {
             path,
             content,
             dirty: false,
+            last_active: Instant::now(),
+            io_context: None,
+            load_worker: None,
+            save_worker: None,
+            observed_stamp: opened_stamp,
             csv,
             csv_error: None,
             outline,
@@ -208,8 +252,9 @@ impl Document {
                 "LF"
             },
             revision: next_revision(),
+            editor_snapshot: std::cell::Cell::new(None),
             cursor_position: std::cell::Cell::new(None),
-            disk_stamp: disk_stamp(&source_path),
+            disk_stamp: opened_stamp,
             disk_hash: Some(content_hash(&source)),
             disk_checked: Instant::now(),
             auto_reload_stamp: None,
@@ -217,6 +262,182 @@ impl Document {
             original_hash: std::cell::Cell::new(Some(content_hash(&source))),
             original: source,
         })
+    }
+
+    /// A session tab can remain lightweight until it is first selected.
+    pub fn deferred(path: PathBuf, ctx: eframe::egui::Context) -> Self {
+        Self {
+            path,
+            content: Content::Unloaded {
+                line: 1,
+                column: 1,
+                attempted: false,
+            },
+            dirty: false,
+            last_active: Instant::now(),
+            io_context: Some(ctx),
+            load_worker: None,
+            save_worker: None,
+            observed_stamp: None,
+            csv: None,
+            csv_error: None,
+            outline: Vec::new(),
+            outline_refresh: None,
+            outline_worker: None,
+            markdown: MarkdownMode::Split,
+            cursor: 0,
+            jump: None,
+            editor_id: None,
+            line_ending: "LF",
+            original: "".into(),
+            revision: next_revision(),
+            editor_snapshot: std::cell::Cell::new(None),
+            cursor_position: std::cell::Cell::new(None),
+            disk_stamp: None,
+            disk_hash: None,
+            disk_checked: Instant::now(),
+            auto_reload_stamp: None,
+            buffer_hash: std::cell::Cell::new(None),
+            original_hash: std::cell::Cell::new(None),
+        }
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.load_worker.is_some()
+    }
+    pub fn is_saving(&self) -> bool {
+        self.save_worker.is_some()
+    }
+
+    fn load_background(&mut self, headers: bool) {
+        if self.is_loading() || self.is_saving() {
+            return;
+        }
+        let Some(ctx) = self.io_context.clone() else {
+            return;
+        };
+        let path = self.path.clone();
+        let csv_source = self.csv_is_source();
+        let (tx, rx) = mpsc::channel();
+        self.load_worker = Some((self.revision, rx));
+        std::thread::spawn(move || {
+            let result = Self::open(path, headers).and_then(|mut doc| {
+                doc.set_csv_source(csv_source)?;
+                Ok(doc)
+            });
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Stale reads never replace edits made while I/O was running. A save
+    /// updates the baseline to its snapshot, retaining any newer unsaved edits.
+    pub fn poll_io(&mut self) -> Result<bool> {
+        let mut changed = false;
+        if let Some((revision, rx)) = &self.load_worker {
+            let revision = *revision;
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.load_worker = None;
+                    if revision == self.revision {
+                        let mut fresh = result?;
+                        fresh.io_context = self.io_context.clone();
+                        fresh.markdown = self.markdown;
+                        fresh.cursor = self.cursor;
+                        fresh.jump = self.jump;
+                        fresh.editor_id = self.editor_id;
+                        fresh.last_active = self.last_active;
+                        *self = fresh;
+                        changed = true;
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.load_worker = None;
+                    bail!("Background file load stopped");
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = &self.save_worker {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.save_worker = None;
+                    let saved = result?;
+                    self.disk_stamp = saved.stamp;
+                    self.observed_stamp = saved.stamp;
+                    self.disk_hash = Some(saved.hash);
+                    self.original_hash.set(Some(saved.hash));
+                    self.original = saved.text;
+                    self.disk_checked = Instant::now();
+                    self.dirty = self.revision != saved.revision
+                        && match &self.content {
+                            Content::Text(text) => text != &self.original,
+                            _ => self.source_text()?.as_str() != self.original.as_str(),
+                        };
+                    changed = true;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.save_worker = None;
+                    bail!("Background file save stopped");
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn is_unloaded(&self) -> bool {
+        matches!(self.content, Content::Unloaded { .. })
+    }
+
+    /// Only ordinary clean text files are eligible. CSV grids/source retain
+    /// their editing state. A missing or unreadable file keeps its last copy.
+    pub fn unload_if_idle(&mut self, now: Instant) -> bool {
+        if self.dirty
+            || self.is_loading()
+            || self.is_saving()
+            || self.is_csv()
+            || !matches!(self.content, Content::Text(_))
+            || now.saturating_duration_since(self.last_active) < Duration::from_secs(300)
+            || std::fs::File::open(&self.path).is_err()
+        {
+            return false;
+        }
+        let (line, column) = self.cursor_line_column(self.cursor);
+        self.content = Content::Unloaded {
+            line,
+            column,
+            attempted: false,
+        };
+        self.original = "".into();
+        self.outline = Vec::new();
+        self.outline_refresh = None;
+        self.outline_worker = None;
+        self.cursor_position.set(None);
+        self.buffer_hash.set(None);
+        true
+    }
+
+    pub fn needs_loading(&self) -> bool {
+        matches!(
+            self.content,
+            Content::Unloaded {
+                attempted: false,
+                ..
+            }
+        )
+    }
+
+    /// Loading is transactional: a failed read leaves the unloaded tab intact.
+    pub fn ensure_loaded(&mut self, headers: bool) -> Result<bool> {
+        if !self.is_unloaded() {
+            return Ok(false);
+        }
+        if let Content::Unloaded { attempted, .. } = &mut self.content {
+            *attempted = true;
+        }
+        self.reload(headers)?;
+        Ok(true)
     }
 
     /// Keep full-file symbol parsing out of the render loop, including after edits.
@@ -266,6 +487,23 @@ impl Document {
         self.revision = next_revision();
     }
 
+    /// Content-derived keys are computed once per edit, not once per frame.
+    pub fn editor_snapshot(&self) -> (u64, bool) {
+        if let Some((revision, fingerprint, large)) = self.editor_snapshot.get()
+            && revision == self.revision
+        {
+            return (fingerprint, large);
+        }
+        let Content::Text(text) = &self.content else {
+            return (0, false);
+        };
+        let fingerprint = eframe::egui::util::hash(text.as_str());
+        let large = crate::editor_analysis::is_large(text);
+        self.editor_snapshot
+            .set(Some((self.revision, fingerprint, large)));
+        (fingerprint, large)
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -277,6 +515,9 @@ impl Document {
     /// moved without the text changing is found by walking the short
     /// distance to it.
     pub fn cursor_line_column(&self, cursor: usize) -> (usize, usize) {
+        if let Content::Unloaded { line, column, .. } = self.content {
+            return (line, column);
+        }
         let Content::Text(text) = &self.content else {
             return (1, 1);
         };
@@ -354,6 +595,13 @@ impl Document {
     /// hashes are kept as well, because the answer is asked every frame and
     /// hashing a large text every frame is wasteful.
     pub fn can_reload(&mut self) -> bool {
+        if self.io_context.is_some() {
+            if self.disk_checked.elapsed() >= Duration::from_millis(500) {
+                self.observed_stamp = disk_stamp(&self.path);
+                self.disk_checked = Instant::now();
+            }
+            return self.observed_stamp != self.disk_stamp;
+        }
         if self.disk_checked.elapsed() >= Duration::from_millis(500) {
             self.check_disk();
         }
@@ -382,17 +630,40 @@ impl Document {
         if self.dirty {
             return Ok(false);
         }
-        self.check_disk();
+        if self.ensure_loaded(headers)? {
+            return Ok(true);
+        }
+        if self.io_context.is_some() {
+            self.observed_stamp = disk_stamp(&self.path);
+            self.disk_checked = Instant::now();
+        } else {
+            self.check_disk();
+        }
         self.reload_if_clean(headers)
     }
 
     /// Adopt external edits only while the editor buffer is clean. Failed loads
     /// retain the existing document and are retried when the disk changes again.
     pub fn reload_if_clean(&mut self, headers: bool) -> Result<bool> {
-        if self.dirty || !self.can_reload() || self.auto_reload_stamp == self.disk_stamp {
+        if self.is_unloaded() {
+            return self.ensure_loaded(headers);
+        }
+        if self.dirty || self.is_saving() || self.is_loading() || !self.can_reload() {
             return Ok(false);
         }
-        self.auto_reload_stamp = self.disk_stamp;
+        let stamp = if self.io_context.is_some() {
+            self.observed_stamp
+        } else {
+            self.disk_stamp
+        };
+        if self.auto_reload_stamp == stamp {
+            return Ok(false);
+        }
+        self.auto_reload_stamp = if self.io_context.is_some() {
+            self.observed_stamp
+        } else {
+            self.disk_stamp
+        };
         self.reload(headers)?;
         Ok(true)
     }
@@ -418,6 +689,7 @@ impl Document {
             return hash;
         }
         let hash = match &self.content {
+            Content::Unloaded { .. } => self.original_hash(),
             Content::Text(text) => content_hash(text),
             Content::Csv(sheet) => match sheet.serialize() {
                 Ok(text) => {
@@ -436,11 +708,17 @@ impl Document {
     }
 
     pub fn reload(&mut self, headers: bool) -> Result<()> {
+        if self.io_context.is_some() {
+            self.load_background(headers);
+            return Ok(());
+        }
         let mut fresh = Self::open(self.path.clone(), headers)?;
         fresh.set_csv_source(self.csv_is_source())?;
         fresh.markdown = self.markdown;
         fresh.cursor = self.cursor;
         fresh.editor_id = self.editor_id;
+        fresh.jump = self.jump;
+        fresh.last_active = self.last_active;
         *self = fresh;
         Ok(())
     }
@@ -456,6 +734,7 @@ impl Document {
     /// Use the exact source until the grid has actually changed its field values.
     pub fn source_text(&self) -> Result<String> {
         match &self.content {
+            Content::Unloaded { .. } => navigation::read_text(&self.path),
             Content::Text(text) => Ok(text.to_string()),
             Content::Csv(sheet) => {
                 let text = sheet.serialize()?;
@@ -498,6 +777,55 @@ impl Document {
     }
 
     pub fn save(&mut self) -> Result<()> {
+        // Saving an unloaded clean tab is a no-op; never write a placeholder.
+        if self.is_unloaded() {
+            return Ok(());
+        }
+        if self.is_loading() {
+            bail!("The file is still loading. Try saving after it finishes.");
+        }
+        if self.is_saving() {
+            return Ok(());
+        }
+        if let Some(ctx) = self.io_context.clone() {
+            let source = match &self.content {
+                Content::Text(text) => SaveSource::Text(text.clone()),
+                Content::Csv(sheet) => {
+                    let csv = self.csv.as_ref().unwrap();
+                    SaveSource::Csv(
+                        sheet.save_snapshot(),
+                        csv.source.clone(),
+                        csv.grid_snapshot.clone(),
+                    )
+                }
+                Content::Unloaded { .. } => unreachable!(),
+            };
+            let path = self.path.clone();
+            let original = self.original.clone();
+            let revision = self.revision;
+            let (tx, rx) = mpsc::channel();
+            self.save_worker = Some(rx);
+            std::thread::spawn(move || {
+                let result = (|| {
+                    let text = source.text()?;
+                    if navigation::read_text(&path)?.as_str() != original.as_str() {
+                        bail!(
+                            "The file changed on disk. Save was stopped to protect those changes. Open the disk version separately or copy your edits before reloading."
+                        );
+                    }
+                    atomic_write(&path, text.as_bytes())?;
+                    Ok(Saved {
+                        hash: content_hash(&text),
+                        text,
+                        stamp: disk_stamp(&path),
+                        revision,
+                    })
+                })();
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            });
+            return Ok(());
+        }
         let disk = navigation::read_text(&self.path)?;
         if disk.as_str() != self.original.as_str() {
             bail!(
@@ -513,6 +841,7 @@ impl Document {
         self.original = match &self.content {
             Content::Text(buffer) => buffer.clone(),
             Content::Csv(_) => text.into(),
+            Content::Unloaded { .. } => unreachable!("unloaded saves return above"),
         };
         self.dirty = false;
         Ok(())
@@ -532,6 +861,205 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn finish_io(doc: &mut Document) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while doc.is_loading() || doc.is_saving() {
+            doc.poll_io()?;
+            assert!(Instant::now() < deadline, "file worker did not complete");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn background_open_and_save_preserve_edits_made_after_the_save_snapshot() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("background.ts");
+        std::fs::write(&path, "original")?;
+        let mut doc = Document::deferred(path.clone(), eframe::egui::Context::default());
+        doc.jump = Some((3, 2));
+        assert!(doc.ensure_loaded(true)?);
+        assert!(doc.is_loading());
+        finish_io(&mut doc)?;
+        assert_eq!(doc.source_text()?, "original");
+        assert_eq!(doc.jump, Some((3, 2)));
+        doc.content = Content::Text("saved snapshot".into());
+        doc.dirty = true;
+        doc.mark_changed();
+        doc.save()?;
+        assert!(doc.is_saving());
+        doc.content = Content::Text("newer unsaved edit".into());
+        doc.mark_changed();
+        finish_io(&mut doc)?;
+        assert_eq!(std::fs::read_to_string(&path)?, "saved snapshot");
+        assert_eq!(doc.original.as_str(), "saved snapshot");
+        assert_eq!(doc.source_text()?, "newer unsaved edit");
+        assert!(doc.dirty);
+        doc.save()?;
+        finish_io(&mut doc)?;
+        assert_eq!(std::fs::read_to_string(&path)?, "newer unsaved edit");
+        assert!(!doc.dirty);
+        Ok(())
+    }
+
+    #[test]
+    fn background_save_reports_conflicts_without_losing_either_version() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("conflict.ts");
+        std::fs::write(&path, "baseline")?;
+        let mut doc = Document::open(path.clone(), true)?;
+        doc.io_context = Some(eframe::egui::Context::default());
+        doc.content = Content::Text("unsaved edit".into());
+        doc.dirty = true;
+        doc.mark_changed();
+        std::fs::write(&path, "external edit")?;
+        doc.save()?;
+        let error = finish_io(&mut doc).unwrap_err();
+        assert!(error.to_string().contains("changed on disk"));
+        assert_eq!(std::fs::read_to_string(&path)?, "external edit");
+        assert_eq!(doc.source_text()?, "unsaved edit");
+        assert_eq!(doc.original.as_str(), "baseline");
+        assert!(doc.dirty);
+        assert!(!doc.is_saving());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_background_reads_cannot_replace_a_same_length_edit() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("stale.ts");
+        std::fs::write(&path, "const old = 1;")?;
+        let mut doc = Document::open(path.clone(), true)?;
+        let original_key = doc.editor_snapshot();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Document::open(path, true))
+            .unwrap_or_else(|_| panic!("receiver open"));
+        doc.load_worker = Some((doc.revision(), rx));
+        doc.content = Content::Text("const new = 2;".into());
+        doc.dirty = true;
+        doc.mark_changed();
+        assert_ne!(doc.editor_snapshot().0, original_key.0);
+        assert!(!doc.poll_io()?);
+        assert_eq!(doc.source_text()?, "const new = 2;");
+        assert!(doc.dirty);
+        Ok(())
+    }
+
+    #[test]
+    fn background_csv_save_preserves_exact_source_until_the_grid_changes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("grid.csv");
+        let source = "name,value\r\n\"Alice\",1\r\n";
+        std::fs::write(&path, source)?;
+        let mut doc = Document::deferred(path.clone(), eframe::egui::Context::default());
+        doc.ensure_loaded(true)?;
+        finish_io(&mut doc)?;
+        doc.save()?;
+        finish_io(&mut doc)?;
+        assert_eq!(std::fs::read_to_string(&path)?, source);
+        let Content::Csv(sheet) = &mut doc.content else {
+            unreachable!()
+        };
+        sheet.table[0][0] = "Bob".into();
+        doc.dirty = true;
+        doc.mark_changed();
+        doc.save()?;
+        finish_io(&mut doc)?;
+        assert_eq!(std::fs::read_to_string(&path)?, "name,value\nBob,1\n");
+        assert!(!doc.dirty);
+        Ok(())
+    }
+
+    #[test]
+    fn idle_unload_releases_text_and_restores_latest_disk_contents() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("idle.rs");
+        std::fs::write(&path, "// first\nfn original() {}\n")?;
+        let mut doc = Document::open(path.clone(), true)?;
+        doc.cursor = 12;
+        doc.jump = Some((2, 4));
+        doc.markdown = MarkdownMode::Edit;
+        doc.editor_id = Some(eframe::egui::Id::new("idle"));
+        let position = doc.cursor_line_column(doc.cursor);
+        let text = Arc::downgrade(&doc.original.0);
+        let now = Instant::now();
+        doc.last_active = now;
+        assert!(!doc.unload_if_idle(now + Duration::from_secs(299)));
+        assert!(doc.unload_if_idle(now + Duration::from_secs(300)));
+        assert!(
+            text.upgrade().is_none(),
+            "both text and baseline must be released"
+        );
+        assert!(doc.original.is_empty());
+        assert!(doc.outline.is_empty());
+        assert_eq!(doc.cursor_line_column(doc.cursor), position);
+        assert!(!doc.unload_if_idle(now + Duration::from_secs(600)));
+        std::fs::write(&path, "// changed outside\nfn latest() {}\n")?;
+        assert!(doc.ensure_loaded(true)?);
+        assert!(matches!(&doc.content, Content::Text(text) if text.contains("latest")));
+        assert_eq!(doc.cursor, 12);
+        assert_eq!(doc.jump, Some((2, 4)));
+        assert!(doc.markdown == MarkdownMode::Edit);
+        assert_eq!(doc.editor_id, Some(eframe::egui::Id::new("idle")));
+        assert!(!doc.dirty);
+        assert!(!doc.can_reload());
+        assert!(!doc.ensure_loaded(true)?);
+        Ok(())
+    }
+
+    #[test]
+    fn idle_unload_protects_dirty_missing_and_csv_documents() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let now = Instant::now();
+        for name in ["dirty.txt", "missing.txt", "grid.csv", "source.csv"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "name,value\nhello,world\n")?;
+            let mut doc = Document::open(path.clone(), true)?;
+            if name == "dirty.txt" {
+                doc.content = Content::Text("unsaved".into());
+                doc.dirty = true;
+            } else if name == "missing.txt" {
+                std::fs::remove_file(&path)?;
+            } else if name == "source.csv" {
+                doc.set_csv_source(true)?;
+            }
+            doc.last_active = now;
+            assert!(
+                !doc.unload_if_idle(now + Duration::from_secs(301)),
+                "{name}"
+            );
+            assert!(!doc.is_unloaded());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unloaded_missing_file_is_retryable_and_save_never_writes_a_placeholder() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("retry.txt");
+        std::fs::write(&path, "original")?;
+        let mut doc = Document::open(path.clone(), true)?;
+        assert!(doc.unload_if_idle(doc.last_active + Duration::from_secs(300)));
+        std::fs::remove_file(&path)?;
+        assert!(doc.needs_loading());
+        assert!(doc.ensure_loaded(true).is_err());
+        assert!(doc.is_unloaded());
+        assert!(
+            !doc.needs_loading(),
+            "failed loads must not spin every frame"
+        );
+        doc.save()?;
+        assert!(!path.exists());
+        std::fs::write(&path, "restored externally")?;
+        doc.save()?;
+        assert_eq!(std::fs::read_to_string(&path)?, "restored externally");
+        assert!(doc.refresh_if_clean(true)?);
+        assert!(
+            matches!(&doc.content, Content::Text(text) if text.as_str() == "restored externally")
+        );
+        Ok(())
+    }
+
     #[test]
     fn saved_text_is_shared_until_an_actual_edit() -> Result<()> {
         use eframe::egui::TextBuffer;

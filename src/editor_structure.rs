@@ -12,13 +12,6 @@ pub struct Guide {
     pub anchor: usize,
     pub inclusive_end: bool,
 }
-#[derive(Default)]
-pub struct Computer;
-impl egui::cache::ComputerMut<&LayoutJob, Structure> for Computer {
-    fn compute(&mut self, job: &LayoutJob) -> Structure {
-        Structure::build(job)
-    }
-}
 impl Structure {
     pub fn build(job: &LayoutJob) -> Self {
         let mut result = Self::default();

@@ -30,7 +30,6 @@ const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
 /// The source of one file plus the syntax sections of every line.
 pub struct FileLines {
-    source: String,
     lines: Vec<Range<usize>>,
     syntax: LayoutJob,
 }
@@ -63,16 +62,11 @@ impl FileLines {
             dark,
             cancelled,
         )?;
-        Some(Self {
-            source,
-            lines,
-            syntax,
-        })
+        Some(Self { lines, syntax })
     }
 
     fn bytes(&self) -> usize {
-        self.source.len()
-            + self.syntax.text.len()
+        self.syntax.text.len()
             + self.lines.len() * size_of::<Range<usize>>()
             + self.syntax.sections.len() * size_of::<eframe::egui::text::LayoutSection>()
     }
@@ -82,7 +76,7 @@ impl FileLines {
     pub fn line(&self, line: usize) -> Option<LayoutJob> {
         let range = self.lines.get(line.checked_sub(1)?)?.clone();
         let mut job = LayoutJob {
-            text: self.source[range.clone()].to_owned(),
+            text: self.syntax.text[range.clone()].to_owned(),
             ..Default::default()
         };
         let first = self

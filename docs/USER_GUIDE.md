@@ -68,6 +68,14 @@ Files with at least 10,000 newline characters or 512 KiB of text show editable t
 
 Symbol outlines are also prepared in the background for large files. Git line markers and hunk counts are requested after drawing the editor, with a short idle delay when opening a file or typing. You can read and edit while those annotations load.
 
+Clean text tabs release their contents and saved undo history after five minutes without being selected, including tabs in inactive worktrees. Selecting a tab reloads the latest disk contents and retains cursor, selection, scroll, and folding state (folds reset if the text changed). Active tabs, unsaved edits, CSV/TSV tabs, and files already missing or unreadable stay in memory. If a file becomes unavailable after unloading, its tab shows a retry action instead of an empty editor.
+
+Project indexing and file-tree construction run in the background. Native file watching uses the same ignore-filtered project index, so events inside ignored dependency folders do not trigger refreshes. Backends that enumerate directories register only eligible folders; macOS subscribes through FSEvents without walking descendants. Native file watching coalesces updates; ordinary file edits refresh Git without rebuilding the project tree. Periodic scans remain as a fallback (five minutes for indexes above 100,000 files), and **Files → Refresh project** forces a scan. Switching projects cancels the old scan. Large project filename searches also run in a cancellable worker and reuse results while the query stays unchanged.
+
+Opening, reloading, and saving files run in the background. Restored session tabs load when selected. A save writes a snapshot and checks that the disk version still matches its baseline; newer edits remain unsaved, and closing after a save waits for successful completion. File reads that become stale while you edit cannot replace your newer buffer.
+
+CSV column menus calculate distinct values only when requested. Edits invalidate cached values so the next opened menu reflects the current grid.
+
 ### Keyboard controls
 
 | Action | macOS | Windows / Linux |

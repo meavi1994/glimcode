@@ -1,6 +1,6 @@
 use eframe::egui;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     path::{Path, PathBuf},
 };
@@ -74,6 +74,7 @@ pub struct FileTree {
     pub action: Option<FileAction>,
     pub diff: Option<PathBuf>,
     children: BTreeMap<OsString, FileTree>,
+    extra_files: BTreeSet<PathBuf>,
     file: Option<PathBuf>,
     last_active: Option<PathBuf>,
     open_override: Option<bool>,
@@ -112,27 +113,31 @@ impl FileTree {
         self.reveal_requested = true;
     }
 
+    #[cfg(test)]
     pub fn build(root: &Path, files: &[PathBuf]) -> Self {
-        let mut tree = Self::default();
-        for path in files {
-            let Ok(relative) = path.strip_prefix(root) else {
-                continue;
-            };
-            let mut node = &mut tree;
-            for component in relative.components() {
-                node = node
-                    .children
-                    .entry(component.as_os_str().to_owned())
-                    .or_default();
-            }
-            node.file = Some(path.clone());
-        }
-        tree
+        Self::build_cancellable(root, files, &[], || false).expect("uncancelled build")
     }
 
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn build_with_folders(root: &Path, files: &[PathBuf], folders: &[PathBuf]) -> Self {
-        let mut tree = Self::build(root, files);
-        for path in folders {
+        Self::build_cancellable(root, files, folders, || false).expect("uncancelled build")
+    }
+
+    pub fn build_cancellable(
+        root: &Path,
+        files: &[PathBuf],
+        folders: &[PathBuf],
+        cancelled: impl Fn() -> bool,
+    ) -> Option<Self> {
+        let mut tree = Self::default();
+        for (path, file) in files
+            .iter()
+            .map(|path| (path, true))
+            .chain(folders.iter().map(|path| (path, false)))
+        {
+            if cancelled() {
+                return None;
+            }
             let Ok(relative) = path.strip_prefix(root) else {
                 continue;
             };
@@ -143,12 +148,102 @@ impl FileTree {
                     .entry(component.as_os_str().to_owned())
                     .or_default();
             }
+            if file {
+                node.file = Some(path.clone());
+            }
         }
-        tree
+        Some(tree)
+    }
+
+    /// Swap a tree built by a worker, retaining navigation and pending folder
+    /// commands. egui owns the established folder expansion state by path.
+    pub fn adopt_index(&mut self, root: &Path, mut fresh: Self) -> Self {
+        fresh.last_active = self.last_active.take();
+        fresh.reveal_requested = self.reveal_requested;
+        fresh.reveal_target = self.reveal_target.take();
+        fresh.action = self.action.take();
+        fresh.diff = self.diff.take();
+        if let Some(target) = fresh.reveal_target.clone() {
+            let pending = fresh.reveal_requested;
+            fresh.reveal_path(root, &target);
+            fresh.reveal_requested = pending;
+        }
+        fn commands(old: &mut FileTree, fresh: &mut FileTree) {
+            fresh.open_override = old.open_override.take();
+            for (name, child) in &mut old.children {
+                if child.file.is_none()
+                    && let Some(next) = fresh.children.get_mut(name)
+                {
+                    commands(child, next);
+                }
+            }
+        }
+        commands(self, &mut fresh);
+        std::mem::replace(self, fresh)
+    }
+
+    /// Status colors do not change the project index. Insert/remove only Git
+    /// entries absent from disk (such as deleted files), instead of rebuilding
+    /// millions of nodes whenever an editor becomes dirty or Git refreshes.
+    pub fn sync_extra_files(
+        &mut self,
+        root: &Path,
+        files: &[PathBuf],
+        folders: &[PathBuf],
+        extras: impl Iterator<Item = PathBuf>,
+    ) {
+        let extras: BTreeSet<_> = extras
+            .filter(|path| files.binary_search(path).is_err())
+            .collect();
+        fn remove(tree: &mut FileTree, parts: &[OsString], path: &Path, folders: &[PathBuf]) {
+            let Some((name, rest)) = parts.split_first() else {
+                return;
+            };
+            if let Some(child) = tree.children.get_mut(name) {
+                if rest.is_empty() {
+                    child.file = None;
+                } else {
+                    remove(child, rest, &path.join(&rest[0]), folders);
+                }
+                if child.file.is_none()
+                    && child.children.is_empty()
+                    && folders.binary_search(&path.to_path_buf()).is_err()
+                {
+                    tree.children.remove(name);
+                }
+            }
+        }
+        let removed: Vec<_> = self.extra_files.difference(&extras).cloned().collect();
+        for path in removed {
+            if let Ok(relative) = path.strip_prefix(root) {
+                let parts: Vec<_> = relative
+                    .components()
+                    .map(|part| part.as_os_str().to_owned())
+                    .collect();
+                if let Some(first) = parts.first() {
+                    remove(self, &parts, &root.join(first), folders);
+                }
+            }
+        }
+        let added: Vec<_> = extras.difference(&self.extra_files).cloned().collect();
+        for path in &added {
+            if let Ok(relative) = path.strip_prefix(root) {
+                let mut node = &mut *self;
+                for part in relative.components() {
+                    node = node
+                        .children
+                        .entry(part.as_os_str().to_owned())
+                        .or_default();
+                }
+                node.file = Some(path.clone());
+            }
+        }
+        self.extra_files = extras;
     }
 
     /// Refresh entries while retaining reveal commands. Folder expansion is
     /// persisted by egui under path-based IDs, so it survives this rebuild.
+    #[cfg(test)]
     pub fn refresh(&mut self, root: &Path, files: &[PathBuf], folders: &[PathBuf]) {
         let mut fresh = Self::build_with_folders(root, files, folders);
         fresh.last_active = self.last_active.take();
@@ -406,6 +501,53 @@ impl FileTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_extra_entries_update_only_their_branch_and_preserve_real_empty_folders() {
+        let root = Path::new("/project");
+        let files = vec![root.join("src/main.ts")];
+        let folders = vec![root.join("src"), root.join("src/empty")];
+        let mut tree = FileTree::build_with_folders(root, &files, &folders);
+        let extra = root.join("src/empty/deleted.ts");
+        tree.sync_extra_files(
+            root,
+            &files,
+            &folders,
+            vec![extra.clone(), files[0].clone()].into_iter(),
+        );
+        assert_eq!(
+            tree.children[&OsString::from("src")].children[&OsString::from("empty")].children
+                [&OsString::from("deleted.ts")]
+                .file
+                .as_ref(),
+            Some(&extra)
+        );
+        tree.sync_extra_files(root, &files, &folders, std::iter::empty());
+        let src = &tree.children[&OsString::from("src")];
+        assert!(src.children[&OsString::from("empty")].children.is_empty());
+        assert_eq!(
+            src.children[&OsString::from("main.ts")].file.as_ref(),
+            Some(&files[0])
+        );
+    }
+
+    #[test]
+    fn worker_tree_replacement_retains_reveal_and_pending_folder_commands() {
+        let root = Path::new("/project");
+        let file = root.join("src/main.ts");
+        let mut tree = FileTree::build(root, &[file.clone()]);
+        tree.expand_all(false);
+        tree.reveal_path(root, &root.join("ignored/empty"));
+        let fresh = FileTree::build(root, &[file, root.join("src/new.ts")]);
+        let _ = tree.adopt_index(root, fresh);
+        assert!(tree.reveal_pending());
+        assert!(tree.children.contains_key(&OsString::from("ignored")));
+        assert_eq!(
+            tree.children[&OsString::from("src")].open_override,
+            Some(false)
+        );
+        assert!(FileTree::build_cancellable(root, &[root.join("main.ts")], &[], || true).is_none());
+    }
 
     #[test]
     fn tree_uses_filtered_folder_index_instead_of_rediscovering_ignored_directories()

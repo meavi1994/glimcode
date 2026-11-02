@@ -36,7 +36,7 @@ enum FrameAction {
     OpenProjectInstance(PathBuf),
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Hash)]
 enum Picker {
     Everywhere,
     Files,
@@ -103,7 +103,12 @@ struct TextClick {
 
 /// How many navigation steps are remembered.
 const MAX_HISTORY: usize = 200;
-const PROJECT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const PROJECT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+struct WorkspaceIndex {
+    paths: navigation::WorkspacePaths,
+    tree: crate::explorer::FileTree,
+}
 
 struct WorktreeSession {
     documents: Vec<Document>,
@@ -115,17 +120,24 @@ struct WorktreeSession {
 pub struct Coder {
     worktrees: crate::worktrees::Manager,
     session_store: Option<crate::session::Store>,
+    io_context: Option<egui::Context>,
+    save_continuation: bool,
+    close_after_saves: bool,
     worktree_sessions: std::collections::BTreeMap<PathBuf, WorktreeSession>,
     root: PathBuf,
-    files: Vec<PathBuf>,
-    folders: Vec<PathBuf>,
+    files: Arc<Vec<PathBuf>>,
+    folders: Arc<Vec<PathBuf>>,
     tree: crate::explorer::FileTree,
     selected_category: Option<navigation::MatchCategory>,
     extension_filter: Option<String>,
     result_scope: crate::search_view::Scope,
     file_filter: String,
-    files_rx: Option<Receiver<anyhow::Result<navigation::WorkspacePaths>>>,
+    files_rx: Option<Receiver<anyhow::Result<Option<WorkspaceIndex>>>>,
     files_checked: Instant,
+    files_cancel: Arc<AtomicBool>,
+    workspace_watch: Option<crate::workspace_watch::WorkspaceWatch>,
+    files_requested: bool,
+    git_requested: bool,
     documents: Vec<Document>,
     active: usize,
     query: String,
@@ -148,6 +160,10 @@ pub struct Coder {
     picker: Option<Picker>,
     picker_query: String,
     picker_selection: usize,
+    files_generation: u64,
+    picker_files_key: Option<u64>,
+    picker_files: Vec<PathBuf>,
+    picker_files_worker: Option<(Receiver<Vec<PathBuf>>, Arc<AtomicBool>)>,
     recent_file_searches: Vec<PathBuf>,
     picker_focus: bool,
     last_shift: Option<Instant>,
@@ -181,6 +197,7 @@ pub struct Coder {
     git_colors: (u64, Arc<std::collections::BTreeMap<PathBuf, Color32>>),
     goto: Option<FocusSearch>,
     pending_click: Option<PendingClick>,
+    deferred_revert: Option<crate::git_view::RevertHunk>,
     pending_reveal: bool,
     file_action: Option<crate::explorer::FileAction>,
     file_action_name: String,
@@ -230,6 +247,7 @@ impl Coder {
                 path.parent()
                     .map(|parent| crate::session::Store::new(parent.join("projects")))
             });
+        app.io_context = (!capturing).then(|| cc.egui_ctx.clone());
         app.restore_session();
         app.refresh_files();
         if let Some(file) = argument.filter(|p| p.is_file()) {
@@ -238,8 +256,8 @@ impl Coder {
         #[cfg(feature = "ui-capture")]
         if let Ok(mode) = std::env::var("CODER_UI_PREVIEW") {
             let paths = navigation::workspace_paths(&app.root).unwrap_or_default();
-            app.files = paths.files;
-            app.folders = paths.folders;
+            app.files = Arc::new(paths.files);
+            app.folders = Arc::new(paths.folders);
             app.tree =
                 crate::explorer::FileTree::build_with_folders(&app.root, &app.files, &app.folders);
             app.files_rx = None;
@@ -439,10 +457,13 @@ impl Coder {
         Self {
             worktrees: Default::default(),
             session_store: None,
+            io_context: None,
+            save_continuation: false,
+            close_after_saves: false,
             worktree_sessions: Default::default(),
             root,
-            files: vec![],
-            folders: vec![],
+            files: Arc::default(),
+            folders: Arc::default(),
             tree: Default::default(),
             selected_category: None,
             extension_filter: None,
@@ -450,6 +471,10 @@ impl Coder {
             file_filter: String::new(),
             files_rx: None,
             files_checked: Instant::now(),
+            files_cancel: Arc::new(AtomicBool::new(false)),
+            workspace_watch: None,
+            files_requested: false,
+            git_requested: false,
             documents: vec![],
             active: 0,
             query: String::new(),
@@ -472,6 +497,10 @@ impl Coder {
             picker: None,
             picker_query: String::new(),
             picker_selection: 0,
+            files_generation: 0,
+            picker_files_key: None,
+            picker_files: Vec::new(),
+            picker_files_worker: None,
             recent_file_searches: vec![],
             picker_focus: false,
             last_shift: None,
@@ -503,6 +532,7 @@ impl Coder {
             git_colors: (0, Arc::new(std::collections::BTreeMap::new())),
             goto: None,
             pending_click: None,
+            deferred_revert: None,
             pending_reveal: false,
             file_action: None,
             file_action_name: String::new(),
@@ -582,7 +612,11 @@ impl Coder {
             if self.documents.iter().any(|doc| doc.path == path) {
                 continue;
             }
-            if let Ok(mut doc) = Document::open(path, self.csv_headers) {
+            let opened = match &self.io_context {
+                Some(ctx) => Ok(Document::deferred(path, ctx.clone())),
+                None => Document::open(path, self.csv_headers),
+            };
+            if let Ok(mut doc) = opened {
                 doc.jump = Some((
                     tab["line"].as_u64().unwrap_or(1).max(1) as usize,
                     tab["column"].as_u64().unwrap_or(1).max(1) as usize,
@@ -609,14 +643,31 @@ impl Coder {
         self.save_session();
         self.search_cancel.store(true, Ordering::Relaxed);
         self.search_rx = None;
+        self.files_cancel.store(true, Ordering::Relaxed);
         self.files_rx = None;
+        let old_watch = self.workspace_watch.take();
+        self.files_requested = false;
+        self.git_requested = false;
         self.preview.clear();
         self.root = root.canonicalize().unwrap_or(root);
-        self.documents.clear();
+        let old_documents = std::mem::take(&mut self.documents);
+        if let Some(ctx) = &self.io_context {
+            for doc in &old_documents {
+                if let Some(id) = doc.editor_id {
+                    release_editor_state(ctx, id);
+                }
+            }
+        }
         self.active = 0;
-        self.files.clear();
-        self.folders.clear();
-        self.tree = Default::default();
+        self.files_generation = self.files_generation.wrapping_add(1);
+        self.clear_picker_files();
+        let old_files = std::mem::take(&mut self.files);
+        let old_folders = std::mem::take(&mut self.folders);
+        let old_tree = std::mem::take(&mut self.tree);
+        // Retiring a large tree or native watch can take appreciable time too.
+        std::thread::spawn(move || {
+            drop((old_tree, old_files, old_folders, old_documents, old_watch))
+        });
         self.history.clear();
         self.recent_file_searches.clear();
         self.results.clear();
@@ -638,6 +689,7 @@ impl Coder {
         self.replacement.clear();
         self.picker = None;
         self.pending_click = None;
+        self.deferred_revert = None;
         if let Some(goto) = self.goto.take() {
             goto.cancel.store(true, Ordering::Relaxed);
         }
@@ -678,12 +730,32 @@ impl Coder {
         if self.files_rx.is_some() {
             return;
         }
+        self.files_requested = false;
         self.files_checked = Instant::now();
         let root = self.root.clone();
         let (tx, rx) = mpsc::channel();
         self.files_rx = Some(rx);
+        let files = self.files.clone();
+        let folders = self.folders.clone();
+        self.files_cancel = Arc::new(AtomicBool::new(false));
+        let cancel = self.files_cancel.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(navigation::workspace_paths(&root));
+            let result =
+                navigation::workspace_paths_cancelled(&root, || cancel.load(Ordering::Relaxed))
+                    .map(|paths| {
+                        let paths = paths?;
+                        if *files == paths.files && *folders == paths.folders {
+                            return None;
+                        }
+                        let tree = crate::explorer::FileTree::build_cancellable(
+                            &root,
+                            &paths.files,
+                            &paths.folders,
+                            || cancel.load(Ordering::Relaxed),
+                        )?;
+                        Some(WorkspaceIndex { paths, tree })
+                    });
+            let _ = tx.send(result);
         });
     }
 
@@ -699,7 +771,11 @@ impl Coder {
                 self.status = format!("Could not reload {}: {error}", canonical.display());
             }
         } else {
-            match Document::open(canonical, self.csv_headers) {
+            let opened = match &self.io_context {
+                Some(ctx) => Ok(Document::deferred(canonical, ctx.clone())),
+                None => Document::open(canonical, self.csv_headers),
+            };
+            match opened {
                 Ok(doc) => {
                     self.documents.push(doc);
                     self.active = self.documents.len() - 1;
@@ -720,6 +796,18 @@ impl Coder {
 
     fn apply_review_revert(&mut self, revert: crate::git_view::RevertHunk, ctx: &egui::Context) {
         self.open(revert.path.clone(), None);
+        if let Some(doc) = self
+            .documents
+            .get_mut(self.active)
+            .filter(|doc| doc.path == revert.path)
+            && (doc.is_unloaded() || doc.is_loading())
+        {
+            if doc.needs_loading() {
+                let _ = doc.ensure_loaded(self.csv_headers);
+            }
+            self.deferred_revert = Some(revert);
+            return;
+        }
         if let Some(doc) = self
             .documents
             .get_mut(self.active)
@@ -792,9 +880,20 @@ impl Coder {
             self.queue_action(FrameAction::Save(index));
             return true;
         }
-        match self.documents[index].save() {
+        let Some(doc) = self.documents.get_mut(index) else {
+            return false;
+        };
+        match doc.save() {
             Ok(()) => {
-                self.status = format!("Saved {}", self.documents[index].path.display());
+                self.status = format!(
+                    "{} {}",
+                    if self.documents[index].is_saving() {
+                        "Saving"
+                    } else {
+                        "Saved"
+                    },
+                    self.documents[index].path.display()
+                );
                 true
             }
             Err(error) => {
@@ -952,35 +1051,183 @@ impl Coder {
         });
     }
 
+    fn any_saving(&self) -> bool {
+        self.documents
+            .iter()
+            .chain(
+                self.worktree_sessions
+                    .values()
+                    .flat_map(|session| session.documents.iter()),
+            )
+            .any(Document::is_saving)
+    }
+
+    fn finish_pending(&mut self, ctx: &egui::Context) {
+        match self.pending.take() {
+            Some(Pending::Close(index)) => self.close(index, ctx),
+            Some(Pending::Reload(index)) => {
+                if let Err(error) = self.documents[index].reload(self.csv_headers) {
+                    self.error = Some(error.to_string());
+                }
+            }
+            Some(Pending::SwitchProject(root)) => self.switch_project(root),
+            Some(Pending::Exit) => {
+                self.allow_exit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            None => {}
+        }
+    }
+
+    fn poll_file_io(&mut self, ctx: &egui::Context) {
+        let mut failed_save = false;
+        let active_path = self.documents.get(self.active).map(|doc| doc.path.clone());
+        for doc in self.documents.iter_mut().chain(
+            self.worktree_sessions
+                .values_mut()
+                .flat_map(|session| session.documents.iter_mut()),
+        ) {
+            let saving = doc.is_saving();
+            match doc.poll_io() {
+                Ok(true) => {
+                    if active_path.as_ref() == Some(&doc.path) {
+                        self.focus_editor = true;
+                    }
+                    self.status = format!(
+                        "{} {}",
+                        if saving { "Saved" } else { "Loaded" },
+                        doc.path.display()
+                    )
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    if saving {
+                        failed_save = true;
+                        self.error =
+                            Some(format!("Could not save {}: {error:#}", doc.path.display()));
+                    } else {
+                        self.status = format!("Could not load {}: {error:#}", doc.path.display());
+                    }
+                }
+            }
+        }
+        if failed_save {
+            self.save_continuation = false;
+            self.close_after_saves = false;
+            self.pending = None;
+        }
+        if !self.any_saving() {
+            if self.save_continuation {
+                self.save_continuation = false;
+                self.finish_pending(ctx);
+            }
+            if self.close_after_saves {
+                self.close_after_saves = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn unload_idle_documents(&mut self, ctx: &egui::Context, now: Instant) {
+        for (index, doc) in self.documents.iter_mut().enumerate() {
+            if index == self.active {
+                doc.last_active = now;
+            } else if doc.unload_if_idle(now) {
+                release_unloaded_editor(ctx, doc);
+            }
+        }
+        for session in self.worktree_sessions.values_mut() {
+            for doc in &mut session.documents {
+                if doc.unload_if_idle(now) {
+                    release_unloaded_editor(ctx, doc);
+                }
+            }
+        }
+    }
+
     fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_file_io(ctx);
+        self.unload_idle_documents(ctx, Instant::now());
+        if self
+            .workspace_watch
+            .as_ref()
+            .is_none_or(|watch| watch.root() != self.root)
+        {
+            self.workspace_watch =
+                Some(crate::workspace_watch::WorkspaceWatch::new(&self.root, ctx));
+        }
+        let watch = self.workspace_watch.as_mut().unwrap();
+        if !self.files.is_empty() || self.files_rx.is_none() {
+            watch.set_index(self.files.clone(), self.folders.clone());
+        }
+        let changes = watch.poll(Instant::now());
+        let watched = watch.reliable();
+        self.files_requested |= changes.files;
+        self.git_requested |= changes.git;
+        if self.git_requested && self.git.refresh_if_idle(&self.root, ctx) {
+            self.git_requested = false;
+        }
         self.git.poll(&self.root, ctx);
         self.search_highlight.poll();
         if let Some(rx) = &self.files_rx
             && let Ok(result) = rx.try_recv()
         {
             match result {
-                Ok(paths) => {
-                    if self.files != paths.files || self.folders != paths.folders {
-                        let mut tree_files = paths.files.clone();
-                        tree_files.extend(self.git_colors.1.keys().cloned());
-                        self.tree.refresh(&self.root, &tree_files, &paths.folders);
-                        self.files = paths.files;
-                        self.folders = paths.folders;
-                    }
+                Ok(Some(mut index)) => {
+                    index.tree.sync_extra_files(
+                        &self.root,
+                        &index.paths.files,
+                        &index.paths.folders,
+                        self.git_colors.1.keys().cloned(),
+                    );
+                    self.files_generation = self.files_generation.wrapping_add(1);
+                    let old_tree = self.tree.adopt_index(&self.root, index.tree);
+                    let old_files = std::mem::replace(&mut self.files, Arc::new(index.paths.files));
+                    let old_folders =
+                        std::mem::replace(&mut self.folders, Arc::new(index.paths.folders));
+                    std::thread::spawn(move || drop((old_tree, old_files, old_folders)));
                 }
+                Ok(None) => {}
                 Err(error) => self.error = Some(format!("{error:#}")),
             }
             self.files_rx = None;
+            if let Some(watch) = &mut self.workspace_watch {
+                watch.set_index(self.files.clone(), self.folders.clone());
+            }
         }
-        if self.files_rx.is_none() && self.files_checked.elapsed() >= PROJECT_REFRESH_INTERVAL {
+        let refresh_interval = if self.files.len() > 100_000 {
+            Duration::from_secs(300)
+        } else if watched {
+            PROJECT_REFRESH_INTERVAL
+        } else {
+            Duration::from_secs(2)
+        };
+        if self.files_rx.is_none()
+            && (self.files_requested || self.files_checked.elapsed() >= refresh_interval)
+        {
             self.refresh_files();
         }
         // Keep checking even when the editor is idle or no file is open.
         ctx.request_repaint_after(Duration::from_millis(500));
         if let Some(doc) = self.documents.get_mut(self.active) {
-            match doc.reload_if_clean(self.csv_headers) {
+            let result = if doc.needs_loading() {
+                doc.ensure_loaded(self.csv_headers)
+            } else if doc.is_unloaded() {
+                Ok(false)
+            } else {
+                doc.reload_if_clean(self.csv_headers)
+            };
+            match result {
                 Ok(true) => {
-                    self.status = format!("Reloaded {} from disk", doc.path.display());
+                    self.status = format!(
+                        "{} {}",
+                        if doc.is_loading() {
+                            "Loading"
+                        } else {
+                            "Reloaded"
+                        },
+                        doc.path.display()
+                    );
                     self.preview.clear();
                     self.search_highlight.clear();
                 }
@@ -1121,6 +1368,7 @@ impl Coder {
                 let source = match &doc.content {
                     Content::Text(text) => text.to_string(),
                     Content::Csv(sheet) => sheet.serialize().unwrap_or_default(),
+                    Content::Unloaded { .. } => unreachable!("unloaded tabs are clean"),
                 };
                 (doc.path.clone(), source)
             })
@@ -1575,9 +1823,12 @@ impl Coder {
                         .collect::<std::collections::BTreeMap<_, _>>()
                 })
                 .unwrap_or_default();
-            let mut tree_files = self.files.clone();
-            tree_files.extend(colors.keys().cloned());
-            self.tree.refresh(&self.root, &tree_files, &self.folders);
+            self.tree.sync_extra_files(
+                &self.root,
+                &self.files,
+                &self.folders,
+                colors.keys().cloned(),
+            );
             self.git_colors = (colors_key, Arc::new(colors));
         }
         let colors = self.git_colors.1.clone();
@@ -1775,6 +2026,7 @@ impl Coder {
                     .and_then(|doc| match &doc.content {
                         Content::Text(text) => Some(text.to_string()),
                         Content::Csv(sheet) => sheet.serialize().ok(),
+                        Content::Unloaded { .. } => None,
                     });
                 self.git.open_review(path, buffer, ctx);
             }
@@ -1892,10 +2144,10 @@ impl Coder {
                         })
                         .collect();
                     let syntax = match &doc.content {
-                        Content::Text(text) if !crate::editor_analysis::is_large(text) => {
+                        Content::Text(text) if !doc.editor_snapshot().1 => {
                             // The colors are the ones the editor paints, so
                             // the same cached result is used.
-                            let fingerprint = egui::util::hash(text.as_str());
+                            let (fingerprint, _) = doc.editor_snapshot();
                             Some(
                                 syntax_cache(
                                     ui,
@@ -2370,7 +2622,7 @@ impl Coder {
                     .find(|doc| doc.path == path)
                     .and_then(|doc| match &doc.content {
                         Content::Text(text) => Some(text.to_string()),
-                        Content::Csv(_) => None,
+                        Content::Csv(_) | Content::Unloaded { .. } => None,
                     })
             });
         }
@@ -2792,8 +3044,8 @@ impl Coder {
                     .documents
                     .get(self.active)
                     .and_then(|doc| match &doc.content {
-                        Content::Text(text) => self.git.cached_file(&doc.path, text),
-                        Content::Csv(_) => None,
+                        Content::Text(_) => self.git.cached_file(&doc.path, doc.revision()),
+                        Content::Csv(_) | Content::Unloaded { .. } => None,
                     });
                 let Some(doc) = self.documents.get_mut(self.active) else {
                     ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()).shrink(8.0));
@@ -2938,8 +3190,22 @@ impl Coder {
                         ui.selectable_value(&mut doc.markdown, MarkdownMode::Preview, "Preview");
                     });
                 }
+                let loading = doc.is_loading();
+                let snapshot = doc.editor_snapshot();
                 let path = doc.path.clone();
                 ui.push_id(&path, |ui| match &mut doc.content {
+                    Content::Unloaded { .. } if loading => {
+                        ui.horizontal(|ui| { ui.spinner(); ui.label("Loading file…"); });
+                    }
+                    Content::Unloaded { .. } => {
+                        ui.label("Could not load this file. It may have been moved, deleted, or become unreadable.");
+                        if ui.button("Retry loading").clicked() {
+                            match doc.ensure_loaded(self.csv_headers) {
+                                Ok(_) => self.status = format!("Loaded {}", doc.path.display()),
+                                Err(error) => self.status = format!("Could not load {}: {error}", doc.path.display()),
+                            }
+                        }
+                    }
                     Content::Csv(sheet) => {
                         let changed = sheet.ui(ui);
                         if changed {
@@ -2963,6 +3229,7 @@ impl Coder {
                                     &mut doc.jump,
                                     &mut doc.editor_id,
                                     EditorFind {
+                                        snapshot: Some(snapshot),
                                         query: editor_query,
                                         active: self.file_find.active().cloned(),
                                         scroll: find_scroll,
@@ -2981,6 +3248,7 @@ impl Coder {
                                 &mut doc.jump,
                                 &mut doc.editor_id,
                                 EditorFind {
+                                    snapshot: Some(snapshot),
                                     query: editor_query,
                                     active: self.file_find.active().cloned(),
                                     scroll: find_scroll,
@@ -2997,7 +3265,7 @@ impl Coder {
                     }
                 });
                 if let Content::Text(text) = &doc.content {
-                    self.git.ensure_file(&doc.path, text, ctx);
+                    self.git.ensure_file(&doc.path, text, doc.revision(), ctx);
                 }
                 if let Some(source) = csv_mode {
                     if let Err(error) = doc.set_csv_source(source) {
@@ -3007,7 +3275,7 @@ impl Coder {
                 }
                 // A dialog that took the keyboard gives it back to the editor,
                 // unless the terminal is the one being typed into.
-                if std::mem::take(&mut self.focus_editor)
+                if enabled && !doc.is_unloaded() && std::mem::take(&mut self.focus_editor)
                     && !self.terminal.focused(ctx)
                     && let Some(id) = doc.editor_id
                 {
@@ -3107,6 +3375,13 @@ impl Coder {
                 .frame(chrome::popup_frame())
                 .show(ctx, |ui| {
                     chrome::modal_style(ui, 500.0);
+                    if self.save_continuation {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Saving files…");
+                        });
+                        return;
+                    }
                     let reload = matches!(self.pending, Some(Pending::Reload(_)));
                     if chrome::dialog_header(
                         ui,
@@ -3231,21 +3506,10 @@ impl Coder {
                         }
                     }
                 };
-                if saved {
-                    match self.pending.take() {
-                        Some(Pending::Close(index)) => self.close(index, ctx),
-                        Some(Pending::Reload(index)) => {
-                            if let Err(error) = self.documents[index].reload(self.csv_headers) {
-                                self.error = Some(error.to_string());
-                            }
-                        }
-                        Some(Pending::SwitchProject(root)) => self.switch_project(root),
-                        Some(Pending::Exit) => {
-                            self.allow_exit = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        None => {}
-                    }
+                if saved && self.any_saving() {
+                    self.save_continuation = true;
+                } else if saved {
+                    self.finish_pending(ctx);
                 } else {
                     self.pending = None;
                 }
@@ -3317,12 +3581,95 @@ impl Coder {
                 self.recent_file_searches.retain(|recent| recent != &path);
             }
         }
+        self.files_requested = true;
         self.refresh_files();
         Ok(())
     }
 
+    fn clear_picker_files(&mut self) {
+        if let Some((_, cancel)) = self.picker_files_worker.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.picker_files_key = None;
+        self.picker_files.clear();
+    }
+
+    fn picker_paths(&mut self, ctx: &egui::Context, mode: Picker, query: &str) -> &[PathBuf] {
+        let open: Vec<_> = self
+            .documents
+            .iter()
+            .rev()
+            .map(|doc| doc.path.clone())
+            .collect();
+        let key = egui::util::hash((
+            &self.root,
+            self.files_generation,
+            mode,
+            query,
+            &open,
+            &self.recent_file_searches,
+        ));
+        if self.picker_files_key != Some(key) {
+            self.clear_picker_files();
+            self.picker_files_key = Some(key);
+            if mode != Picker::Recent && self.files.len() + self.folders.len() > 50_000 {
+                let files = self.files.clone();
+                let folders = self.folders.clone();
+                let recent = self.recent_file_searches.clone();
+                let root = self.root.clone();
+                let query = query.to_owned();
+                let ctx = ctx.clone();
+                let cancel = Arc::new(AtomicBool::new(false));
+                let stop = cancel.clone();
+                let (tx, rx) = mpsc::channel();
+                self.picker_files_worker = Some((rx, cancel));
+                std::thread::spawn(move || {
+                    let paths = file_candidates_with_cancel(
+                        &recent,
+                        &open,
+                        &files,
+                        &folders,
+                        &root,
+                        &query,
+                        || stop.load(Ordering::Relaxed),
+                    );
+                    if !stop.load(Ordering::Relaxed) {
+                        let _ = tx.send(paths);
+                        ctx.request_repaint();
+                    }
+                });
+            } else {
+                let (files, folders) = if mode == Picker::Recent {
+                    (&[][..], &[][..])
+                } else {
+                    (self.files.as_slice(), self.folders.as_slice())
+                };
+                self.picker_files = file_candidates(
+                    &self.recent_file_searches,
+                    &open,
+                    files,
+                    folders,
+                    &self.root,
+                    query,
+                );
+            }
+        }
+        if let Some((rx, _)) = &self.picker_files_worker {
+            match rx.try_recv() {
+                Ok(paths) => {
+                    self.picker_files = paths;
+                    self.picker_files_worker = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.picker_files_worker = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        &self.picker_files
+    }
+
     fn show_picker(&mut self, mode: Picker) {
         self.search_open = false;
+        self.clear_picker_files();
         self.picker = Some(mode);
         self.picker_query.clear();
         self.picker_selection = 0;
@@ -3414,9 +3761,13 @@ impl Coder {
         // A unique suffix can resolve filenames printed relative to a build
         // directory. Ambiguous matches go to the picker instead of guessing.
         let suffix = path.strip_prefix(".").unwrap_or(&path);
-        let mut matches = self.files.iter().chain(&self.folders).filter(|candidate| {
-            candidate.ends_with(suffix) && (candidate.is_file() || candidate.is_dir())
-        });
+        let mut matches = self
+            .files
+            .iter()
+            .chain(self.folders.iter())
+            .filter(|candidate| {
+                candidate.ends_with(suffix) && (candidate.is_file() || candidate.is_dir())
+            });
         let first = matches.next()?;
         if matches.any(|candidate| candidate != first) {
             return None;
@@ -3574,10 +3925,11 @@ impl Coder {
                     close = true;
                 }
                 ui.separator();
+                let picker_query = self.picker_query.clone();
                 let (file_query, target) = if matches!(mode, Picker::Symbols | Picker::Line) {
-                    (self.picker_query.as_str(), None)
+                    (picker_query.as_str(), None)
                 } else {
-                    split_file_location(&self.picker_query)
+                    split_file_location(&picker_query)
                 };
                 let query = file_query.to_lowercase();
                 if mode == Picker::Line {
@@ -3622,27 +3974,11 @@ impl Coder {
                         if query.is_empty() {
                             ui.weak("Recently chosen files first");
                         }
-                        let paths = file_candidates(
-                            &self.recent_file_searches,
-                            &self
-                                .documents
-                                .iter()
-                                .rev()
-                                .map(|doc| doc.path.clone())
-                                .collect::<Vec<_>>(),
-                            if mode == Picker::Recent {
-                                &[]
-                            } else {
-                                &self.files
-                            },
-                            if mode == Picker::Recent {
-                                &[]
-                            } else {
-                                &self.folders
-                            },
-                            &self.root,
-                            &query,
-                        );
+                        let query = query.clone();
+                        let paths = self.picker_paths(ctx, mode, &query).to_vec();
+                        if self.picker_files_worker.is_some() {
+                            ui.spinner();
+                        }
                         for path in paths {
                             entries.push((
                                 relative(&path, &self.root),
@@ -3750,9 +4086,13 @@ impl Coder {
 
     fn draw(&mut self, ctx: &egui::Context) {
         self.defer_actions = true;
+        if self.picker.is_none() && self.picker_files_key.is_some() {
+            self.clear_picker_files();
+        }
         self.poll(ctx);
         self.worktrees.poll();
-        let blocked = self.pending.is_some()
+        let blocked = self.any_saving()
+            || self.pending.is_some()
             || self.terminal.modal()
             || self.worktrees.modal()
             || self.file_action.is_some()
@@ -3784,7 +4124,12 @@ impl Coder {
                 self.start_search(SearchKind::Definitions, true);
             }
         }
+        if ctx.input(|i| i.viewport().close_requested()) && self.any_saving() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_after_saves = true;
+        }
         if ctx.input(|i| i.viewport().close_requested())
+            && !self.any_saving()
             && !self.allow_exit
             && (self.documents.iter().any(|d| d.dirty)
                 || self
@@ -3858,9 +4203,13 @@ impl Coder {
         }
         self.defer_actions = false;
         for action in std::mem::take(&mut self.actions) {
+            if self.any_saving() {
+                self.actions.push(action);
+                continue;
+            }
             match action {
                 FrameAction::Open(path, target) => self.open(path, target),
-                FrameAction::SwitchProject(root) => self.switch_project(root),
+                FrameAction::SwitchProject(root) => self.request_project(root),
                 FrameAction::SwitchWorktree(root) => self.switch_worktree(root),
                 FrameAction::OpenProjectInstance(root) => {
                     if let Err(error) = open_project_instance(&root) {
@@ -3871,10 +4220,24 @@ impl Coder {
                 FrameAction::Save(index) => {
                     self.save(index);
                 }
-                FrameAction::Close(index) => self.close(index, ctx),
+                FrameAction::Close(index) => {
+                    if let Some(doc) = self.documents.get(index) {
+                        if doc.dirty {
+                            self.ask(Pending::Close(index));
+                        } else {
+                            self.close(index, ctx);
+                        }
+                    }
+                }
                 FrameAction::Activate(index) => {
                     if index < self.documents.len() {
                         self.active = index;
+                        if let Err(error) = self.documents[index].ensure_loaded(self.csv_headers) {
+                            self.status = format!(
+                                "Could not load {}: {error}",
+                                self.documents[index].path.display()
+                            );
+                        }
                     }
                 }
                 FrameAction::GitDiff(index) => {
@@ -3887,6 +4250,7 @@ impl Coder {
                         match &doc.content {
                             Content::Text(text) => Some(text.to_string()),
                             Content::Csv(sheet) => sheet.serialize().ok(),
+                            Content::Unloaded { .. } => None,
                         }
                     } else {
                         None
@@ -3911,6 +4275,14 @@ impl Coder {
         if let Some(revert) = self.git.pending_revert.take() {
             self.apply_review_revert(revert, ctx);
         }
+        if self.deferred_revert.as_ref().is_some_and(|revert| {
+            self.documents
+                .iter()
+                .any(|doc| doc.path == revert.path && !doc.is_unloaded() && !doc.is_loading())
+        }) {
+            let revert = self.deferred_revert.take().unwrap();
+            self.apply_review_revert(revert, ctx);
+        }
         if self.pending.is_some()
             || self.terminal.modal()
             || self.worktrees.modal()
@@ -3921,6 +4293,14 @@ impl Coder {
             chrome::clear_resize_cursor(ctx);
         }
         self.dialogs(ctx);
+        if self.any_saving() && self.pending.is_none() {
+            egui::Modal::new(egui::Id::new("saving-files")).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Saving files…");
+                });
+            });
+        }
         let editing_preferences = self.terminal.settings_open;
         self.terminal.windows(ctx);
         if editing_preferences && !self.terminal.settings_open {
@@ -4031,6 +4411,8 @@ impl Drop for Coder {
     fn drop(&mut self) {
         self.save_session();
         self.search_cancel.store(true, Ordering::Relaxed);
+        self.files_cancel.store(true, Ordering::Relaxed);
+        self.clear_picker_files();
     }
 }
 
@@ -4222,6 +4604,18 @@ fn file_candidates(
     root: &Path,
     query: &str,
 ) -> Vec<PathBuf> {
+    file_candidates_with_cancel(recent, open, files, folders, root, query, || false)
+}
+
+fn file_candidates_with_cancel(
+    recent: &[PathBuf],
+    open: &[PathBuf],
+    files: &[PathBuf],
+    folders: &[PathBuf],
+    root: &Path,
+    query: &str,
+    cancelled: impl Fn() -> bool,
+) -> Vec<PathBuf> {
     // Borrow candidate paths; retain at most the visible result limit even for
     // very large repositories. Source order breaks ties in favor of recents.
     let query = query.to_lowercase().replace('\\', "/");
@@ -4233,6 +4627,9 @@ fn file_candidates(
         .chain(files)
         .enumerate()
     {
+        if cancelled() {
+            return Vec::new();
+        }
         let Ok(relative) = path.strip_prefix(root) else {
             continue;
         };
@@ -4748,6 +5145,7 @@ fn html_images(source: &str) -> Vec<HtmlImage> {
 
 #[derive(Default)]
 struct EditorFind<'a> {
+    snapshot: Option<(u64, bool)>,
     query: &'a str,
     active: Option<std::ops::Range<usize>>,
     scroll: bool,
@@ -4794,13 +5192,32 @@ fn apply_undo_budget(ui: &egui::Ui, id: egui::Id, len: usize) {
     ui.ctx().data_mut(|data| data.insert_temp(key, budget));
 }
 
-/// Drop the undo history of a closed file, so its text is not kept in the
+/// Drop the undo history of a closed or unloaded file, so its text is not kept in the
 /// persisted editor state.
 fn release_editor_state(ctx: &egui::Context, id: egui::Id) {
     ctx.data_mut(|data| {
         if let Some(mut state) = data.get_persisted::<egui::widgets::text_edit::TextEditState>(id) {
             state.clear_undoer();
             data.insert_persisted(id, state);
+        }
+        // clear_undoer restores default settings. Reapply the size budget when
+        // this editor is rendered again, even if the file size did not change.
+        data.remove::<usize>(id.with("undo-budget"));
+    });
+}
+
+/// Release text-bearing state while retaining cursor, selection, folds and scroll.
+fn release_unloaded_editor(ctx: &egui::Context, doc: &Document) {
+    if let Some(id) = doc.editor_id {
+        release_editor_state(ctx, id);
+    }
+    ctx.data_mut(|data| {
+        let key = egui::Id::new("editor-syntax");
+        if data
+            .get_temp::<SyntaxCache>(key)
+            .is_some_and(|cache| cache.path == doc.path)
+        {
+            data.remove::<SyntaxCache>(key);
         }
     });
 }
@@ -4820,6 +5237,7 @@ struct SyntaxCache {
     size: f32,
     job: Arc<egui::text::LayoutJob>,
     regions: Arc<Vec<crate::folding::Region>>,
+    structure: Arc<crate::editor_structure::Structure>,
 }
 
 /// The syntax colors of the text, computed when the text changed.
@@ -4859,10 +5277,41 @@ fn syntax_cache(
         size,
         job: job.clone(),
         regions: Arc::new(regions),
+        structure: Arc::new(structure),
     };
     ui.ctx()
         .data_mut(|data| data.insert_temp(id, cache.clone()));
     cache
+}
+
+/// Track mutations made by TextEdit between its layout calls in one frame.
+/// An edit must invalidate a cached galley even when the byte length is unchanged.
+struct TrackedText<'a> {
+    inner: &'a mut dyn egui::TextBuffer,
+    edits: &'a std::cell::Cell<u64>,
+}
+impl egui::TextBuffer for TrackedText<'_> {
+    fn is_mutable(&self) -> bool {
+        self.inner.is_mutable()
+    }
+    fn as_str(&self) -> &str {
+        self.inner.as_str()
+    }
+    fn type_id(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<TrackedText<'static>>()
+    }
+    fn insert_text(&mut self, text: &str, index: usize) -> usize {
+        if !text.is_empty() {
+            self.edits.set(self.edits.get().wrapping_add(1));
+        }
+        self.inner.insert_text(text, index)
+    }
+    fn delete_char_range(&mut self, range: std::ops::Range<usize>) {
+        if !range.is_empty() {
+            self.edits.set(self.edits.get().wrapping_add(1));
+        }
+        self.inner.delete_char_range(range);
+    }
 }
 
 fn text_editor(
@@ -4934,22 +5383,23 @@ fn text_editor(
         .ctx()
         .data_mut(|data| data.get_temp::<crate::folding::State>(fold_id))
         .unwrap_or_default();
-    // One fingerprint of the document per frame, shared by the fold state
-    // and the layout cache.
-    let source_hash = egui::util::hash(text.as_str());
+    let (source_hash, large) = find.snapshot.unwrap_or_else(|| {
+        (
+            egui::util::hash(text.as_str()),
+            crate::editor_analysis::is_large(text.as_str()),
+        )
+    });
     folds.sync(source_hash);
-    let large = crate::editor_analysis::is_large(text.as_str());
     let analysis = large
-        .then(|| crate::editor_analysis::get(ui, text.as_str(), path))
+        .then(|| crate::editor_analysis::get_keyed(ui, text.as_str(), path, source_hash))
         .flatten();
-    let small_regions: Arc<Vec<crate::folding::Region>> = if large {
-        Arc::new(Vec::new())
-    } else {
-        syntax_cache(ui, path, text.as_str(), extension, source_hash).regions
-    };
+    let small_cache =
+        (!large).then(|| syntax_cache(ui, path, text.as_str(), extension, source_hash));
     let fold_regions = analysis
         .as_ref()
-        .map_or(small_regions.as_slice(), |a| a.folds.as_slice());
+        .map(|a| a.folds.as_slice())
+        .or_else(|| small_cache.as_ref().map(|cache| cache.regions.as_slice()))
+        .unwrap_or(&[]);
     if let Some(offset) = jump_offset.or(find_offset) {
         folds.reveal(fold_regions, offset..=offset);
     }
@@ -4970,14 +5420,17 @@ fn text_editor(
             .data_mut(|data| data.insert_temp(fold_id.with("capture-seeded"), true));
     }
     let active_folds = folds.active(fold_regions);
-    let large_layout = large.then(|| crate::editor_analysis::layout_cache(ui, id));
+    let editor_layout = crate::editor_analysis::layout_cache(ui, id);
+    let edits = std::cell::Cell::new(0_u64);
+    let layout_fingerprint = std::cell::Cell::new((0_u64, source_hash));
     let folded = egui::util::hash(&folds.collapsed);
     let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, _wrap_width: f32| {
-        // The buffer is the text we were handed, so its fingerprint is known.
-        let buffer_hash = source_hash;
-        let syntax = analysis
-            .as_ref()
-            .filter(|a| a.syntax.text.len() == buffer.as_str().len());
+        let (generation, mut buffer_hash) = layout_fingerprint.get();
+        if generation != edits.get() {
+            buffer_hash = egui::util::hash(buffer.as_str());
+            layout_fingerprint.set((edits.get(), buffer_hash));
+        }
+        let syntax = analysis.as_ref().filter(|_| buffer_hash == source_hash);
         let layout_key = egui::util::hash((
             buffer_hash,
             syntax.map(|a| a.key),
@@ -4988,8 +5441,7 @@ fn text_editor(
             &find.active,
             folded,
         ));
-        if let Some(cache) = &large_layout
-            && let Some(cached) = cache.lock().unwrap().as_ref()
+        if let Some(cached) = editor_layout.lock().unwrap().as_ref()
             && cached.key == layout_key
         {
             return cached.galley.clone();
@@ -5039,12 +5491,10 @@ fn text_editor(
         } else {
             galley
         };
-        if let Some(cache) = &large_layout {
-            *cache.lock().unwrap() = Some(crate::editor_analysis::CachedLayout {
-                key: layout_key,
-                galley: galley.clone(),
-            });
-        }
+        *editor_layout.lock().unwrap() = Some(crate::editor_analysis::CachedLayout {
+            key: layout_key,
+            galley: galley.clone(),
+        });
         galley
     };
     let mut changed = false;
@@ -5072,7 +5522,11 @@ fn text_editor(
                 let guide_layer = ui.painter().add(egui::Shape::Noop);
                 let git_layer = ui.painter().add(egui::Shape::Noop);
                 let blame_hover_layer = ui.painter().add(egui::Shape::Noop);
-                let output = egui::TextEdit::multiline(&mut *text)
+                let mut tracked = TrackedText {
+                    inner: &mut *text,
+                    edits: &edits,
+                };
+                let output = egui::TextEdit::multiline(&mut tracked)
                     .id(id)
                     .font(FontId::monospace(font_size))
                     .code_editor()
@@ -5151,19 +5605,18 @@ fn text_editor(
                     Color32::from_rgb(116, 110, 98)
                 };
                 let small_structure = if large {
-                    crate::editor_structure::Structure::default()
+                    Arc::new(crate::editor_structure::Structure::default())
+                } else if edits.get() == 0 {
+                    small_cache.as_ref().unwrap().structure.clone()
                 } else {
-                    ui.ctx().memory_mut(|memory| {
-                        memory
-                            .caches
-                            .cache::<egui::cache::FrameCache<
-                                crate::editor_structure::Structure,
-                                crate::editor_structure::Computer,
-                            >>()
-                            .get(output.galley.job.as_ref())
-                    })
+                    Arc::new(crate::editor_structure::Structure::build(
+                        &output.galley.job,
+                    ))
                 };
-                let structure = analysis.as_ref().map_or(&small_structure, |a| &a.structure);
+                let structure = analysis
+                    .as_ref()
+                    .filter(|_| edits.get() == 0)
+                    .map_or(small_structure.as_ref(), |a| &a.structure);
                 let active_pair = structure.matching(*cursor);
                 let caret_line = output
                     .galley
@@ -5702,6 +6155,256 @@ mod tests {
     use super::*;
 
     #[test]
+    fn save_and_close_waits_for_background_success_and_keeps_the_tab_on_conflict()
+    -> anyhow::Result<()> {
+        for conflict in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("save.ts");
+            std::fs::write(&path, "baseline")?;
+            let ctx = egui::Context::default();
+            let mut app = Coder::empty(dir.path().to_path_buf());
+            app.io_context = Some(ctx.clone());
+            app.open(path.clone(), None);
+            app.documents[0].ensure_loaded(true)?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while app.documents[0].is_loading() {
+                app.poll_file_io(&ctx);
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            app.documents[0].content = Content::Text("unsaved edit".into());
+            app.documents[0].dirty = true;
+            app.documents[0].mark_changed();
+            if conflict {
+                std::fs::write(&path, "external edit")?;
+            }
+            app.pending = Some(Pending::Close(0));
+            assert!(app.save(0));
+            app.save_continuation = true;
+            assert_eq!(
+                app.documents.len(),
+                1,
+                "a queued save has not closed the tab"
+            );
+            while app.any_saving() {
+                app.poll_file_io(&ctx);
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if conflict {
+                assert_eq!(app.documents.len(), 1);
+                assert_eq!(app.documents[0].source_text()?, "unsaved edit");
+                assert_eq!(std::fs::read_to_string(&path)?, "external edit");
+                assert!(app.documents[0].dirty);
+                assert!(app.error.is_some());
+            } else {
+                assert!(app.documents.is_empty());
+                assert_eq!(std::fs::read_to_string(&path)?, "unsaved edit");
+            }
+            assert!(!app.save_continuation);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn layout_cache_reuses_idle_frames_and_invalidates_same_length_replacements() {
+        for lines in [1_500, 10_000] {
+            let ctx = egui::Context::default();
+            let path = Path::new("layout.ts");
+            let mut text = "const value = 1;\n".repeat(lines);
+            let mut cursor = 0;
+            let mut jump = Some((1, 1));
+            let mut id = None;
+            let mut frame = |events| {
+                let mut result = None;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(900.0, 600.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            text_editor(
+                                ui,
+                                &mut text,
+                                path,
+                                &mut cursor,
+                                &mut jump,
+                                &mut id,
+                                EditorFind::default(),
+                            );
+                            result = crate::editor_analysis::layout_cache(ui, id.unwrap())
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .map(|cached| cached.galley.clone());
+                        });
+                    },
+                );
+                (result.unwrap(), id.unwrap())
+            };
+            frame(Vec::new());
+            let (idle, _) = frame(Vec::new());
+            let (idle_again, editor_id) = frame(Vec::new());
+            assert!(
+                Arc::ptr_eq(&idle, &idle_again),
+                "idle frames reuse the laid-out text"
+            );
+            let mut state = egui::TextEdit::load_state(&ctx, editor_id).unwrap();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(5),
+                )));
+            state.store(&ctx, editor_id);
+            let (changed, _) = frame(vec![egui::Event::Text("class".into())]);
+            assert!(
+                changed.text().starts_with("class value"),
+                "same-length edits must invalidate layout within the input frame"
+            );
+            drop(frame);
+            assert_eq!(changed.text(), text);
+        }
+    }
+
+    #[test]
+    #[ignore = "allocates a synthetic index of two million file paths"]
+    fn two_million_path_picker_is_cancellable_and_reuses_its_results() {
+        let root = PathBuf::from("/synthetic-project");
+        let mut app = Coder::empty(root.clone());
+        app.files = Arc::new(
+            (0..2_000_000)
+                .map(|index| root.join(format!("package-{}/file-{index}.ts", index / 1000)))
+                .collect(),
+        );
+        let ctx = egui::Context::default();
+        app.picker_paths(&ctx, Picker::Files, "no-such-file");
+        let cancel = app.picker_files_worker.as_ref().unwrap().1.clone();
+        app.picker_paths(&ctx, Picker::Files, "file-1999999.ts");
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(
+            app.picker_files_worker.is_some(),
+            "large indexes are searched off the UI thread"
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.picker_files_worker.is_some() {
+            app.picker_paths(&ctx, Picker::Files, "file-1999999.ts");
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            app.picker_files,
+            vec![root.join("package-1999/file-1999999.ts")]
+        );
+        let before = app.picker_files.as_ptr();
+        assert_eq!(
+            app.picker_paths(&ctx, Picker::Files, "file-1999999.ts")
+                .as_ptr(),
+            before
+        );
+        assert!(app.picker_files_worker.is_none());
+    }
+
+    #[test]
+    fn idle_tabs_release_undo_but_keep_selection_and_reload_after_close() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("idle.txt");
+        let active = dir.path().join("active.txt");
+        std::fs::write(&path, "first\nsecond\nthird\n")?;
+        std::fs::write(&active, "active")?;
+        let mut app = Coder::empty(dir.path().to_path_buf());
+        app.open(path.clone(), None);
+        app.open(active, None);
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("idle-editor");
+        app.documents[0].editor_id = Some(id);
+        app.documents[0].cursor = 8;
+        let selection =
+            egui::text::CCursorRange::two(egui::text::CCursor::new(6), egui::text::CCursor::new(8));
+        let mut state = egui::text_edit::TextEditState::default();
+        state.cursor.set_char_range(Some(selection));
+        let mut undoer = state.undoer();
+        undoer.add_undo(&(selection, "previous text".to_owned()));
+        state.set_undoer(undoer);
+        state.store(&ctx, id);
+        ctx.data_mut(|data| data.insert_temp(id.with("undo-budget"), 4_usize));
+        let idle = app.documents[0].last_active;
+        let now = idle + Duration::from_secs(300);
+        app.unload_idle_documents(&ctx, now - Duration::from_secs(1));
+        assert!(!app.documents[0].is_unloaded());
+        app.unload_idle_documents(&ctx, now);
+        assert!(app.documents[0].is_unloaded());
+        assert!(!app.documents[1].is_unloaded(), "active tab is protected");
+        let state = egui::TextEdit::load_state(&ctx, id).unwrap();
+        assert_eq!(state.cursor.char_range(), Some(selection));
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<usize>(id.with("undo-budget"))),
+            None,
+            "the file's undo budget must be reapplied after clearing history"
+        );
+        assert!(
+            !state
+                .undoer()
+                .has_undo(&(selection, "current text".to_owned()))
+        );
+        let snapshot = app.session_snapshot(&app.documents, app.active, &app.terminal);
+        assert_eq!(snapshot["tabs"][0]["line"], 2);
+        assert_eq!(snapshot["tabs"][0]["column"], 3);
+        std::fs::write(&path, "new contents")?;
+        app.close(1, &ctx);
+        app.poll(&ctx);
+        assert!(
+            matches!(&app.documents[0].content, Content::Text(text) if text.as_str() == "new contents")
+        );
+        assert_eq!(app.documents[0].cursor, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn idle_worktree_tabs_unload_while_dirty_tabs_stay_resident() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("clean.txt");
+        std::fs::write(&path, "saved")?;
+        let clean = Document::open(path.clone(), true)?;
+        let mut dirty = Document::open(path, true)?;
+        dirty.content = Content::Text("unsaved edits".into());
+        dirty.dirty = true;
+        let now = dirty.last_active + Duration::from_secs(300);
+        let mut app = Coder::empty(dir.path().to_path_buf());
+        let root = dir.path().join("other-worktree");
+        app.worktree_sessions.insert(
+            root.clone(),
+            WorktreeSession {
+                documents: vec![clean, dirty],
+                active: 0,
+                terminal: crate::terminal::Terminal::default(),
+                history: Vec::new(),
+            },
+        );
+        app.unload_idle_documents(&egui::Context::default(), now);
+        let docs = &app.worktree_sessions[&root].documents;
+        assert!(docs[0].is_unloaded());
+        assert!(
+            matches!(&docs[1].content, Content::Text(text) if text.as_str() == "unsaved edits")
+        );
+        assert!(docs[1].dirty);
+        let session = app.worktree_sessions.remove(&root).unwrap();
+        app.documents = session.documents;
+        app.active = session.active;
+        app.poll(&egui::Context::default());
+        assert!(
+            matches!(&app.documents[0].content, Content::Text(text) if text.as_str() == "saved")
+        );
+        assert!(app.documents[1].dirty);
+        Ok(())
+    }
+
+    #[test]
     fn editor_drops_use_normal_open_actions_and_respect_target_and_modals() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let file = dir.path().join("a file.rs");
@@ -5800,8 +6503,8 @@ mod tests {
         std::fs::create_dir_all(source.parent().unwrap())?;
         std::fs::write(&source, "fn main() {}\n")?;
         let mut app = Coder::empty(root.clone());
-        app.files = vec![source.clone()];
-        app.folders = vec![nested.clone(), nested.join("src")];
+        app.files = Arc::new(vec![source.clone()]);
+        app.folders = Arc::new(vec![nested.clone(), nested.join("src")]);
         for (query, expected) in [
             (source.to_string_lossy().into_owned(), source.clone()),
             (nested.to_string_lossy().into_owned(), nested.clone()),
@@ -5834,7 +6537,7 @@ mod tests {
         let other = root.join("other/main.rs");
         std::fs::create_dir_all(other.parent().unwrap())?;
         std::fs::write(&other, "// other\n")?;
-        app.files.push(other);
+        Arc::make_mut(&mut app.files).push(other);
         assert_eq!(app.resolve_terminal_path("main.rs", &deep), None);
         let external = tempfile::tempdir()?;
         app.open(source, None);
@@ -6819,7 +7522,7 @@ mod tests {
         std::fs::write(&changed, "changed")?;
         std::fs::write(&normal, "normal")?;
         let mut app = Coder::empty(root.clone());
-        app.files = vec![changed.clone(), normal];
+        app.files = Arc::new(vec![changed.clone(), normal]);
         app.tree = crate::explorer::FileTree::build_with_folders(&root, &app.files, &app.folders);
         app.git.repo = Some(crate::git::Repository {
             root: root.clone(),
@@ -7398,8 +8101,8 @@ mod tests {
         let paths = navigation::workspace_paths(&root)?;
         assert!(paths.folders.contains(&folder));
         let mut app = Coder::empty(root.clone());
-        app.files = paths.files;
-        app.folders = paths.folders;
+        app.files = Arc::new(paths.files);
+        app.folders = Arc::new(paths.folders);
         app.tree = crate::explorer::FileTree::build_with_folders(&root, &app.files, &app.folders);
         app.show_project = false;
         app.show_picker(Picker::Files);
@@ -7758,6 +8461,11 @@ mod tests {
                 app.documents[0].dirty = true;
                 app.documents[0].mark_changed();
             }
+            if buffer.is_none() {
+                let now = app.documents[0].last_active + Duration::from_secs(300);
+                app.unload_idle_documents(&ctx, now);
+                assert!(app.documents[0].is_unloaded());
+            }
             let expected = buffer.unwrap_or(disk);
             app.query = "needle".into();
             app.run_search(SearchKind::References, false);
@@ -7814,7 +8522,7 @@ mod tests {
         std::fs::write(&path, "fn sample() {}\n")?;
         let mut app = Coder::empty(dir.path().to_path_buf());
         app.open(path.clone(), None);
-        app.files = vec![path.clone()];
+        app.files = Arc::new(vec![path.clone()]);
         app.tree =
             crate::explorer::FileTree::build_with_folders(&app.root, &app.files, &app.folders);
         app.query = "sample".into();

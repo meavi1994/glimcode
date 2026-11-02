@@ -659,9 +659,20 @@ pub struct WorkspacePaths {
     pub folders: Vec<PathBuf>,
 }
 
+#[cfg(any(test, feature = "ui-capture"))]
 pub fn workspace_paths(root: &Path) -> Result<WorkspacePaths> {
+    Ok(workspace_paths_cancelled(root, || false)?.expect("uncancelled scan"))
+}
+
+pub fn workspace_paths_cancelled(
+    root: &Path,
+    cancelled: impl Fn() -> bool,
+) -> Result<Option<WorkspacePaths>> {
     let mut paths = WorkspacePaths::default();
     for entry in workspace_walk(root)?.build() {
+        if cancelled() {
+            return Ok(None);
+        }
         let entry = entry.context("Cannot list project files")?;
         if entry.file_type().is_some_and(|kind| kind.is_file()) {
             paths.files.push(entry.into_path());
@@ -669,9 +680,12 @@ pub fn workspace_paths(root: &Path) -> Result<WorkspacePaths> {
             paths.folders.push(entry.into_path());
         }
     }
+    if cancelled() {
+        return Ok(None);
+    }
     paths.files.sort();
     paths.folders.sort();
-    Ok(paths)
+    Ok((!cancelled()).then_some(paths))
 }
 
 #[cfg(any(test, feature = "ui-capture"))]
@@ -1274,6 +1288,16 @@ pub fn token_at(text: &str, position: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancelled_workspace_scans_do_not_publish_a_partial_index() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("first.ts"), "const value = 1;")?;
+        assert!(workspace_paths_cancelled(dir.path(), || true)?.is_none());
+        let paths = workspace_paths_cancelled(dir.path(), || false)?.unwrap();
+        assert_eq!(paths.files, vec![dir.path().join("first.ts")]);
+        Ok(())
+    }
+
     #[test]
     fn deeply_nested_typescript_outline_uses_bounded_call_stack() {
         const CHILD: &str = "GLIMCODE_DEEP_OUTLINE_CHILD";

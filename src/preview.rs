@@ -36,7 +36,6 @@ impl SourceVersion {
 /// Keep the full source and its syntax styles, while laying out only visible lines.
 pub struct SourcePreview {
     pub path: PathBuf,
-    source: String,
     source_version: SourceVersion,
     lines: Vec<Range<usize>>,
     syntax: LayoutJob,
@@ -76,7 +75,6 @@ impl SourcePreview {
         Some(Self {
             source_version: SourceVersion::for_path(&path, None),
             path,
-            source,
             lines,
             syntax,
             dark,
@@ -95,20 +93,19 @@ impl SourcePreview {
     }
 
     fn bytes(&self) -> usize {
-        self.source.len()
-            + self.syntax.text.len()
+        self.syntax.text.len()
             + self.lines.len() * size_of::<Range<usize>>()
             + self.syntax.sections.len() * size_of::<eframe::egui::text::LayoutSection>()
     }
 
     pub fn source(&self) -> &str {
-        &self.source
+        &self.syntax.text
     }
 
     pub fn line_text(&self, index: usize) -> &str {
         self.lines
             .get(index)
-            .map_or("", |range| &self.source[range.clone()])
+            .map_or("", |range| &self.syntax.text[range.clone()])
     }
 
     pub fn len(&self) -> usize {
@@ -129,7 +126,7 @@ impl SourcePreview {
     pub fn line(&self, index: usize, query: &str) -> LayoutJob {
         let range = &self.lines[index];
         let mut job = LayoutJob {
-            text: self.source[range.clone()].to_owned(),
+            text: self.syntax.text[range.clone()].to_owned(),
             ..Default::default()
         };
         let first = self

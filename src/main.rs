@@ -23,6 +23,7 @@ mod session;
 mod sheet;
 mod terminal;
 mod test_files;
+mod workspace_watch;
 mod worktrees;
 
 fn main() -> eframe::Result {

@@ -15,6 +15,27 @@ type RowSelection = (String, Vec<ValueSelection>);
 
 pub type Row = Vec<String>;
 
+/// An owned snapshot lets CSV encoding run without borrowing the live grid.
+pub struct SaveSnapshot {
+    rows: Vec<Row>,
+    headers: Option<Vec<String>>,
+    delimiter: u8,
+}
+impl SaveSnapshot {
+    pub fn serialize(self) -> Result<String> {
+        let mut writer = csv::WriterBuilder::new()
+            .delimiter(self.delimiter)
+            .from_writer(Vec::new());
+        if let Some(headers) = self.headers {
+            writer.write_record(headers)?;
+        }
+        for row in self.rows {
+            writer.write_record(row)?;
+        }
+        String::from_utf8(writer.into_inner()?).context("Cannot encode CSV")
+    }
+}
+
 pub struct Sheet {
     pub table: DataTable<Row>,
     pub viewer: Viewer,
@@ -22,7 +43,6 @@ pub struct Sheet {
     has_headers: bool,
     sort_column: usize,
     counted_filter: Option<RowSelection>,
-    values_dirty: bool,
     visible_count: usize,
     compact: bool,
     single_click: bool,
@@ -34,6 +54,8 @@ pub struct Viewer {
     pub headers: Vec<String>,
     filter: RowSelection,
     unique_values: Vec<Vec<(String, usize)>>,
+    values_valid: Vec<bool>,
+    requested_values: BTreeSet<usize>,
     value_search: Vec<String>,
     view_sort: Vec<(usize, bool)>,
     sort_requested: bool,
@@ -147,6 +169,8 @@ impl Sheet {
                 headers,
                 filter: (String::new(), vec![None; count]),
                 unique_values: vec![vec![]; count],
+                values_valid: vec![false; count],
+                requested_values: BTreeSet::new(),
                 value_search: vec![String::new(); count],
                 view_sort: vec![],
                 sort_requested: false,
@@ -162,7 +186,6 @@ impl Sheet {
             has_headers,
             sort_column: 0,
             counted_filter: None,
-            values_dirty: true,
             visible_count: 0,
             compact: false,
             single_click: false,
@@ -172,6 +195,14 @@ impl Sheet {
 
     pub fn delimiter(&self) -> u8 {
         self.delimiter
+    }
+
+    pub fn save_snapshot(&self) -> SaveSnapshot {
+        SaveSnapshot {
+            rows: self.table.iter().cloned().collect(),
+            headers: self.has_headers.then(|| self.viewer.headers.clone()),
+            delimiter: self.delimiter,
+        }
     }
 
     pub fn serialize(&self) -> Result<String> {
@@ -192,8 +223,8 @@ impl Sheet {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> bool {
-        if self.values_dirty {
-            self.refresh_unique_values();
+        for column in std::mem::take(&mut self.viewer.requested_values) {
+            self.refresh_column_values(column);
         }
         ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
         self.viewer.font_size = crate::preferences::editor_font_size(ui.ctx()).max(14.0);
@@ -451,6 +482,7 @@ impl Sheet {
                 .push(format!("Column {}", self.viewer.headers.len() + 1));
             self.viewer.filter.1.push(None);
             self.viewer.unique_values.push(vec![]);
+            self.viewer.values_valid.push(false);
             self.viewer.value_search.push(String::new());
             self.viewer.widths.push(140.0);
             for row in self.table.iter_mut() {
@@ -466,12 +498,17 @@ impl Sheet {
             });
             changed = true;
         }
+        let bulk_change = self.table.has_user_modification() || add_row || add_column;
         changed |= self.table.has_user_modification() || self.viewer.edited_this_frame;
         self.viewer.commit_requested = false;
         self.viewer.edited_this_frame = false;
         if changed {
             self.counted_filter = None;
-            self.values_dirty = true;
+            // Live edits invalidate their column in show_cell_editor. Bulk
+            // paste, row deletion and undo may touch arbitrary columns.
+            if bulk_change {
+                self.viewer.invalidate_values();
+            }
         }
         self.table.clear_user_modification_flag();
         changed
@@ -479,19 +516,39 @@ impl Sheet {
 }
 
 impl Sheet {
-    fn refresh_unique_values(&mut self) {
-        self.viewer.unique_values = (0..self.viewer.headers.len())
-            .map(|column| {
-                let mut counts = BTreeMap::<String, usize>::new();
-                for row in self.table.iter() {
-                    *counts.entry(row[column].clone()).or_default() += 1;
-                }
-                let mut values: Vec<_> = counts.into_iter().collect();
-                values.sort_by(|(a, _), (b, _)| compare(a, b).then_with(|| a.cmp(b)));
-                values
-            })
+    fn refresh_column_values(&mut self, column: usize) {
+        if column >= self.viewer.headers.len() || self.viewer.values_valid[column] {
+            return;
+        }
+        let mut counts = BTreeMap::<&str, usize>::new();
+        for row in self.table.iter() {
+            *counts.entry(&row[column]).or_default() += 1;
+        }
+        let mut values: Vec<_> = counts
+            .into_iter()
+            .map(|(value, count)| (value.to_owned(), count))
             .collect();
-        self.values_dirty = false;
+        values.sort_by(|(a, _), (b, _)| compare(a, b).then_with(|| a.cmp(b)));
+        self.viewer.unique_values[column] = values;
+        self.viewer.values_valid[column] = true;
+    }
+
+    #[cfg(test)]
+    fn refresh_unique_values(&mut self) {
+        self.viewer.invalidate_values();
+        for column in 0..self.viewer.headers.len() {
+            self.refresh_column_values(column);
+        }
+    }
+}
+
+impl Viewer {
+    fn invalidate_values(&mut self) {
+        self.values_valid.fill(false);
+        // Do not retain potentially large stale distinct-value strings.
+        for values in &mut self.unique_values {
+            *values = Vec::new();
+        }
     }
 }
 
@@ -630,6 +687,13 @@ impl RowViewer<Row> for Viewer {
                         ui.add_space(3.0);
                         ui.separator();
                         ui.add_space(4.0);
+                        if !self.values_valid[column] {
+                            self.requested_values.insert(column);
+                            ui.ctx().request_repaint();
+                            ui.spinner();
+                            ui.weak("Loading values…");
+                            return;
+                        }
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Show values").size(12.0).strong());
                             ui.with_layout(
@@ -844,6 +908,10 @@ impl RowViewer<Row> for Viewer {
                 .desired_width(f32::INFINITY),
         );
         self.edited_this_frame |= response.changed();
+        if response.changed() {
+            self.values_valid[column] = false;
+            self.unique_values[column] = Vec::new();
+        }
         self.selected = Some((self.headers[column].clone(), row[column].clone()));
         Some(response)
     }
@@ -1144,6 +1212,30 @@ mod tests {
             Sheet::parse(&sheet.serialize()?, b',', true)?.table.len(),
             4
         );
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_values_are_built_only_for_requested_columns_and_invalidated_after_edits()
+    -> Result<()> {
+        let mut sheet = Sheet::parse("name,value\nAlice,1\nBob,2\nAlice,1\n", b',', true)?;
+        assert!(sheet.viewer.unique_values.iter().all(Vec::is_empty));
+        sheet.refresh_column_values(1);
+        assert_eq!(
+            sheet.viewer.unique_values[1],
+            vec![("1".into(), 2), ("2".into(), 1)]
+        );
+        assert!(sheet.viewer.unique_values[0].is_empty());
+        assert_eq!(sheet.viewer.values_valid, vec![false, true]);
+        sheet.table[0][1] = "3".into();
+        sheet.viewer.invalidate_values();
+        assert!(sheet.viewer.unique_values[1].is_empty());
+        sheet.refresh_column_values(1);
+        assert_eq!(
+            sheet.viewer.unique_values[1],
+            vec![("1".into(), 1), ("2".into(), 1), ("3".into(), 1)]
+        );
+        assert!(sheet.viewer.unique_values[0].is_empty());
         Ok(())
     }
 

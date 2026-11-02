@@ -118,6 +118,14 @@ impl GitTool {
         self.repo_rx = Some(worker(ctx, move || git::repository(&root, base.as_deref())));
         self.last_refresh = Some(Instant::now());
     }
+    pub fn refresh_if_idle(&mut self, project: &Path, ctx: &egui::Context) -> bool {
+        if self.repo_rx.is_some() {
+            return false;
+        }
+        self.refresh(project, ctx);
+        true
+    }
+
     pub fn poll(&mut self, project: &Path, ctx: &egui::Context) {
         if self.project != project {
             self.reset(project, ctx);
@@ -133,9 +141,15 @@ impl GitTool {
                         self.file = None;
                         self.failed_file = None;
                     }
+                    let tree_changed = self
+                        .repo
+                        .as_ref()
+                        .is_none_or(|old| old.root != repo.root || old.files != repo.files);
                     self.selected_base = Some(repo.base.clone());
                     self.repo = Some(repo);
-                    self.generation = self.generation.wrapping_add(1);
+                    if tree_changed {
+                        self.generation = self.generation.wrapping_add(1);
+                    }
                     self.note = None;
                 }
                 Err(error) => {
@@ -230,7 +244,7 @@ impl GitTool {
             && self.repo_rx.is_none()
             && self
                 .last_refresh
-                .is_some_and(|t| t.elapsed() > Duration::from_secs(4))
+                .is_some_and(|t| t.elapsed() > Duration::from_secs(30))
         {
             let root = self.project.clone();
             self.refresh(&root, ctx);
@@ -259,28 +273,41 @@ impl GitTool {
             ctx.request_repaint_after(Duration::from_secs(2));
         }
     }
-    pub fn cached_file(&self, path: &Path, source: &str) -> Option<Arc<FileData>> {
+    fn annotation_key(&self, path: &Path, revision: u64) -> Option<u64> {
         let repo = self.repo.as_ref()?;
         if self
             .selected_base
             .as_deref()
             .is_some_and(|base| base != repo.base)
+            || !path.starts_with(&repo.root)
         {
             return None;
         }
+        Some(egui::util::hash((
+            &repo.head,
+            &repo.merge_base,
+            path,
+            revision,
+            self.show_blame,
+        )))
+    }
+
+    pub fn cached_file(&self, path: &Path, revision: u64) -> Option<Arc<FileData>> {
+        let key = self.annotation_key(path, revision)?;
         self.file
             .as_ref()
-            .map(|(_, data)| data)
-            .filter(|data| data.path == path && data.text == source)
-            .cloned()
+            .filter(|(stored, _)| *stored == key)
+            .map(|(_, data)| data.clone())
     }
 
     pub fn ensure_file(
         &mut self,
         path: &Path,
         source: &str,
+        revision: u64,
         ctx: &egui::Context,
     ) -> Option<Arc<FileData>> {
+        let key = self.annotation_key(path, revision)?;
         let repo = self.repo.as_ref()?;
         if self
             .selected_base
@@ -292,7 +319,6 @@ impl GitTool {
         if !path.starts_with(&repo.root) {
             return None;
         }
-        let key = egui::util::hash((&repo.head, &repo.merge_base, path, source, self.show_blame));
         if self.desired.is_none_or(|(previous, _)| previous != key) {
             self.desired = Some((key, Instant::now()));
         }
@@ -2914,16 +2940,16 @@ mod tests {
             files: vec![],
             remote: None,
         });
-        assert!(tool.ensure_file(&path, "first", &ctx).is_none());
+        assert!(tool.ensure_file(&path, "first", 1, &ctx).is_none());
         assert!(
             tool.file_rx.is_none(),
             "opening must not start Git work before the editor appears"
         );
         tool.desired.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(1);
-        tool.ensure_file(&path, "edited", &ctx);
+        tool.ensure_file(&path, "edited", 2, &ctx);
         assert!(tool.file_rx.is_none(), "typing resets the idle delay");
         tool.desired.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(1);
-        tool.ensure_file(&path, "edited", &ctx);
+        tool.ensure_file(&path, "edited", 2, &ctx);
         assert!(
             tool.file_rx.is_some(),
             "Git work starts once the buffer settles"
