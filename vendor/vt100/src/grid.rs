@@ -99,6 +99,126 @@ impl Grid {
         }
     }
 
+    /// Rewrap normal-screen rows without losing cells outside the new width.
+    pub fn set_size_reflow(&mut self, size: Size) {
+        if size == self.size {
+            return;
+        }
+        if self.rows.is_empty() || size.cols < 2 || self.scroll_region_active() {
+            self.set_size(size);
+            return;
+        }
+        let history = self.scrollback.len();
+        let cursor_row = history + usize::from(self.pos.row);
+        let saved_row = history + usize::from(self.saved_pos.row);
+        let viewport = history.saturating_sub(self.scrollback_offset);
+        let old_cols = self.size.cols;
+        let mut source: Vec<_> = self.scrollback.drain(..).collect();
+        source.append(&mut self.rows);
+        // Empty rows below the cursor are spare screen space, not output.
+        while source.len() > cursor_row.max(saved_row) + 1
+            && source.last().is_some_and(|row| {
+                !row.wrapped() && (0..old_cols).all(|col| row.get(col) == Some(&crate::Cell::new()))
+            })
+        {
+            source.pop();
+        }
+        let mut rows = Vec::new();
+        let mut row = crate::row::Row::new(size.cols);
+        let mut col = 0;
+        let mut cursor = (0, 0);
+        let mut saved = (0, 0);
+        let mut view_row = 0;
+        for (index, old) in source.iter().enumerate() {
+            if index == viewport {
+                view_row = rows.len();
+            }
+            let mut len = if old.wrapped() {
+                old_cols
+            } else {
+                (0..old_cols)
+                    .rfind(|&c| old.get(c) != Some(&crate::Cell::new()))
+                    .map_or(0, |c| c + 1)
+            };
+            // A wide character can leave an unused cell before a soft wrap.
+            if old.wrapped()
+                && old.get(old_cols - 1) == Some(&crate::Cell::new())
+                && source
+                    .get(index + 1)
+                    .and_then(|r| r.get(0))
+                    .is_some_and(crate::Cell::is_wide)
+            {
+                len -= 1;
+            }
+            if index == cursor_row {
+                len = len.max(self.pos.col.min(old_cols));
+            }
+            if index == saved_row {
+                len = len.max(self.saved_pos.col.min(old_cols));
+            }
+            let mut c = 0;
+            while c < len {
+                let cell = old.get(c).unwrap();
+                let width = if cell.is_wide() { 2 } else { 1 };
+                if col + width > size.cols {
+                    row.wrap(true);
+                    rows.push(row);
+                    row = crate::row::Row::new(size.cols);
+                    col = 0;
+                }
+                if index == cursor_row && (c..c + width).contains(&self.pos.col) {
+                    cursor = (rows.len(), col + self.pos.col - c);
+                }
+                if index == saved_row && (c..c + width).contains(&self.saved_pos.col) {
+                    saved = (rows.len(), col + self.saved_pos.col - c);
+                }
+                *row.get_mut(col).unwrap() = cell.clone();
+                if width == 2 {
+                    *row.get_mut(col + 1).unwrap() = old.get(c + 1).unwrap().clone();
+                }
+                c += width;
+                col += width;
+            }
+            if index == cursor_row && self.pos.col >= len {
+                cursor = (rows.len(), col);
+            }
+            if index == saved_row && self.saved_pos.col >= len {
+                saved = (rows.len(), col);
+            }
+            if !old.wrapped() || index + 1 == source.len() {
+                rows.push(row);
+                row = crate::row::Row::new(size.cols);
+                col = 0;
+            }
+        }
+        let height = usize::from(size.rows);
+        let start = rows.len().saturating_sub(height).min(cursor.0);
+        rows.truncate(start + height);
+        self.rows = rows.split_off(start);
+        self.scrollback = rows.into();
+        while self.scrollback.len() > self.scrollback_len {
+            self.scrollback.pop_front();
+            self.discarded_rows += 1;
+        }
+        self.scrollback_offset = if self.scrollback_offset == 0 {
+            0
+        } else {
+            start.saturating_sub(view_row).min(self.scrollback.len())
+        };
+        self.pos = Pos {
+            row: cursor.0.saturating_sub(start).min(height - 1) as u16,
+            col: cursor.1,
+        };
+        self.saved_pos = Pos {
+            row: saved.0.saturating_sub(start).min(height - 1) as u16,
+            col: saved.1.min(size.cols - 1),
+        };
+        self.size = size;
+        self.rows.resize(height, self.new_row());
+        self.scroll_top = 0;
+        self.scroll_bottom = size.rows - 1;
+    }
+
     pub fn pos(&self) -> Pos {
         self.pos
     }

@@ -4,6 +4,74 @@ use super::*;
 
 #[test]
 #[ignore = "requires GLIMCODE_ZMX_PATH and permission to create local Unix sockets"]
+fn zmx_output_reflows_after_narrowing_and_restoring_desktop_width() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let backend = tmux::Persistent::new_with_backend(None, "zmx")
+        .context("Install zmx 0.8.1 or set GLIMCODE_ZMX_PATH")?;
+    struct Cleanup(tmux::Persistent);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = zmx::run(self.0.executable(), &["kill", &self.0.name, "--force"]);
+        }
+    }
+    let _cleanup = Cleanup(backend.clone());
+    let tab = Session::spawn_with(
+        1,
+        dir.path().into(),
+        Settings {
+            shell: "/bin/sh".into(),
+            ..Default::default()
+        },
+        egui::Context::default(),
+        Some(backend),
+        None,
+    );
+    let resize = |cols| {
+        assert!(tab.send(Command::Resize(PtySize {
+            rows: 24,
+            cols,
+            ..FALLBACK_SIZE
+        })));
+        wait_for(&tab.screen, |s| s.parser.screen().size() == (24, cols));
+    };
+    resize(80);
+    let line = "REFLOW:abcdefghijklmnopqrstuvwxyz0123456789:END";
+    assert!(tab.send(Command::Input(
+        format!("stty -echo; printf '\\033[2J\\033[H{line}\\r\\n'\n").into_bytes()
+    )));
+    wait_for(&tab.screen, |s| s.parser.screen().contents().contains(line));
+    for cols in [20, 80, 30, 80] {
+        resize(cols);
+        let state = tab.screen.lock().unwrap();
+        assert!(state.parser.screen().contents().contains(line));
+        if cols == 80 {
+            assert_eq!(state.parser.screen().cell(0, 46).unwrap().contents(), "D");
+        }
+    }
+    resize(20);
+    assert!(tab.send(Command::Input(
+        format!("printf '{line}\\r\\n'\n").into_bytes()
+    )));
+    wait_for(&tab.screen, |s| {
+        s.parser.screen().contents().matches(line).count() == 2
+    });
+    resize(80);
+    assert_eq!(
+        tab.screen
+            .lock()
+            .unwrap()
+            .parser
+            .screen()
+            .contents()
+            .matches(line)
+            .count(),
+        2
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires GLIMCODE_ZMX_PATH and permission to create local Unix sockets"]
 fn zmx_restores_fullscreen_input_unicode_and_shell_across_disconnect() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let backend = tmux::Persistent::new_with_backend(None, "zmx")

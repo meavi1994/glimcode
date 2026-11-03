@@ -145,6 +145,14 @@ impl Screen {
             .set_size(crate::grid::Size { rows, cols });
     }
 
+    /// Resize with text reflow on the normal screen. The alternate screen
+    /// retains fixed cell coordinates so full-screen applications can redraw.
+    pub fn set_size_reflow(&mut self, rows: u16, cols: u16) {
+        self.grid.set_size_reflow(crate::grid::Size { rows, cols });
+        self.alternate_grid
+            .set_size(crate::grid::Size { rows, cols });
+    }
+
     /// Returns the current size of the terminal.
     ///
     /// The return value will be (rows, cols).

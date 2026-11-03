@@ -560,7 +560,16 @@ impl Session {
                             // Keep output from being parsed with the old geometry after SIGWINCH.
                             let mut state = shared.lock().unwrap();
                             pair.master.resize(size)?;
-                            state.parser.screen_mut().set_size(size.rows, size.cols);
+                            if direct_pty {
+                                state
+                                    .parser
+                                    .screen_mut()
+                                    .set_size_reflow(size.rows, size.cols);
+                            } else {
+                                state.parser.screen_mut().set_size(size.rows, size.cols);
+                            }
+                            state.revision = state.revision.wrapping_add(1);
+                            ctx.request_repaint();
                         }
                         Ok(Command::Scroll(lines, point)) => {
                             // The outer tmux client stays on our main screen.
@@ -2956,6 +2965,65 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_resize_reflows_existing_output_and_restores_full_width() {
+        let mut parser = vt100::Parser::new(6, 24, 100);
+        parser.process(b"abcdefghijklmnopqrstuvwxYZ\r\nsecond line\r\n");
+        let original = parser.screen().contents();
+        parser.screen_mut().set_size_reflow(6, 10);
+        assert_eq!(parser.screen().contents(), original);
+        assert_eq!(parser.screen().cell(1, 0).unwrap().contents(), "k");
+        // Changing only height must retain soft-wrap information, too.
+        parser.screen_mut().set_size_reflow(4, 10);
+        parser.screen_mut().set_size_reflow(6, 10);
+        parser.screen_mut().set_size_reflow(6, 24);
+        assert_eq!(parser.screen().contents(), original);
+        assert_eq!(parser.screen().cell(0, 23).unwrap().contents(), "x");
+        assert_eq!(parser.screen().cursor_position(), (3, 0));
+        // New output written while narrow must also unwrap on expansion.
+        parser.screen_mut().set_size_reflow(6, 10);
+        parser.process(b"0123456789abcdefghij\r\n");
+        parser.screen_mut().set_size_reflow(6, 24);
+        assert!(parser.screen().contents().contains("0123456789abcdefghij"));
+        assert_eq!(parser.screen().cell(3, 19).unwrap().contents(), "j");
+    }
+
+    #[test]
+    fn terminal_reflow_preserves_unicode_styles_links_and_scrollback() {
+        let mut parser = vt100::Parser::new_with_callbacks(3, 24, 100, Callbacks::default());
+        parser.process("\x1b]8;;https://example.com\x1b\\\x1b[31m123456789猫e\u{301}abcdefghijk\x1b[0m\x1b]8;;\x1b\\\r\nnext\r\nlast".as_bytes());
+        parser.screen_mut().set_size_reflow(3, 10);
+        parser.screen_mut().set_size_reflow(3, 24);
+        assert_eq!(
+            parser.screen().contents(),
+            "123456789猫e\u{301}abcdefghijk\nnext\nlast"
+        );
+        assert!(parser.screen().cell(0, 9).unwrap().is_wide());
+        assert!(parser.screen().cell(0, 10).unwrap().is_wide_continuation());
+        assert_eq!(parser.screen().cell(0, 11).unwrap().contents(), "e\u{301}");
+        assert_eq!(
+            parser.screen().cell(0, 11).unwrap().fgcolor(),
+            vt100::Color::Idx(1)
+        );
+        assert_eq!(
+            parser.screen().hyperlink(0, 11),
+            Some("https://example.com")
+        );
+        assert_eq!(parser.screen().cursor_position(), (2, 4));
+    }
+
+    #[test]
+    fn terminal_reflow_keeps_alternate_screen_coordinates() {
+        let mut parser = vt100::Parser::new(6, 24, 100);
+        parser.process(b"abcdefghijklmnopqrst\x1b[?1049h\x1b[2;8HAPP");
+        parser.screen_mut().set_size_reflow(6, 10);
+        assert_eq!(parser.screen().cell(1, 7).unwrap().contents(), "A");
+        parser.process(b"\x1b[?1049l");
+        assert_eq!(parser.screen().contents(), "abcdefghijklmnopqrst");
+        parser.screen_mut().set_size_reflow(6, 24);
+        assert_eq!(parser.screen().cell(0, 19).unwrap().contents(), "t");
+    }
 
     #[test]
     fn settings_has_four_separate_dialogs_and_cancelling_preserves_saved_values() {
