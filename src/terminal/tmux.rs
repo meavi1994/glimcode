@@ -165,7 +165,8 @@ mod tests {
                 anyhow::ensure!(Instant::now() < deadline, "prompt did not render");
                 std::thread::sleep(Duration::from_millis(10));
             }
-            let output = backend.run(&["display-message", "-p", "-t", &target, "#{history_size}"])?;
+            let output =
+                backend.run(&["display-message", "-p", "-t", &target, "#{history_size}"])?;
             assert_eq!(
                 String::from_utf8(output.stdout)?.trim(),
                 expected_history.to_string()
@@ -673,6 +674,7 @@ impl Persistent {
         path.is_absolute()
             .then_some((path, activity.parse().ok(), mouse))
     }
+    #[cfg(test)]
     pub fn mouse_reporting(&self) -> bool {
         !self.is_zmx()
             && self

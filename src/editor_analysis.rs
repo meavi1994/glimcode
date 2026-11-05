@@ -12,7 +12,7 @@ use std::{
 };
 
 pub fn is_large(text: &str) -> bool {
-    text.len() >= 512 * 1024 || text.bytes().filter(|b| *b == b'\n').take(10_000).count() == 10_000
+    text.len() >= 64 * 1024 || text.bytes().filter(|b| *b == b'\n').take(999).count() == 999
 }
 
 pub struct Analysis {
@@ -231,8 +231,9 @@ mod tests {
 
     #[test]
     fn large_file_detection_covers_long_lines_and_many_short_lines() {
-        assert!(is_large(&"x".repeat(512 * 1024)));
-        assert!(is_large(&"x\n".repeat(10_000)));
+        assert!(is_large(&"x".repeat(64 * 1024)));
+        assert!(is_large(&"x\n".repeat(999)));
+        assert!(!is_large(&"x\n".repeat(998)));
         assert!(!is_large("const value = 1;\n"));
     }
 }

@@ -356,6 +356,28 @@ enum Command {
     Scroll(i64, (u16, u16)),
 }
 type Killer = Arc<Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>>;
+/// Dropping the sender stops polling without waiting for an external process.
+struct StatusPoller(mpsc::Sender<()>);
+impl StatusPoller {
+    fn spawn(mut poll: impl FnMut() + Send + 'static) -> Self {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            while matches!(
+                rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                poll();
+            }
+        });
+        Self(tx)
+    }
+}
+impl Drop for StatusPoller {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
 struct ManagedChild(Box<dyn portable_pty::Child + Send + Sync>);
 impl Drop for ManagedChild {
     fn drop(&mut self) {
@@ -504,8 +526,38 @@ impl Session {
                         repaint.request_repaint();
                     }
                 });
-                let mut directory_checked = Instant::now() - Duration::from_secs(2);
-                let mut directory_revision = 0;
+                // Metadata queries spawn external tmux/zmx processes. Keep them
+                // off the PTY writer so an in-flight query cannot delay a key.
+                let _status = backend.as_ref().map(|session| {
+                    let session = session.clone();
+                    let shared = shared.clone();
+                    let ctx = ctx.clone();
+                    let mut directory_checked = Instant::now() - Duration::from_secs(2);
+                    let mut directory_revision = 0;
+                    StatusPoller::spawn(move || {
+                        let revision = shared.lock().unwrap().revision;
+                        if directory_checked.elapsed() >= Duration::from_secs(2)
+                            || (revision != directory_revision
+                                && directory_checked.elapsed() >= Duration::from_millis(50))
+                        {
+                            if let Some((directory, activity, mouse)) = session.pane_status() {
+                                let mut state = shared.lock().unwrap();
+                                state.parser.callbacks_mut().directory = Some(directory);
+                                if state.tmux_mouse_reporting != mouse {
+                                    state.tmux_mouse_reporting = mouse;
+                                    ctx.request_repaint();
+                                }
+                                if activity
+                                    .is_some_and(|activity| state.update_tmux_activity(activity))
+                                {
+                                    ctx.request_repaint();
+                                }
+                            }
+                            directory_checked = Instant::now();
+                            directory_revision = revision;
+                        }
+                    })
+                });
                 loop {
                     if stop.load(Ordering::Relaxed) {
                         let _ = child.0.kill();
@@ -515,28 +567,6 @@ impl Session {
                     if let Some(status) = child.0.try_wait()? {
                         shared.lock().unwrap().status = format!("Exited · {status}");
                         break;
-                    }
-                    let revision = shared.lock().unwrap().revision;
-                    if directory_checked.elapsed() >= Duration::from_secs(2)
-                        || (revision != directory_revision
-                            && directory_checked.elapsed() >= Duration::from_millis(50))
-                    {
-                        if let Some((directory, activity, mouse)) =
-                            backend.as_ref().and_then(|session| session.pane_status())
-                        {
-                            let mut state = shared.lock().unwrap();
-                            state.parser.callbacks_mut().directory = Some(directory);
-                            if state.tmux_mouse_reporting != mouse {
-                                state.tmux_mouse_reporting = mouse;
-                                ctx.request_repaint();
-                            }
-                            if activity.is_some_and(|activity| state.update_tmux_activity(activity))
-                            {
-                                ctx.request_repaint();
-                            }
-                        }
-                        directory_checked = Instant::now();
-                        directory_revision = revision;
                     }
                     // Replies have their own buffer so a busy input queue cannot drop them.
                     let replies =
@@ -573,13 +603,10 @@ impl Session {
                         }
                         Ok(Command::Scroll(lines, point)) => {
                             // The outer tmux client stays on our main screen.
-                            // Check the pane itself before deciding whether a
-                            // wheel belongs to an application or local history.
-                            // Alternate-screen ownership is not a mouse request.
-                            let application = backend
-                                .as_ref()
-                                .is_some_and(|session| session.mouse_reporting());
+                            // The metadata worker refreshes the pane's mouse mode;
+                            // do not launch a subprocess on the input path.
                             let mut state = shared.lock().unwrap();
+                            let application = state.tmux_mouse_reporting;
                             if application {
                                 let bytes = mouse_bytes(
                                     state.parser.screen(),
@@ -707,6 +734,55 @@ pub struct Terminal {
     share_qr_login: bool,
     share_qr: Option<(String, qr::Code)>,
     sessions: sessions::Manager,
+}
+
+#[cfg(test)]
+pub(crate) fn benchmark_noise_shell() -> String {
+    let python =
+        tmux::find_executable("python3").expect("python3 is required for the output generator");
+    let program = r#"import os, tty, threading, time
+tty.setraw(0)
+lock = threading.Lock()
+def write(data):
+    with lock:
+        os.write(1, data)
+def noise():
+    for i in range(30000):
+        write(b'busy terminal output: 0123456789 abcdefghijklmnopqrstuvwxyz\r\n' * 32)
+        time.sleep(0.001)
+threading.Thread(target=noise, daemon=True).start()
+write(b'\x1b]2;READY\x07')
+while True:
+    key = os.read(0, 1)
+    if not key:
+        break
+    write(b'\x1b]2;KEY_' + key + b'\x07')
+"#;
+    shell_words::join([python.to_string_lossy().as_ref(), "-u", "-c", program])
+}
+
+#[cfg(test)]
+impl Terminal {
+    pub(crate) fn benchmark_start(&mut self, root: &Path, ctx: &egui::Context) {
+        self.direct_pty = true;
+        self.settings.shell = benchmark_noise_shell();
+        self.toggle(root, ctx);
+    }
+    pub(crate) fn benchmark_title(&self) -> String {
+        self.tabs[self.active]
+            .screen
+            .lock()
+            .unwrap()
+            .parser
+            .callbacks()
+            .title
+            .clone()
+    }
+    pub(crate) fn benchmark_focus(&self, ctx: &egui::Context) {
+        ctx.memory_mut(|memory| {
+            memory.request_focus(egui::Id::new(("terminal-input", self.tabs[self.active].id)))
+        });
+    }
 }
 impl Terminal {
     /// Output from any live tab counts, including tabs in hidden workspaces.
@@ -2965,6 +3041,259 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopping_metadata_polling_does_not_wait_for_a_slow_query() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = StatusPoller::spawn(move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let start = Instant::now();
+        drop(worker);
+        assert!(start.elapsed() < Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    #[ignore = "PTY latency benchmark; run with --release --ignored --nocapture"]
+    fn terminal_pty_latency_benchmark() {
+        let ctx = egui::Context::default();
+        let tab = Session::spawn(
+            9001,
+            std::env::temp_dir(),
+            Settings {
+                shell: "/bin/sh -c 'stty -echo -icanon; printf READY; exec cat'".into(),
+                ..Default::default()
+            },
+            ctx,
+        );
+        tab.send(Command::Resize(PtySize {
+            rows: 60,
+            cols: 180,
+            pixel_width: 0,
+            pixel_height: 0,
+        }));
+        wait_for(&tab.screen, |s| {
+            s.parser.screen().contents().ends_with("READY")
+        });
+        // Hold a metadata query in flight during every input round trip.
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let _poller = StatusPoller::spawn(move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut timings = Vec::new();
+        for byte in b'a'..=b't' {
+            let start = Instant::now();
+            assert!(tab.send(Command::Input(vec![byte])));
+            loop {
+                if tab
+                    .screen
+                    .lock()
+                    .unwrap()
+                    .parser
+                    .screen()
+                    .contents()
+                    .ends_with(char::from(byte))
+                {
+                    break;
+                }
+                assert!(start.elapsed() < Duration::from_secs(1));
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            timings.push(start.elapsed());
+        }
+        release_tx.send(()).unwrap();
+        eprintln!("PTY input-to-parsed-echo times with metadata query blocked: {timings:?}");
+        timings.sort();
+        assert!(
+            timings[18] < Duration::from_micros(8_333),
+            "p95 input round trip must fit a 120 Hz interval"
+        );
+    }
+
+    #[test]
+    #[ignore = "busy PTY latency benchmark; requires python3; run with --release --ignored --nocapture"]
+    fn busy_terminal_input_benchmark() {
+        let python =
+            tmux::find_executable("python3").expect("python3 is required for the output generator");
+        let program = r#"import os, tty, threading, time
+tty.setraw(0)
+lock = threading.Lock()
+def write(data):
+    with lock:
+        os.write(1, data)
+def noise():
+    for i in range(4000):
+        write(b'busy terminal output: 0123456789 abcdefghijklmnopqrstuvwxyz\r\n' * 32)
+        time.sleep(0.001)
+threading.Thread(target=noise, daemon=True).start()
+write(b'\x1b]2;READY\x07')
+while True:
+    key = os.read(0, 1)
+    if not key:
+        break
+    write(b'\x1b]2;KEY_' + key + b'\x07')
+"#;
+        let ctx = egui::Context::default();
+        let command = shell_words::join([python.to_string_lossy().as_ref(), "-u", "-c", &program]);
+        let mut tab = Session::spawn(
+            9002,
+            std::env::temp_dir(),
+            Settings {
+                shell: command,
+                ..Default::default()
+            },
+            ctx.clone(),
+        );
+        tab.send(Command::Resize(PtySize {
+            rows: 60,
+            cols: 180,
+            pixel_width: 0,
+            pixel_height: 0,
+        }));
+        wait_for(&tab.screen, |s| s.parser.callbacks().title == "READY");
+        let mut focus = true;
+        let mut time = 0.0;
+        let mut frame = |tab: &mut Session, events| {
+            time += 1.0 / 120.0;
+            let start = Instant::now();
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        render(ui, tab, true, &mut focus, 13.0);
+                    });
+                },
+            );
+            start.elapsed()
+        };
+        frame(&mut tab, vec![]);
+        frame(&mut tab, vec![]);
+        let mut frames = Vec::new();
+        let mut round_trips = Vec::new();
+        for byte in b'a'..=b't' {
+            let start = Instant::now();
+            frames.push(frame(
+                &mut tab,
+                vec![egui::Event::Text(char::from(byte).to_string())],
+            ));
+            let title = format!("KEY_{}", char::from(byte));
+            while tab.screen.lock().unwrap().parser.callbacks().title != title {
+                assert!(
+                    start.elapsed() < Duration::from_secs(1),
+                    "input stalled behind terminal output"
+                );
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            round_trips.push(start.elapsed());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        eprintln!("Busy terminal UI frames: {frames:?}; input-to-parsed-reply: {round_trips:?}");
+        frames.sort();
+        round_trips.sort();
+        assert!(
+            frames[18] < Duration::from_micros(8_333),
+            "busy terminal p95 UI frame must fit 120 Hz"
+        );
+        assert!(
+            round_trips[18] < Duration::from_micros(8_333),
+            "busy terminal p95 input round trip must fit 120 Hz"
+        );
+    }
+
+    #[test]
+    #[ignore = "terminal frame benchmark; run with --release --ignored --nocapture"]
+    fn terminal_input_workload_benchmark() {
+        for (width, height) in [(1400.0, 900.0), (2400.0, 1400.0)] {
+            let ctx = egui::Context::default();
+            let (tx, rx) = mpsc::sync_channel(128);
+            let screen = Arc::new(Mutex::new(ScreenState::default()));
+            let mut tab = Session {
+                id: 1,
+                root: "/project".into(),
+                shell: "test".into(),
+                default_name: "Local".into(),
+                screen: screen.clone(),
+                tx,
+                stopped: Arc::new(AtomicBool::new(false)),
+                killer: Arc::new(Mutex::new(None)),
+                size: (0, 0),
+                selection: None,
+                scroll_remainder: 0.0,
+                view: TerminalView::default(),
+                persistent: None,
+                notice: None,
+            };
+            let mut focus = true;
+            let mut timings = Vec::new();
+            for phase in 0..8 {
+                let events = if phase >= 2 {
+                    vec![egui::Event::Text("x".into())]
+                } else {
+                    vec![]
+                };
+                let start = Instant::now();
+                let mut grid = None;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        time: Some(phase as f64 / 120.0),
+                        events,
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, height),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            grid = Some(render(ui, &mut tab, true, &mut focus, 13.0));
+                        });
+                    },
+                );
+                timings.push(start.elapsed());
+                let commands: Vec<_> = rx.try_iter().collect();
+                if phase >= 2 {
+                    assert!(
+                        commands
+                            .iter()
+                            .any(|c| matches!(c, Command::Input(bytes) if bytes == b"x")),
+                        "each key must reach the input queue in this frame"
+                    );
+                }
+                let mut state = screen.lock().unwrap();
+                if phase == 0 {
+                    let grid = grid.unwrap();
+                    state.parser.screen_mut().set_size(grid.rows, grid.cols);
+                    state.parser.process(
+                        &b"\x1b[32muser@host\x1b[0m output content and history\r\n".repeat(5000),
+                    );
+                } else if phase >= 2 {
+                    state.process_output(b"x", true);
+                }
+            }
+            eprintln!("Terminal {width}x{height}, 5,000 history lines, frame times: {timings:?}");
+            assert!(
+                timings[2..]
+                    .iter()
+                    .all(|t| *t < Duration::from_micros(8_333)),
+                "terminal input frames must fit a 120 Hz budget"
+            );
+        }
+    }
 
     #[test]
     fn terminal_resize_reflows_existing_output_and_restores_full_width() {

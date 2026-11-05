@@ -118,6 +118,7 @@ struct WorktreeSession {
 }
 
 pub struct Coder {
+    profiler: Option<crate::performance::Profiler>,
     worktrees: crate::worktrees::Manager,
     session_store: Option<crate::session::Store>,
     io_context: Option<egui::Context>,
@@ -240,7 +241,9 @@ impl Coder {
             app.terminal.load_settings();
         }
         app.terminal.settings.apply(&cc.egui_ctx);
-        app.session_store = (!capturing)
+        let isolated_profile =
+            std::env::var("GLIMCODE_PROFILE_ISOLATED").is_ok_and(|value| value == "1");
+        app.session_store = (!capturing && !isolated_profile)
             .then(crate::preferences::path)
             .flatten()
             .and_then(|path| {
@@ -252,6 +255,14 @@ impl Coder {
         app.refresh_files();
         if let Some(file) = argument.filter(|p| p.is_file()) {
             app.open(file, None);
+        }
+        if app.profiler.is_some()
+            && let Some(file) = std::env::var_os("GLIMCODE_PROFILE_FILE")
+        {
+            let file = PathBuf::from(file);
+            if file.is_file() {
+                app.open(file, Some((1, 1)));
+            }
         }
         #[cfg(feature = "ui-capture")]
         if let Ok(mode) = std::env::var("CODER_UI_PREVIEW") {
@@ -455,6 +466,7 @@ impl Coder {
 
     fn empty(root: PathBuf) -> Self {
         Self {
+            profiler: crate::performance::Profiler::from_env(),
             worktrees: Default::default(),
             session_store: None,
             io_context: None,
@@ -1832,6 +1844,7 @@ impl Coder {
             self.git_colors = (colors_key, Arc::new(colors));
         }
         let colors = self.git_colors.1.clone();
+        self.tree.set_status_revision(colors_key);
         egui::SidePanel::right("explorer")
             .default_width(285.0)
             .width_range(160.0..=500.0)
@@ -4367,10 +4380,21 @@ impl Coder {
 
 impl eframe::App for Coder {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        let started = self.profiler.as_ref().map(|_| Instant::now());
         self.draw(ctx);
         // Persist session IDs immediately, so an editor crash can reconnect too.
         if self.terminal.take_metadata_changed() {
             self.save_session();
+        }
+        if let (Some(profiler), Some(start)) = (&mut self.profiler, started) {
+            profiler.frame(
+                ctx,
+                start,
+                self.files.len(),
+                self.files_rx.is_some(),
+                self.search_rx.is_some(),
+                self.terminal.visible,
+            );
         }
         #[cfg(feature = "ui-capture")]
         if let Ok(path) = std::env::var("CODER_CAPTURE_TO") {
@@ -5314,6 +5338,60 @@ impl egui::TextBuffer for TrackedText<'_> {
     }
 }
 
+fn source_loading_preview(
+    ui: &mut egui::Ui,
+    text: &str,
+    size: f32,
+    jump: &mut Option<(usize, usize)>,
+    id: egui::Id,
+) {
+    // Keep the editor's focus target alive while its full geometry is prepared.
+    // Keyboard events can then be deferred even when opening without a jump.
+    let response = ui.interact(ui.available_rect_before_wrap(), id, egui::Sense::click());
+    if response.clicked() {
+        response.request_focus();
+    }
+    let mut starts = vec![0];
+    starts.extend(text.match_indices('\n').map(|(byte, _)| byte + 1));
+    let height = ui.fonts_mut(|fonts| fonts.row_height(&FontId::monospace(size)));
+    let mut scroll = egui::ScrollArea::both().id_salt("source-scroll");
+    if let Some((line, _)) = jump {
+        scroll = scroll.vertical_scroll_offset(line.saturating_sub(1) as f32 * height);
+    }
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        scroll.show_rows(ui, height, starts.len(), |ui, rows| {
+            for row in rows {
+                let end = starts.get(row + 1).copied().unwrap_or(text.len());
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [62.0 * size / 13.0, height],
+                        egui::Label::new(
+                            RichText::new((row + 1).to_string())
+                                .monospace()
+                                .size(size)
+                                .color(chrome::MUTED),
+                        ),
+                    );
+                    let response = ui.add(
+                        egui::Label::new(
+                            RichText::new(text[starts[row]..end].trim_end_matches('\n'))
+                                .monospace()
+                                .size(size),
+                        )
+                        .extend()
+                        .sense(egui::Sense::click()),
+                    );
+                    if response.clicked() {
+                        *jump = Some((row + 1, 1));
+                        ui.memory_mut(|memory| memory.request_focus(id));
+                    }
+                });
+            }
+        });
+    });
+}
+
 fn text_editor(
     ui: &mut egui::Ui,
     text: &mut dyn egui::TextBuffer,
@@ -5327,6 +5405,31 @@ fn text_editor(
     let font_size = crate::preferences::editor_font_size(ui.ctx());
     *editor_id = Some(id);
     apply_undo_budget(ui, id, text.as_str().len());
+    let (source_hash, large) = find.snapshot.unwrap_or_else(|| {
+        (
+            egui::util::hash(text.as_str()),
+            crate::editor_analysis::is_large(text.as_str()),
+        )
+    });
+    if large
+        && !crate::editor_layout::prepare(
+            ui,
+            id,
+            text.as_str(),
+            &FontId::monospace(font_size),
+            if ui.visuals().dark_mode {
+                chrome::TEXT
+            } else {
+                Color32::BLACK
+            },
+        )
+    {
+        if jump.is_some() || ui.memory(|memory| memory.has_focus(id)) {
+            crate::editor_layout::defer_input(ui, id);
+        }
+        source_loading_preview(ui, text.as_str(), font_size, jump, id);
+        return (false, None, None);
+    }
     let find_offset = find
         .active
         .as_ref()
@@ -5383,12 +5486,6 @@ fn text_editor(
         .ctx()
         .data_mut(|data| data.get_temp::<crate::folding::State>(fold_id))
         .unwrap_or_default();
-    let (source_hash, large) = find.snapshot.unwrap_or_else(|| {
-        (
-            egui::util::hash(text.as_str()),
-            crate::editor_analysis::is_large(text.as_str()),
-        )
-    });
     folds.sync(source_hash);
     let analysis = large
         .then(|| crate::editor_analysis::get_keyed(ui, text.as_str(), path, source_hash))
@@ -5421,6 +5518,9 @@ fn text_editor(
     }
     let active_folds = folds.active(fold_regions);
     let editor_layout = crate::editor_analysis::layout_cache(ui, id);
+    if large {
+        crate::editor_layout::keep_alive(ui, id);
+    }
     let edits = std::cell::Cell::new(0_u64);
     let layout_fingerprint = std::cell::Cell::new((0_u64, source_hash));
     let folded = egui::util::hash(&folds.collapsed);
@@ -5431,7 +5531,9 @@ fn text_editor(
             layout_fingerprint.set((edits.get(), buffer_hash));
         }
         let syntax = analysis.as_ref().filter(|_| buffer_hash == source_hash);
-        let layout_key = egui::util::hash((
+        let viewport =
+            (large && active_folds.is_empty()).then(|| crate::editor_layout::viewport_key(ui));
+        let style_key = egui::util::hash((
             buffer_hash,
             syntax.map(|a| a.key),
             font_size.to_bits(),
@@ -5441,10 +5543,26 @@ fn text_editor(
             &find.active,
             folded,
         ));
+        let layout_key = egui::util::hash((style_key, viewport));
         if let Some(cached) = editor_layout.lock().unwrap().as_ref()
             && cached.key == layout_key
         {
             return cached.galley.clone();
+        }
+        if large
+            && let Some(galley) =
+                crate::editor_layout::repaint_viewport(ui, id, style_key, viewport)
+        {
+            let galley = if buffer_hash == source_hash {
+                crate::folding::layout(galley, &active_folds)
+            } else {
+                galley
+            };
+            *editor_layout.lock().unwrap() = Some(crate::editor_analysis::CachedLayout {
+                key: layout_key,
+                galley: galley.clone(),
+            });
+            return galley;
         }
         let mut job = if large {
             syntax.map_or_else(
@@ -5484,7 +5602,11 @@ fn text_editor(
             }
         }
 
-        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        let galley = if large {
+            crate::editor_layout::layout_visible_keyed(ui, id, job, viewport, style_key)
+        } else {
+            ui.fonts_mut(|fonts| fonts.layout_job(job))
+        };
         // Edits always lay out the full new buffer; anchors are rebuilt next frame.
         let galley = if buffer_hash == source_hash {
             crate::folding::layout(galley, &active_folds)
@@ -6207,6 +6329,57 @@ mod tests {
     }
 
     #[test]
+    fn typing_during_cold_layout_is_replayed_once_after_preparation() {
+        let ctx = egui::Context::default();
+        let original = (0..5000)
+            .map(|i| format!("const value{i} = 1;\n"))
+            .collect::<String>();
+        let mut text = original.clone();
+        let mut cursor = 0;
+        let mut jump = Some((1, 1));
+        let mut id = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut first = true;
+        loop {
+            let events = if first {
+                first = false;
+                vec![egui::Event::Text("猫".into())]
+            } else {
+                vec![]
+            };
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        text_editor(
+                            ui,
+                            &mut text,
+                            Path::new("cold.ts"),
+                            &mut cursor,
+                            &mut jump,
+                            &mut id,
+                            EditorFind::default(),
+                        );
+                    });
+                },
+            );
+            if text != original {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(text, format!("猫{original}"));
+    }
+
+    #[test]
     fn layout_cache_reuses_idle_frames_and_invalidates_same_length_replacements() {
         for lines in [1_500, 10_000] {
             let ctx = egui::Context::default();
@@ -6217,35 +6390,46 @@ mod tests {
             let mut id = None;
             let mut frame = |events| {
                 let mut result = None;
-                let _ = ctx.run(
-                    egui::RawInput {
-                        screen_rect: Some(egui::Rect::from_min_size(
-                            egui::Pos2::ZERO,
-                            egui::vec2(900.0, 600.0),
-                        )),
-                        events,
-                        ..Default::default()
-                    },
-                    |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            text_editor(
-                                ui,
-                                &mut text,
-                                path,
-                                &mut cursor,
-                                &mut jump,
-                                &mut id,
-                                EditorFind::default(),
-                            );
-                            result = crate::editor_analysis::layout_cache(ui, id.unwrap())
-                                .lock()
-                                .unwrap()
-                                .as_ref()
-                                .map(|cached| cached.galley.clone());
-                        });
-                    },
-                );
-                (result.unwrap(), id.unwrap())
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut events = events;
+                loop {
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(900.0, 600.0),
+                            )),
+                            events: std::mem::take(&mut events),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                text_editor(
+                                    ui,
+                                    &mut text,
+                                    path,
+                                    &mut cursor,
+                                    &mut jump,
+                                    &mut id,
+                                    EditorFind::default(),
+                                );
+                                result = crate::editor_analysis::layout_cache(ui, id.unwrap())
+                                    .lock()
+                                    .unwrap()
+                                    .as_ref()
+                                    .map(|cached| cached.galley.clone());
+                            });
+                        },
+                    );
+                    if let Some(result) = result {
+                        break (result, id.unwrap());
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "geometry preparation did not finish"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             };
             frame(Vec::new());
             let (idle, _) = frame(Vec::new());
@@ -6792,6 +6976,260 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "combined IDE stress benchmark; creates 2,000 search files and a synthetic 2M-file index; requires python3"]
+    fn combined_ide_stress_benchmark() -> anyhow::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().to_path_buf();
+        let source = (0..5000)
+            .map(|i| format!("const entry{i} = {{ value: 'sample content' }};\n"))
+            .collect::<String>();
+        let source_path = root.join("source.ts");
+        std::fs::write(&source_path, &source)?;
+        let search_source = "export const sample = 'search fixture content';\n".repeat(160);
+        for i in 0..2000 {
+            std::fs::write(root.join(format!("search{i:04}.ts")), &search_source)?;
+        }
+        let ctx = egui::Context::default();
+        let mut app = Coder::empty(root.clone());
+        app.open(source_path.clone(), Some((1, 1)));
+        app.terminal.benchmark_start(&root, &ctx);
+        let mut clock = 0.0;
+        let mut render = |app: &mut Coder, events| {
+            clock += 1.0 / 120.0;
+            let start = Instant::now();
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(clock),
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1800.0, 1200.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+            start.elapsed()
+        };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while app.terminal.benchmark_title() != "READY" {
+            render(&mut app, vec![]);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..5 {
+            render(&mut app, vec![]);
+        }
+        let (tx, rx) = mpsc::channel();
+        app.files_rx = Some(rx);
+        app.files_checked = Instant::now() + Duration::from_secs(60);
+        let index_root = root.clone();
+        let indexing = Arc::new(AtomicBool::new(true));
+        let working = indexing.clone();
+        let indexer = std::thread::spawn(move || {
+            let mut files: Vec<_> = (0..2_000_000)
+                .map(|i| index_root.join(format!("dir{:04}/file{:04}.ts", i / 1000, i % 1000)))
+                .collect();
+            files.push(source_path);
+            files.sort_unstable();
+            let tree =
+                crate::explorer::FileTree::build_cancellable(&index_root, &files, &[], || false)
+                    .unwrap();
+            let _ = tx.send(Ok(Some(WorkspaceIndex {
+                paths: navigation::WorkspacePaths {
+                    files,
+                    folders: Vec::new(),
+                },
+                tree,
+            })));
+            working.store(false, Ordering::Relaxed);
+        });
+        app.query = "never_present_in_the_fixture".into();
+        app.search_docked = true;
+        let mut frames = Vec::new();
+        let mut replies = Vec::new();
+        let mut overlap = 0;
+        let mut indexed = 0;
+        let mut completed_frames = 0;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while indexing.load(Ordering::Relaxed) || completed_frames < 30 {
+            if app.search_rx.is_none() {
+                app.run_search(SearchKind::Text, false);
+            }
+            let started = Instant::now();
+            if indexing.load(Ordering::Relaxed) && app.search_rx.is_some() {
+                overlap += 1;
+            }
+            app.terminal.benchmark_focus(&ctx);
+            let byte = b'a' + (frames.len() % 20) as u8;
+            frames.push(render(
+                &mut app,
+                vec![egui::Event::Text(char::from(byte).to_string())],
+            ));
+            let title = format!("KEY_{}", char::from(byte));
+            while app.terminal.benchmark_title() != title {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "terminal input stalled"
+                );
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            replies.push(started.elapsed());
+            indexed = indexed.max(app.files.len());
+            if !indexing.load(Ordering::Relaxed) {
+                completed_frames += 1;
+            }
+            assert!(Instant::now() < deadline);
+            if let Some(delay) = Duration::from_micros(8_333).checked_sub(started.elapsed()) {
+                std::thread::sleep(delay);
+            }
+        }
+        indexer.join().unwrap();
+        assert!(
+            overlap >= 10,
+            "indexing, search and terminal input must overlap"
+        );
+        assert_eq!(indexed, 2_000_001);
+        assert!(
+            matches!(&app.documents[0].content, Content::Text(text) if text.as_str() == source.as_str())
+        );
+        frames.sort();
+        replies.sort();
+        let quantile = |values: &[Duration], q: usize| {
+            values[(values.len() - 1) * q / 100].as_secs_f64() * 1000.0
+        };
+        let report = serde_json::json!({ "frames": frames.len(), "overlapping_frames": overlap, "synthetic_indexed_files": indexed, "real_search_fixture_files": 2000,
+            "frame_p50_ms": quantile(&frames,50), "frame_p95_ms": quantile(&frames,95), "frame_p99_ms": quantile(&frames,99), "frame_max_ms": frames.last().unwrap().as_secs_f64()*1000.0,
+            "input_reply_p95_ms": quantile(&replies,95), "input_reply_p99_ms": quantile(&replies,99), "input_reply_max_ms": replies.last().unwrap().as_secs_f64()*1000.0 });
+        eprintln!("Combined IDE stress: {report}");
+        std::fs::create_dir_all("target/performance")?;
+        std::fs::write(
+            "target/performance/combined-stress.json",
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        assert!(
+            quantile(&frames, 99) < 1000.0 / 120.0,
+            "p99 frame exceeds 120 Hz budget"
+        );
+        assert!(
+            quantile(&replies, 99) < 1000.0 / 120.0,
+            "p99 terminal reply exceeds 120 Hz budget"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "source workload benchmark; run with --release --ignored --nocapture"]
+    fn source_workload_benchmark() {
+        for lines in [100, 1000, 5000] {
+            let ctx = egui::Context::default();
+            let mut source = (0..lines)
+                .map(|i| format!("const value{i} = input.trim(); // some sample content\n"))
+                .collect::<String>();
+            // File opening happens after the application's font/UI startup.
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(
+                        RichText::new("const value = input.trim(); // 0123456789").monospace(),
+                    );
+                });
+            });
+            let mut cursor = 0;
+            let mut jump = Some((1, 1));
+            let mut editor_id = None;
+            let mut timings = Vec::new();
+            for phase in 0..5 {
+                let start = Instant::now();
+                let _ = ctx.run(
+                    egui::RawInput {
+                        time: Some(phase as f64 * 0.05),
+                        events: if phase == 2 {
+                            vec![egui::Event::Text("x".into())]
+                        } else {
+                            vec![]
+                        },
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1400.0, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            text_editor(
+                                ui,
+                                &mut source,
+                                Path::new("probe.ts"),
+                                &mut cursor,
+                                &mut jump,
+                                &mut editor_id,
+                                EditorFind::default(),
+                            );
+                        });
+                    },
+                );
+                timings.push(start.elapsed());
+                if phase == 0 && lines >= 1000 {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let mut cold_frames = Vec::new();
+                    while !crate::editor_layout::ready(&ctx, editor_id.unwrap()) {
+                        let tick = Instant::now();
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(1400.0, 900.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    text_editor(
+                                        ui,
+                                        &mut source,
+                                        Path::new("probe.ts"),
+                                        &mut cursor,
+                                        &mut jump,
+                                        &mut editor_id,
+                                        EditorFind::default(),
+                                    );
+                                });
+                            },
+                        );
+                        cold_frames.push(tick.elapsed());
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    eprintln!("{lines} lines: cold preparation UI frames: {cold_frames:?}");
+                    cold_frames.sort();
+                    assert!(
+                        cold_frames[cold_frames.len() * 95 / 100] < Duration::from_micros(8_333)
+                    );
+                    assert!(
+                        timings[0] < Duration::from_micros(8_333),
+                        "first visible file frame must fit 120 Hz"
+                    );
+                }
+                if phase == 2 {
+                    assert!(
+                        source.starts_with('x'),
+                        "typing must update the complete source buffer"
+                    );
+                }
+            }
+            assert!(
+                timings[2] < Duration::from_micros(8_333)
+                    && timings[4] < Duration::from_micros(8_333),
+                "typing and cached editor frames must fit a 120 Hz frame budget"
+            );
+            eprintln!(
+                "{lines} lines / {} bytes: open, idle, type, next frame, idle: {timings:?}",
+                source.len()
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "large-file performance check; run with --release --ignored --nocapture"]
     fn large_typescript_editor_benchmark() {
         let ctx = egui::Context::default();
@@ -6843,6 +7281,15 @@ mod tests {
             source.lines().count()
         );
         let (initial, _, _) = frame(&mut source, vec![], None);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ctx
+            .memory(|memory| memory.focused())
+            .is_some_and(|id| crate::editor_layout::ready(&ctx, id))
+        {
+            frame(&mut source, vec![], None);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
         let (steady, _, _) = frame(&mut source, vec![], None);
         // Editing must preserve the full buffer, including the final lines.
         let before = source.clone();

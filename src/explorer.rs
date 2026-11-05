@@ -71,6 +71,7 @@ pub fn context_menu(
 
 #[derive(Default)]
 pub struct FileTree {
+    large: Option<crate::project_tree::LargeTree>,
     pub action: Option<FileAction>,
     pub diff: Option<PathBuf>,
     children: BTreeMap<OsString, FileTree>,
@@ -83,7 +84,17 @@ pub struct FileTree {
 }
 
 impl FileTree {
+    pub fn set_status_revision(&mut self, revision: u64) {
+        if let Some(tree) = &mut self.large {
+            tree.set_status_revision(revision);
+        }
+    }
+
     pub fn expand_all(&mut self, open: bool) {
+        if let Some(tree) = &mut self.large {
+            tree.expand_all(open);
+            return;
+        }
         for child in self.children.values_mut() {
             child.open_override = Some(open);
             child.expand_all(open);
@@ -102,6 +113,12 @@ impl FileTree {
         let Ok(relative) = path.strip_prefix(root) else {
             return;
         };
+        if let Some(tree) = &mut self.large {
+            tree.reveal(path);
+            self.reveal_target = Some(path.to_owned());
+            self.reveal_requested = true;
+            return;
+        }
         let mut node = &mut *self;
         for component in relative.components() {
             node = node
@@ -129,6 +146,14 @@ impl FileTree {
         folders: &[PathBuf],
         cancelled: impl Fn() -> bool,
     ) -> Option<Self> {
+        if files.len() >= crate::project_tree::THRESHOLD {
+            return Some(Self {
+                large: Some(crate::project_tree::LargeTree::build(
+                    root, files, folders, &cancelled,
+                )?),
+                ..Default::default()
+            });
+        }
         let mut tree = Self::default();
         for (path, file) in files
             .iter()
@@ -168,6 +193,13 @@ impl FileTree {
             fresh.reveal_path(root, &target);
             fresh.reveal_requested = pending;
         }
+        if let (Some(previous), Some(next)) = (&mut self.large, &mut fresh.large) {
+            next.adopt(previous);
+            if let Some(target) = fresh.reveal_target.as_deref() {
+                next.reveal(target);
+            }
+            return std::mem::replace(self, fresh);
+        }
         fn commands(old: &mut FileTree, fresh: &mut FileTree) {
             fresh.open_override = old.open_override.take();
             for (name, child) in &mut old.children {
@@ -195,6 +227,10 @@ impl FileTree {
         let extras: BTreeSet<_> = extras
             .filter(|path| files.binary_search(path).is_err())
             .collect();
+        if let Some(tree) = &mut self.large {
+            tree.set_extras(extras);
+            return;
+        }
         fn remove(tree: &mut FileTree, parts: &[OsString], path: &Path, folders: &[PathBuf]) {
             let Some((name, rest)) = parts.split_first() else {
                 return;
@@ -345,6 +381,27 @@ impl FileTree {
         self.last_active = active.map(Path::to_path_buf);
         let target = self.reveal_target.clone();
         let selected = target.as_deref().or(active);
+        if let Some(tree) = &mut self.large {
+            if requested || active_changed {
+                if let Some(path) = selected {
+                    tree.reveal(path);
+                }
+            }
+            let opened = tree.show(
+                ui,
+                selected,
+                filter,
+                colors,
+                changed_only,
+                hide_tests,
+                &mut self.action,
+                &mut self.diff,
+            );
+            if opened.is_some() {
+                self.reveal_target = None;
+            }
+            return opened;
+        }
         let opened = self.show_children(
             ui,
             root,

@@ -37,6 +37,8 @@ Result rows in **Find in Files** are syntax colored: every file behind the visib
 
 The same holds for the work a frame does: the syntax colors of a document are computed once per change and shared by the editor and the panels that show it, a search hands over only the buffers that changed, and a click does not copy the file it happens in.
 
+**Performance target: 120 Hz responsiveness** (8.33 ms per complete frame) for scrolling, terminal typing, editor typing, and tab switching with **1,000–5,000-line source files in repositories containing 2 million files**. This is a performance acceptance target; end-to-end smoothness at that scale has not yet been validated on a real repository. Terminal input takes priority: session metadata queries run separately from the PTY writer. Source files with at least 1,000 lines or 64 KiB use background syntax and structure analysis, cold geometry preparation also runs on a worker, and edits reuse the glyph meshes of unchanged lines. The first viewport is shown immediately; only visible rows need new meshes. Large repositories use an immutable directory index and a virtualized file tree: filtering and row projection run on cancellable workers, and drawing touches only the visible rows. Indexing and searches can take time while the UI stays interactive.
+
 The architecture is designed to keep memory overhead low. **We do not yet publish a measured RAM comparison with IntelliJ or a fixed memory-usage promise.** Usage depends on project size, open files, terminal sessions, and workload. Reproducible performance measurements and improvements are welcome.
 
 ## Built for the work around AI-generated code
@@ -249,6 +251,20 @@ cargo build --release --locked
 ```
 
 Tests cover navigation, Unicode handling, search, highlighting, CSV round trips and UI interactions, saving, Git views, terminal behavior, and native layouts. Sample files live in [`examples/`](examples/).
+
+Run the focused source-file and repository-scale benchmarks separately in release mode:
+
+```sh
+cargo test --release source_workload_benchmark -- --ignored --nocapture
+cargo test --release two_million_file_tree_benchmark -- --ignored --nocapture
+cargo test --release terminal_input_workload_benchmark -- --ignored --nocapture
+cargo test --release terminal_pty_latency_benchmark -- --ignored --nocapture
+cargo test --release busy_terminal_input_benchmark -- --ignored --nocapture
+cargo test --release combined_ide_stress_benchmark -- --ignored --nocapture
+```
+
+The first measures opening, typing, and cached frames for 100, 1,000, and 5,000 lines. The second constructs a synthetic two-million-file index, expands every folder, and checks that rendering at different scroll positions emits only viewport-sized output. The terminal benchmarks check input frames with 5,000 history lines and real PTY echo round trips while a metadata query is blocked, and input latency during continuous output (the busy-output generator requires Python 3). These are headless component benchmarks; filesystem traversal, GPU presentation, and complete interactive sessions on a real repository require separate measurement. The combined stress check overlaps indexing, search, continuous PTY output and typing in the complete IDE. See [performance checks and live tracing](docs/PERFORMANCE.md) for tail-latency reports and native event/GPU timing capture.
+
 
 The Markdown preview uses Comrak for parsing and native widgets for display; see [`vendor/egui_commonmark/PATCHES.md`](vendor/egui_commonmark/PATCHES.md) for the renderer adapter.
 

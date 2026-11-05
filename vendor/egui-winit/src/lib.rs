@@ -269,6 +269,45 @@ impl State {
     ) -> EventResponse {
         profiling::function_scope!(short_window_event_description(event));
 
+        // Opt-in native event timestamps consumed by Glimcode's frame profiler.
+        // Store counts and arrival times only; never key contents.
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TRACE.get_or_init(|| std::env::var_os("GLIMCODE_PROFILE_PATH").is_some()) {
+            let input = matches!(
+                event,
+                winit::event::WindowEvent::KeyboardInput {
+                    event: winit::event::KeyEvent {
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                    is_synthetic: false,
+                    ..
+                } | winit::event::WindowEvent::MouseWheel { .. }
+                    | winit::event::WindowEvent::MouseInput {
+                        state: ElementState::Pressed,
+                        ..
+                    }
+                    | winit::event::WindowEvent::Ime(winit::event::Ime::Commit(_))
+            );
+            if input {
+                self.egui_ctx.data_mut(|data| {
+                    let id = egui::Id::new("glimcode-native-input-timing");
+                    let (at, count) = data
+                        .get_temp::<(std::time::Instant, u64)>(id)
+                        .unwrap_or((std::time::Instant::now(), 0));
+                    data.insert_temp(id, (at, count + 1));
+                });
+            }
+            if let Some(hz) = window
+                .current_monitor()
+                .and_then(|monitor| monitor.refresh_rate_millihertz())
+            {
+                self.egui_ctx.data_mut(|data| {
+                    data.insert_temp(egui::Id::new("glimcode-monitor-hz"), hz as f32 / 1000.0)
+                });
+            }
+        }
+
         #[cfg(feature = "accesskit")]
         if let Some(accesskit) = self.accesskit.as_mut() {
             accesskit.process_event(window, event);
@@ -821,7 +860,11 @@ impl State {
                     self.egui_input.events.push(egui::Event::Copy);
                     return;
                 } else if is_paste_command(self.egui_input.modifiers, active_key) {
-                    let contents = self.clipboard.get().unwrap_or_default().replace("\r\n", "\n");
+                    let contents = self
+                        .clipboard
+                        .get()
+                        .unwrap_or_default()
+                        .replace("\r\n", "\n");
                     // Preserve image-only paste commands for custom widgets.
                     self.egui_input.events.push(egui::Event::Paste(contents));
                     return;
