@@ -14,18 +14,27 @@ const FILES: u8 = 1;
 const GIT: u8 = 2;
 const FAILED: u8 = 4;
 const METADATA: u8 = 8;
+const RESCAN: u8 = 16;
+const GIT_RESCAN: u8 = 32;
+const POLICY: u8 = 64;
+const EXTERNAL: u8 = 128;
 
 #[derive(Default)]
 pub struct Changes {
     pub files: bool,
     pub git: bool,
     pub git_metadata: bool,
+    pub paths: Option<Vec<PathBuf>>,
+    pub git_paths: Option<Vec<PathBuf>>,
+    pub policy: bool,
+    pub external: bool,
 }
 
 #[derive(Clone)]
 struct WatchIndex {
     files: Arc<Vec<PathBuf>>,
     folders: Arc<Vec<PathBuf>>,
+    delta: Arc<crate::workspace_delta::Delta>,
 }
 
 type DirectoryUpdate = (Arc<Vec<PathBuf>>, Option<WatchIndex>);
@@ -39,6 +48,9 @@ pub struct WorkspaceWatch {
     flags: Arc<AtomicU8>,
     pending: u8,
     since: Option<Instant>,
+    event_paths: Arc<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>>,
+    git_paths: Arc<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>>,
+    external: Arc<std::sync::Mutex<Option<PathBuf>>>,
 }
 
 fn indexed(paths: &[PathBuf], path: &Path) -> bool {
@@ -84,25 +96,49 @@ fn filter_event(root: &Path, index: Option<&WatchIndex>, event: &mut Event) -> u
             let Some(index) = index else {
                 return true;
             }; // initial index is still being built
-            if path == root || indexed(&index.files, path) || indexed(&index.folders, path) {
-                return true;
-            }
             let configuration = matches!(
                 path.file_name().and_then(|name| name.to_str()),
                 Some(".gitignore" | ".ignore" | ".rgignore")
             );
+            if path
+                .parent()
+                .is_some_and(|parent| index.delta.hidden(parent, true))
+            {
+                return false;
+            }
+            if !membership
+                && !configuration
+                && index.delta.hidden(path, indexed(&index.folders, path))
+            {
+                return false;
+            }
+            if path == root
+                || indexed(&index.files, path)
+                || indexed(&index.folders, path)
+                || index.delta.files.contains(path)
+                || index.delta.folders.contains(path)
+            {
+                return true;
+            }
             // A new entry in a visible directory needs a scan to apply its
             // ignore rules. Events inside an excluded subtree never do.
             (membership || configuration)
-                && path
-                    .parent()
-                    .is_some_and(|parent| parent == root || indexed(&index.folders, parent))
+                && path.parent().is_some_and(|parent| {
+                    parent == root
+                        || indexed(&index.folders, parent)
+                        || index.delta.folders.contains(parent)
+                })
         });
         if event.paths.is_empty() {
             return 0;
         }
     }
-    classify(event)
+    let bits = classify(event);
+    if bits != 0 && event.paths.iter().any(|path| !path.starts_with(root)) {
+        bits | METADATA
+    } else {
+        bits
+    }
 }
 
 fn git_directories(root: &Path) -> Vec<PathBuf> {
@@ -172,6 +208,14 @@ impl WorkspaceWatch {
         let worker_flags = flags.clone();
         let index = Arc::new(std::sync::RwLock::new(None::<WatchIndex>));
         let event_index = index.clone();
+        #[cfg(not(target_os = "macos"))]
+        let registration_index = index.clone();
+        let event_paths = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let collected = event_paths.clone();
+        let git_paths = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let git_changes = git_paths.clone();
+        let external = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let observed_external = external.clone();
         let ctx = ctx.clone();
         let watch_root = root.to_path_buf();
         let (tx, rx) = mpsc::channel();
@@ -183,7 +227,45 @@ impl WorkspaceWatch {
                 let bits = event
                     .map(|mut event| {
                         let index = event_index.read().unwrap();
-                        filter_event(&event_root, index.as_ref(), &mut event)
+                        let mut bits = filter_event(&event_root, index.as_ref(), &mut event);
+                        if bits & FILES != 0 {
+                            let mut paths = collected.lock().unwrap();
+                            let full = event.need_rescan()
+                                || event.paths.is_empty()
+                                || event.paths.iter().any(|p| {
+                                    p == &event_root
+                                        || matches!(
+                                            p.file_name().and_then(|n| n.to_str()),
+                                            Some(
+                                                ".gitignore"
+                                                    | ".ignore"
+                                                    | ".rgignore"
+                                                    | "exclude"
+                                                    | ".git"
+                                            )
+                                        )
+                                });
+                            if full || paths.len() + event.paths.len() > 4096 {
+                                bits |= RESCAN;
+                                paths.clear();
+                            } else {
+                                paths.extend(event.paths.iter().cloned());
+                            }
+                        }
+                        if bits & GIT != 0 {
+                            let mut paths = git_changes.lock().unwrap();
+                            if bits & (RESCAN | METADATA) != 0
+                                || event.paths.is_empty()
+                                || event.paths.iter().any(|p| p == &event_root)
+                                || paths.len() + event.paths.len() > 512
+                            {
+                                bits |= GIT_RESCAN;
+                                paths.clear();
+                            } else {
+                                paths.extend(event.paths);
+                            }
+                        }
+                        bits
                     })
                     .unwrap_or(FILES | GIT | FAILED);
                 if bits != 0 && output.fetch_or(bits, Ordering::Relaxed) & (FILES | GIT) == 0 {
@@ -204,6 +286,7 @@ impl WorkspaceWatch {
                     watcher = None;
                 }
             }
+            let mut watched_git = std::collections::BTreeSet::new();
             if let Some(watch) = watcher.as_mut() {
                 for directory in git_directories(&watch_root) {
                     for path in [
@@ -221,6 +304,8 @@ impl WorkspaceWatch {
                         };
                         if watch.watch(&path, mode).is_err() {
                             worker_flags.fetch_or(FILES | GIT | FAILED, Ordering::Relaxed);
+                        } else {
+                            watched_git.insert(path);
                         }
                     }
                 }
@@ -229,9 +314,70 @@ impl WorkspaceWatch {
             ctx.request_repaint();
             #[cfg(not(target_os = "macos"))]
             let mut watched = std::collections::BTreeSet::from([watch_root.clone()]);
-            while let Ok(mut update) = directories.recv() {
+            let policy_path = crate::preferences::global_ignore_path();
+            let stamp = || {
+                policy_path
+                    .as_ref()
+                    .and_then(|path| std::fs::metadata(path).ok())
+                    .and_then(|meta| Some((meta.modified().ok()?, meta.len())))
+            };
+            let mut external_path = None;
+            let mut external_stamp = None;
+            let mut policy_stamp = stamp();
+            let mut policy_checked = Instant::now();
+            loop {
+                if policy_checked.elapsed() >= Duration::from_secs(2) {
+                    let path = observed_external.lock().unwrap().clone();
+                    let next_external = path
+                        .as_ref()
+                        .and_then(|path| std::fs::metadata(path).ok())
+                        .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+                    if path != external_path || next_external != external_stamp {
+                        if path.is_some() {
+                            worker_flags.fetch_or(EXTERNAL, Ordering::Relaxed);
+                            ctx.request_repaint();
+                        }
+                        external_path = path;
+                        external_stamp = next_external;
+                    }
+                    let next = stamp();
+                    if next != policy_stamp {
+                        worker_flags.fetch_or(POLICY, Ordering::Relaxed);
+                        ctx.request_repaint();
+                        policy_stamp = next;
+                    }
+                    policy_checked = Instant::now();
+                }
+                let mut update = match directories.recv_timeout(Duration::from_secs(2)) {
+                    Ok(update) => update,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 for next in directories.try_iter() {
                     update = next;
+                }
+                if let Some(watch) = watcher.as_mut() {
+                    for directory in git_directories(&watch_root) {
+                        for path in [
+                            directory.clone(),
+                            directory.join("info"),
+                            directory.join("refs"),
+                        ] {
+                            if watched_git.contains(&path) || !path.is_dir() {
+                                continue;
+                            }
+                            let mode = if path.ends_with("refs") {
+                                RecursiveMode::Recursive
+                            } else {
+                                RecursiveMode::NonRecursive
+                            };
+                            if watch.watch(&path, mode).is_err() {
+                                worker_flags.fetch_or(FILES | GIT | FAILED, Ordering::Relaxed);
+                            } else {
+                                watched_git.insert(path);
+                            }
+                        }
+                    }
                 }
                 // Old immutable index snapshots are retired here, off the UI thread.
                 let (folders, old_index) = update;
@@ -240,9 +386,17 @@ impl WorkspaceWatch {
                 let _ = folders;
                 #[cfg(not(target_os = "macos"))]
                 if let Some(watch) = watcher.as_mut() {
+                    let delta = registration_index
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .map(|index| index.delta.clone())
+                        .unwrap_or_default();
                     let wanted: std::collections::BTreeSet<_> = folders
                         .iter()
+                        .filter(|p| !delta.hidden(p, true))
                         .cloned()
+                        .chain(delta.folders.iter().cloned())
                         .chain(std::iter::once(watch_root.clone()))
                         .collect();
                     let added = wanted.difference(&watched).count();
@@ -277,6 +431,9 @@ impl WorkspaceWatch {
             flags,
             pending: 0,
             since: None,
+            event_paths,
+            git_paths,
+            external,
         }
     }
 
@@ -287,11 +444,13 @@ impl WorkspaceWatch {
         }) {
             return;
         }
+        let delta = index.as_ref().map(|i| i.delta.clone()).unwrap_or_default();
         let old = std::mem::replace(
             &mut *index,
             Some(WatchIndex {
                 files,
                 folders: folders.clone(),
+                delta,
             }),
         );
         drop(index);
@@ -300,6 +459,26 @@ impl WorkspaceWatch {
         {
             std::thread::spawn(move || drop(error.0));
         }
+    }
+
+    pub fn set_delta(&mut self, delta: Arc<crate::workspace_delta::Delta>) {
+        let mut index = self.index.write().unwrap();
+        if let Some(index) = index.as_mut() {
+            let old = std::mem::replace(&mut index.delta, delta);
+            let folders = index.folders.clone();
+            let retirement = WatchIndex {
+                files: index.files.clone(),
+                folders: folders.clone(),
+                delta: old,
+            };
+            if let Some(updates) = &self.updates {
+                let _ = updates.send((folders, Some(retirement)));
+            }
+        }
+    }
+
+    pub fn set_external_file(&mut self, path: Option<PathBuf>) {
+        *self.external.lock().unwrap() = path;
     }
 
     pub fn root(&self) -> &Path {
@@ -327,7 +506,7 @@ impl WorkspaceWatch {
             }
         }
         let flags = self.flags.fetch_and(FAILED, Ordering::Relaxed);
-        self.pending |= flags & (FILES | GIT | METADATA);
+        self.pending |= flags & (FILES | GIT | METADATA | RESCAN | GIT_RESCAN | POLICY | EXTERNAL);
         if self.pending != 0 {
             let since = *self.since.get_or_insert(now);
             if now.saturating_duration_since(since) >= Duration::from_millis(200) {
@@ -337,6 +516,18 @@ impl WorkspaceWatch {
                     files: pending & FILES != 0,
                     git: pending & GIT != 0,
                     git_metadata: pending & METADATA != 0,
+                    policy: pending & POLICY != 0,
+                    external: pending & EXTERNAL != 0,
+                    git_paths: {
+                        let paths = std::mem::take(&mut *self.git_paths.lock().unwrap());
+                        (pending & GIT_RESCAN == 0 && !paths.is_empty())
+                            .then(|| paths.into_iter().collect())
+                    },
+                    paths: {
+                        let paths = std::mem::take(&mut *self.event_paths.lock().unwrap());
+                        (pending & RESCAN == 0 && !paths.is_empty())
+                            .then(|| paths.into_iter().collect())
+                    },
                 };
             }
         }
@@ -379,6 +570,7 @@ mod tests {
         let index = WatchIndex {
             files: Arc::new(paths.files),
             folders: Arc::new(paths.folders),
+            delta: Arc::default(),
         };
         for name in [
             "node_modules/pkg/new.ts",
@@ -440,12 +632,29 @@ mod tests {
             let changes = watch.poll(Instant::now());
             if changes.files {
                 assert!(changes.git);
+                assert!(
+                    changes
+                        .paths
+                        .as_ref()
+                        .is_some_and(|paths| paths.contains(&root.join("new.ts"))),
+                    "native membership events must retain their scoped paths"
+                );
                 break;
             }
             anyhow::ensure!(Instant::now() < deadline, "new file event did not arrive");
             std::thread::sleep(Duration::from_millis(10));
         }
         Ok(())
+    }
+
+    #[test]
+    fn linked_git_metadata_invalidates_branch_information_without_a_dot_git_component() {
+        let mut event = Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(PathBuf::from("/bare/repository.git/refs/heads/main"));
+        assert_eq!(
+            filter_event(Path::new("/project"), None, &mut event),
+            GIT | METADATA
+        );
     }
 
     #[test]
@@ -477,12 +686,24 @@ mod tests {
             flags: Arc::new(AtomicU8::new(FILES | GIT)),
             pending: 0,
             since: None,
+            event_paths: Arc::new(std::sync::Mutex::new(
+                [PathBuf::from("/project/new.rs")].into(),
+            )),
+            git_paths: Arc::new(std::sync::Mutex::new(
+                [PathBuf::from("/project/edited.rs")].into(),
+            )),
+            external: Arc::default(),
         };
         let now = Instant::now();
         assert!(!watch.poll(now).files);
         watch.flags.fetch_or(GIT, Ordering::Relaxed);
         let changes = watch.poll(now + Duration::from_millis(200));
         assert!(changes.files && changes.git);
+        assert_eq!(changes.paths, Some(vec![PathBuf::from("/project/new.rs")]));
+        assert_eq!(
+            changes.git_paths,
+            Some(vec![PathBuf::from("/project/edited.rs")])
+        );
         assert!(!watch.poll(now + Duration::from_millis(201)).git);
         watch.flags.store(FILES | FAILED, Ordering::Relaxed);
         watch.poll(now + Duration::from_secs(1));

@@ -101,6 +101,15 @@ thread_local! {
     static CACHE: RefCell<Option<Cached>> = const { RefCell::new(None) };
 }
 
+pub fn invalidate_cache() {
+    CACHE.with(|cache| {
+        if let Some(cached) = cache.borrow_mut().as_mut() {
+            cached.loaded = Instant::now() - Duration::from_secs(3);
+            cached.checked = cached.loaded;
+        }
+    });
+}
+
 /// The Changed tree is drawn every frame. Reuse compiled rules, and refresh
 /// local exceptions at least as often as the project's background file scan.
 pub fn with_global_ignores<T>(root: &Path, apply: impl FnOnce(&mut GlobalIgnores) -> T) -> T {
@@ -181,6 +190,172 @@ mod tests {
         assert!(!rules.is_ignored(&dir.path().join("outside.log")));
         // Root aliases must not change matching, including for deleted paths.
         assert!(rules.is_ignored(&root.canonicalize()?.join("nested/tmp/deleted.rs")));
+        Ok(())
+    }
+}
+
+/// Exact event-path checks without enumerating the containing directory.
+/// Each directory component is checked before descending, preserving ignored
+/// parent/negation behavior of the directory walker.
+pub(crate) struct WorkspaceRules {
+    root: PathBuf,
+    local: HashMap<PathBuf, Gitignore>,
+    global: Gitignore,
+}
+impl WorkspaceRules {
+    pub fn new(root: &Path) -> Self {
+        let (global, _) = GitignoreBuilder::new(root).build_global();
+        Self {
+            root: root.to_owned(),
+            local: HashMap::new(),
+            global,
+        }
+    }
+    fn matched(
+        &mut self,
+        file: PathBuf,
+        directory: &Path,
+        path: &Path,
+        folder: bool,
+    ) -> Option<bool> {
+        let matcher = self.local.entry(file.clone()).or_insert_with(|| {
+            let mut builder = GitignoreBuilder::new(directory);
+            if file.is_file() {
+                let _ = builder.add(&file);
+            }
+            builder.build().unwrap_or_else(|_| Gitignore::empty())
+        });
+        let matched = matcher.matched(path, folder);
+        (!matched.is_none()).then(|| matched.is_ignore())
+    }
+    pub fn allows(&mut self, path: &Path, folder: bool) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        if relative
+            .components()
+            .any(|p| matches!(p.as_os_str().to_str(), Some(".git" | "target")))
+        {
+            return false;
+        }
+        let mut prefix = self.root.clone();
+        let parts: Vec<_> = relative.components().collect();
+        for (index, component) in parts.iter().enumerate() {
+            prefix.push(component);
+            let is_dir = index + 1 < parts.len() || folder;
+            let parent = prefix.parent().unwrap_or(&self.root).to_owned();
+            let git_root = parent
+                .ancestors()
+                .find(|p| p.join(".git").exists())
+                .map(Path::to_path_buf);
+            let mut decision = None;
+            for name in [".rgignore", ".ignore", ".gitignore"] {
+                if name == ".gitignore" && git_root.is_none() {
+                    continue;
+                }
+                for directory in parent.ancestors() {
+                    if name == ".gitignore"
+                        && git_root
+                            .as_ref()
+                            .is_some_and(|root| !directory.starts_with(root))
+                    {
+                        break;
+                    }
+                    if let Some(ignored) =
+                        self.matched(directory.join(name), directory, &prefix, is_dir)
+                    {
+                        decision = Some(ignored);
+                        break;
+                    }
+                }
+                if decision.is_some() {
+                    break;
+                }
+            }
+            if decision.is_none()
+                && let Some(git_root) = &git_root
+            {
+                let dot_git = git_root.join(".git");
+                let git_dir = if dot_git.is_dir() {
+                    dot_git
+                } else {
+                    std::fs::read_to_string(&dot_git)
+                        .ok()
+                        .and_then(|text| {
+                            text.trim()
+                                .strip_prefix("gitdir: ")
+                                .map(|dir| git_root.join(dir))
+                        })
+                        .unwrap_or(dot_git)
+                };
+                decision = self.matched(git_dir.join("info/exclude"), git_root, &prefix, is_dir);
+                if decision.is_none() {
+                    let matched = self.global.matched(&prefix, is_dir);
+                    if !matched.is_none() {
+                        decision = Some(matched.is_ignore());
+                    }
+                }
+            }
+            if decision == Some(true) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod workspace_rule_tests {
+    use super::*;
+    #[test]
+    fn event_path_rules_match_the_walker_including_precedence_and_negation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        for folder in [
+            ".git/info",
+            "src/deep",
+            "excluded",
+            "node_modules/pkg",
+            "target",
+        ] {
+            std::fs::create_dir_all(root.join(folder))?;
+        }
+        std::fs::write(
+            root.join(".gitignore"),
+            "*.log\nexcluded/\nnode_modules/\n!keep.log\n",
+        )?;
+        std::fs::write(root.join(".ignore"), "!src/visible.log\n*.hidden\n")?;
+        std::fs::write(root.join(".rgignore"), "!src/custom.hidden\n")?;
+        std::fs::write(root.join("src/.gitignore"), "!nested.log\n")?;
+        std::fs::write(root.join(".git/info/exclude"), "*.secret\n")?;
+        let names = [
+            "ordinary.rs",
+            "keep.log",
+            "drop.log",
+            "src/visible.log",
+            "src/nested.log",
+            "src/drop.log",
+            "src/custom.hidden",
+            "src/drop.hidden",
+            "excluded/keep.rs",
+            "node_modules/pkg/a.rs",
+            "target/a.rs",
+            "src/hidden.secret",
+            "src/deep/a.rs",
+        ];
+        for name in names {
+            std::fs::write(root.join(name), "")?;
+        }
+        let paths = crate::navigation::workspace_paths(&root)?;
+        let mut rules = WorkspaceRules::new(&root);
+        for name in names {
+            let path = root.join(name);
+            assert_eq!(
+                rules.allows(&path, false),
+                paths.files.contains(&path),
+                "event/walker mismatch for {name}"
+            );
+        }
         Ok(())
     }
 }

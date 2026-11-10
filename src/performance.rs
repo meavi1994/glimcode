@@ -170,3 +170,18 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+pub fn thread_cpu_time() -> Option<Duration> {
+    #[cfg(unix)]
+    {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) } == 0 {
+            return Some(Duration::new(time.tv_sec as u64, time.tv_nsec as u32));
+        }
+    }
+    None
+}

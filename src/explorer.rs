@@ -76,6 +76,7 @@ pub struct FileTree {
     pub diff: Option<PathBuf>,
     children: BTreeMap<OsString, FileTree>,
     extra_files: BTreeSet<PathBuf>,
+    delta: std::sync::Arc<crate::workspace_delta::Delta>,
     file: Option<PathBuf>,
     last_active: Option<PathBuf>,
     open_override: Option<bool>,
@@ -138,6 +139,20 @@ impl FileTree {
     #[cfg(any(test, feature = "ui-capture"))]
     pub fn build_with_folders(root: &Path, files: &[PathBuf], folders: &[PathBuf]) -> Self {
         Self::build_cancellable(root, files, folders, || false).expect("uncancelled build")
+    }
+
+    pub fn build_large_shared(
+        root: &Path,
+        files: std::sync::Arc<Vec<PathBuf>>,
+        folders: std::sync::Arc<Vec<PathBuf>>,
+        cancelled: &impl Fn() -> bool,
+    ) -> Option<Self> {
+        Some(Self {
+            large: Some(crate::project_tree::LargeTree::build_shared(
+                root, files, folders, cancelled,
+            )?),
+            ..Default::default()
+        })
     }
 
     pub fn build_shared_cancellable(
@@ -231,6 +246,64 @@ impl FileTree {
         std::mem::replace(self, fresh)
     }
 
+    pub fn apply_delta(
+        &mut self,
+        root: &Path,
+        delta: std::sync::Arc<crate::workspace_delta::Delta>,
+    ) {
+        self.delta = delta.clone();
+        if let Some(tree) = &mut self.large {
+            tree.set_delta(delta);
+            return;
+        }
+        for path in &delta.removed {
+            if let Ok(relative) = path.strip_prefix(root) {
+                let mut parts = relative.components().peekable();
+                let mut node = &mut *self;
+                while let Some(part) = parts.next() {
+                    if parts.peek().is_none() {
+                        node.children.remove(part.as_os_str());
+                        break;
+                    }
+                    let Some(child) = node.children.get_mut(part.as_os_str()) else {
+                        break;
+                    };
+                    node = child;
+                }
+            }
+        }
+        for (paths, file) in [(&delta.folders, false), (&delta.files, true)] {
+            for path in paths {
+                if let Ok(relative) = path.strip_prefix(root) {
+                    let mut node = &mut *self;
+                    for part in relative.components() {
+                        node = node
+                            .children
+                            .entry(part.as_os_str().to_owned())
+                            .or_default();
+                    }
+                    if file {
+                        node.file = Some(path.clone());
+                    }
+                }
+            }
+        }
+        self.extra_files.clear();
+    }
+
+    pub fn set_shared_extras(
+        &mut self,
+        root: &Path,
+        folders: &[PathBuf],
+        extras: std::sync::Arc<BTreeSet<PathBuf>>,
+    ) {
+        if let Some(tree) = &mut self.large {
+            tree.set_shared_extras(extras);
+        } else {
+            self.sync_extra_files(root, &[], folders, extras.iter().cloned());
+        }
+    }
+
     /// Status colors do not change the project index. Insert/remove only Git
     /// entries absent from disk (such as deleted files), instead of rebuilding
     /// millions of nodes whenever an editor becomes dirty or Git refreshes.
@@ -242,7 +315,7 @@ impl FileTree {
         extras: impl Iterator<Item = PathBuf>,
     ) {
         let extras: BTreeSet<_> = extras
-            .filter(|path| files.binary_search(path).is_err())
+            .filter(|path| files.binary_search(path).is_err() || self.delta.hidden(path, false))
             .collect();
         if let Some(tree) = &mut self.large {
             tree.set_extras(extras);

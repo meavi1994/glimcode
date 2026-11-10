@@ -633,6 +633,16 @@ fn workspace_walk(root: &Path) -> Result<WalkBuilder> {
     workspace_walk_with_ignore(root, None)
 }
 
+pub(crate) fn scoped_workspace_walk(root: &Path, scope: &Path) -> Result<WalkBuilder> {
+    let mut overrides = OverrideBuilder::new(root);
+    overrides.add("!.git")?.add("!target")?;
+    let mut walk = WalkBuilder::new(scope);
+    walk.hidden(false)
+        .add_custom_ignore_filename(".rgignore")
+        .overrides(overrides.build()?);
+    Ok(walk)
+}
+
 fn workspace_walk_with_ignore(root: &Path, global_ignore: Option<&Path>) -> Result<WalkBuilder> {
     let mut overrides = OverrideBuilder::new(root);
     overrides.add("!.git")?.add("!target")?;

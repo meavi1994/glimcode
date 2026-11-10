@@ -73,7 +73,7 @@ Continuous redraw intervals had a median of 8.41 ms and p99 of 14.03 ms. These i
 
 Local artifacts are saved under `target/performance/`: `combined-stress.json`, `kubernetes-native-final.jsonl`, and the `kubernetes-native-final-all.txt` and `kubernetes-native-final-steady.txt` summaries. These generated captures are not committed. Results depend on the workload and machine; repeat the commands and live capture for subsequent changes.
 
-## Screenshot audit follow-up (10 November 2026)
+## Initial screenshot-audit pass (10 November 2026, edc10ec)
 
 The screenshot findings referred to commit `b9525d9`. The current implementation was checked against each item. The changes below reduce repeated work while retaining full Git reconciliation, external-file detection, Unicode editing, terminal history, and folding.
 
@@ -96,7 +96,7 @@ The screenshot findings referred to commit `b9525d9`. The current implementation
 | 20: duplicate file-index storage | Large-tree file entries reference the same immutable path vector as the workspace index. Old indices and projections are retired on workers. |
 | Lower-priority findings | Watched workspaces use event wakeups and periodic reconciliation; disk metadata checks run on workers. Missing idle files are retried after another idle interval. Hover tokens, filtered outline rows and declaration colors are cached. The synchronous Git calls in the cited CLI preview modes are inside the optional `ui-capture` fixture code, not the ordinary startup path. |
 
-These are bounded-work and caching changes, not a replacement of every underlying data structure. Full filesystem reconciliation still walks and sorts the workspace; an old index remains available while its replacement is built. Egui TextEdit still requires full cursor geometry, and composing changed document geometry still visits rows. Markdown's first measurement, content edits and width changes still require block layout; a single very large top-level block is not subdivided. Git metadata and untracked results can remain stale until the next reconciliation if native events are lost. No physical key-to-photon or real two-million-file filesystem-traversal claim is made by the synthetic checks.
+**Historical limits of the initial pass, addressed by the second pass below:** These were bounded-work and caching changes, not a replacement of every underlying data structure. Full filesystem reconciliation still walks and sorts the workspace; an old index remains available while its replacement is built. Egui TextEdit still requires full cursor geometry, and composing changed document geometry still visits rows. Markdown's first measurement, content edits and width changes still require block layout; a single very large top-level block is not subdivided. Git metadata and untracked results can remain stale until the next reconciliation if native events are lost. No physical key-to-photon or real two-million-file filesystem-traversal claim is made by the synthetic checks.
 
 ### Validation for this follow-up
 
@@ -111,3 +111,43 @@ These are bounded-work and caching changes, not a replacement of every underlyin
 | Combined IDE | 511 frames, 481 with indexing/search/input overlap; frame p99 0.625 ms, maximum 7.203 ms; input-to-parsed-reply p99 0.628 ms, maximum 7.229 ms. |
 
 The combined index contained 2,000,001 synthetic paths and the search fixture contained 2,000 real search files. These are component/combined CPU and PTY measurements, not display presentation timings. Results vary between runs and machines. The combined report is written to `target/performance/combined-stress.json`; generated test logs and captures are not committed.
+
+## Incremental indexing and rendering pass (10 November 2026)
+
+The remaining hot paths from the initial pass now have incremental implementations:
+
+- **Workspace membership:** native events retain affected paths. Exact file events evaluate inherited ignore rules without enumerating siblings. New directories scan their own subtree; deletions use prefix tombstones. The explorer and picker share the original immutable index plus a delta containing changed paths. Routine creates, renames and deletes do not copy/sort the workspace path vector or rebuild its directory index. Healthy native watchers no longer schedule periodic whole-workspace walks.
+- **Reconciliation and memory:** manual refresh, ignore-policy changes, overflow and unavailable watchers still reconcile the filesystem. Reconciliation streams entries against the existing index using compact seen arrays, retaining only changes rather than constructing a second complete index/tree. Large index, search, status and projection allocations are retired on workers. Large changes can promote an initially small explorer to the virtualized tree on a worker.
+- **Picker and terminal paths:** paths are normalized once during index construction. Sorted exact/prefix lookups use subtree minima to obtain the highest-priority candidates without enumerating a large prefix range; substring queries intersect n-gram block postings. Short queries use block signatures. The same index resolves terminal-link suffixes, including paths added after startup. Queries retain recent/open-file priority and cancellation.
+- **Editor edits:** a balanced row tree stores byte/character offsets, intrinsic bounds and mesh summaries. Edits split/join only affected rows and reuse unchanged syntax jobs, hashes, font geometry and meshes. Newline insertions/deletions update the summaries without reconstructing all line jobs. Egui's flat placed-row coordinates shift when line heights or counts change; this does not reshape those rows. Source revisions with identical text reuse the current galley. Syntax-color updates retain row geometry and update meshes only for visible rows, including when previously offscreen rows enter the viewport. Command-hover uses indexed row offsets and inspects the pointed row, including Unicode characters.
+- **Editor scrolling and loading:** scrolling patches newly visible rows in the existing galley instead of recomposing all rows. Redundant previous-frame references are released before mutation; explicitly retained snapshots remain protected by copy-on-write. The initial loading preview receives line positions from the geometry worker instead of rescanning the document every frame.
+- **Markdown:** Comrak parsing and large-block geometry run on a worker. A height index skips offscreen blocks before their first UI measurement. Long lists page at balanced item boundaries with correct numbering; long code blocks, prose and tables mesh only visible rows. Prose formatting and links retain their style and hit targets. Native image rendering remains available. Width, scale, theme and source changes invalidate the appropriate work.
+- **Git:** ordinary content notifications retain changed paths and use literal, bounded pathspec batches. Unrelated cached changes remain intact. Unchanged scoped results reuse the shared repository file vector without rebuilding its full changed-file map. Native Git metadata notifications trigger full metadata/status refreshes, including linked worktrees; reliable watchers replace periodic full-status polling. Fallback/manual reconciliation remains available. Large status-color maps and missing-file overlays are prepared off the UI thread.
+- **External files and ignore policy:** native file notifications invalidate metadata promptly. Active files outside the watched workspace and the global ignore file are checked on a background observer; the UI wakes only for changes. Stale metadata results cannot replace a newer save baseline. Global policy edits invalidate changed-file projections and active search results.
+
+Initialization still has to read the filesystem and build search/geometry indexes. Changes to ignore rules can affect every path, so their reconciliation remains a background traversal. These necessary operations are distinct from repeatedly rebuilding everything for an ordinary edit or scroll. The tests do not establish physical key-to-photon latency or guarantee a presentation deadline on every machine.
+
+### Real filesystem validation
+
+The opt-in `real_two_million_file_workspace_benchmark` created **2,000,000 real empty files**, checked the index and indexed queries, added a file through the incremental path, performed streaming reconciliation, and removed the entire fixture afterward. This is separate from the combined benchmark's synthetic path index.
+
+| Real-filesystem operation | Observed result |
+| --- | --- |
+| Fixture creation | 58.18 s |
+| Initial ignore-aware walk | 6.74 s |
+| Shared tree and search-index construction | 7.15 s |
+| Single-file incremental update | 0.267 ms |
+| Five indexed queries | 0.002–0.209 ms; 0–6,384 candidates examined |
+| Full streaming reconciliation | 8.66 s |
+
+The report is saved to `target/performance/real-workspace.json`. Reproduce separately from other benchmarks:
+
+```sh
+cargo test --release --offline real_two_million_file_workspace_benchmark -- --ignored --nocapture
+```
+
+The correctness suite passes **346 tests**, with 23 opt-in tests excluded. Additional checks cover native event delivery outside the sandbox, randomized Unicode edits and row offsets, line splits/joins, unchanged syntax-row sharing, in-place scrolling, large prose/table rendering, ordered-list pagination, scoped Git status, linked Git metadata, ignore precedence, and worker-based large status projections.
+
+Release checks for this pass recorded a 5,000-line typing frame of **0.269 ms**, its next frame at **0.062 ms**, and warm terminal frames around **0.045–0.077 ms**. The final combined run sampled 512 frames, with search/indexing/input overlapping in 482: frame p99 **0.620 ms**, maximum **1.328 ms**; input-to-parsed-reply p99 **0.623 ms**, maximum **1.330 ms**. These are CPU/PTY measurements; the combined index is synthetic and its search fixture contains 2,000 real files.
+
+An earlier repeat recorded a 10.208 ms maximum despite passing its p99 target. Thread-CPU and layout counters then identified a whole-file syntax-color layout as the slow operation. The final implementation applies syntax colors to visible rows while preserving the existing geometry; the final combined run had no frames above 4 ms. The report includes thread-CPU percentiles and slow-frame layout counters so future regressions can be distinguished from scheduler delays. These samples do not guarantee every frame on every run meets the budget.

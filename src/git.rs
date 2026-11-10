@@ -43,7 +43,7 @@ pub struct Repository {
     pub base: String,
     pub merge_base: Option<String>,
     pub branches: Vec<String>,
-    pub files: Vec<ChangedFile>,
+    pub files: std::sync::Arc<Vec<ChangedFile>>,
     pub remote: Option<Remote>,
 }
 #[derive(Clone, Debug, Default)]
@@ -219,20 +219,115 @@ pub fn remote(value: &str) -> Option<Remote> {
 /// Automatic content refreshes reuse branch metadata and untracked results.
 /// Membership and Git metadata events, manual refreshes, and the periodic
 /// reconciliation all take the complete path.
+#[cfg(test)]
 pub fn repository_refresh(root: &Path, base: Option<&str>, full: bool) -> Result<Repository> {
+    repository_refresh_paths(root, base, full, None)
+}
+
+pub fn repository_refresh_paths(
+    root: &Path,
+    base: Option<&str>,
+    full: bool,
+    paths: Option<Vec<PathBuf>>,
+) -> Result<Repository> {
     type Cached = std::collections::HashMap<PathBuf, (Instant, Repository)>;
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Cached>> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let previous = cache.lock().unwrap().get(root).cloned();
     if !full
-        && let Some((checked, mut previous)) = previous
-        && checked.elapsed() < Duration::from_secs(30)
+        && let Some((checked, mut previous)) = previous.clone()
+        && (paths.is_some() || checked.elapsed() < Duration::from_secs(30))
         && base.is_none_or(|base| base == previous.base)
     {
+        let scoped: Option<std::collections::BTreeSet<PathBuf>> = paths.and_then(|paths| {
+            let mut scoped = std::collections::BTreeSet::new();
+            for path in paths {
+                let path = if let Ok(relative) = path.strip_prefix(&previous.root) {
+                    relative.to_owned()
+                } else {
+                    normalize_path(&path)
+                        .strip_prefix(&previous.root)
+                        .ok()?
+                        .to_owned()
+                };
+                if path.as_os_str().is_empty() {
+                    return None;
+                }
+                scoped.insert(path);
+            }
+            (!scoped.is_empty()).then_some(scoped)
+        });
+        let affected = |path: &Path| {
+            scoped
+                .as_ref()
+                .is_none_or(|paths| path.ancestors().any(|path| paths.contains(path)))
+        };
+        let scoped_result = if let Some(scopes) = &scoped {
+            let mut old = BTreeMap::new();
+            for scope in scopes {
+                let start = previous.files.partition_point(|file| file.path < *scope);
+                let end = previous
+                    .files
+                    .partition_point(|file| file.path <= *scope || file.path.starts_with(scope));
+                for file in &previous.files[start..end] {
+                    old.insert(file.path.clone(), file.clone());
+                }
+            }
+            let mut next: BTreeMap<_, _> = old
+                .values()
+                .filter_map(|file| {
+                    if file.committed || file.untracked {
+                        let mut file = file.clone();
+                        file.uncommitted = file.untracked;
+                        file.deleted = false;
+                        file.conflict = false;
+                        Some((file.path.clone(), file))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let scopes: Vec<_> = scopes.iter().collect();
+            for chunk in scopes.chunks(64) {
+                let mut status = command(&previous.root);
+                status
+                    .args([
+                        "status",
+                        "--porcelain=v1",
+                        "-z",
+                        "--untracked-files=no",
+                        "--",
+                    ])
+                    .args(chunk);
+                let result = run(status, None, Duration::from_secs(20))?;
+                if !result.success {
+                    bail!("{}", result.error);
+                }
+                parse_status(&result.bytes, &mut next);
+            }
+            for file in next.values_mut() {
+                file.deleted = std::fs::symlink_metadata(previous.root.join(&file.path)).is_err();
+            }
+            if old == next {
+                cache
+                    .lock()
+                    .unwrap()
+                    .insert(root.to_owned(), (checked, previous.clone()));
+                return Ok(previous);
+            }
+            Some(next)
+        } else {
+            None
+        };
+        let old_files = previous.files.clone();
         let mut files: BTreeMap<_, _> = previous
             .files
-            .into_iter()
+            .iter()
+            .cloned()
             .filter_map(|mut file| {
+                if scoped_result.is_some() {
+                    return (!affected(&file.path)).then_some((file.path.clone(), file));
+                }
                 if file.committed || file.untracked {
                     file.uncommitted = file.untracked;
                     file.deleted = false;
@@ -243,28 +338,48 @@ pub fn repository_refresh(root: &Path, base: Option<&str>, full: bool) -> Result
                 }
             })
             .collect();
-        parse_status(
-            &git(
-                &previous.root,
-                &["status", "--porcelain=v1", "-z", "--untracked-files=no"],
-            )?,
-            &mut files,
-        );
-        for file in files.values_mut() {
-            file.deleted = std::fs::symlink_metadata(previous.root.join(&file.path)).is_err();
+        if let Some(next) = scoped_result {
+            files.extend(next);
+        } else {
+            parse_status(
+                &git(
+                    &previous.root,
+                    &["status", "--porcelain=v1", "-z", "--untracked-files=no"],
+                )?,
+                &mut files,
+            );
+            for file in files.values_mut() {
+                file.deleted = std::fs::symlink_metadata(previous.root.join(&file.path)).is_err();
+            }
         }
-        previous.files = files.into_values().collect();
+        let files: Vec<_> = files.into_values().collect();
+        previous.files = if *old_files == files {
+            old_files
+        } else {
+            std::sync::Arc::new(files)
+        };
         cache
             .lock()
             .unwrap()
             .insert(root.to_owned(), (checked, previous.clone()));
         return Ok(previous);
     }
-    let repo = repository(root, base)?;
+    let mut repo = repository(root, base)?;
+    if let Some((_, previous)) = &previous
+        && previous.files == repo.files
+    {
+        repo.files = previous.files.clone();
+    }
     let mut cache = cache.lock().unwrap();
     // Bound retained repositories when projects are switched repeatedly.
     if cache.len() >= 4 && !cache.contains_key(root) {
-        cache.clear();
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (checked, _))| *checked)
+            .map(|(path, _)| path.clone())
+        {
+            cache.remove(&oldest);
+        }
     }
     cache.insert(root.to_owned(), (Instant::now(), repo.clone()));
     Ok(repo)
@@ -375,7 +490,7 @@ pub fn repository(project: &Path, requested_base: Option<&str>) -> Result<Reposi
         base,
         merge_base,
         branches,
-        files: files.into_values().collect(),
+        files: std::sync::Arc::new(files.into_values().collect()),
         remote,
     })
 }
@@ -829,6 +944,63 @@ pub(crate) mod tests {
         git(dir.path(), &["checkout", "-b", "feature"])?;
         Ok(dir)
     }
+    #[test]
+    fn scoped_status_only_rechecks_requested_paths_and_preserves_other_changes() -> Result<()> {
+        let dir = setup()?;
+        let root = dir.path();
+        let original = std::fs::read_to_string(root.join("src/code.rs"))?;
+        std::fs::write(root.join("src/code.rs"), "modified")?;
+        std::fs::write(root.join("deleted.txt"), "modified")?;
+        let first = repository_refresh(root, None, true)?;
+        assert!(
+            first
+                .files
+                .iter()
+                .any(|f| f.path == Path::new("deleted.txt") && f.uncommitted)
+        );
+        std::fs::write(root.join("src/code.rs"), original)?;
+        std::fs::write(root.join("deleted.txt"), "remove me\n")?;
+        let one = repository_refresh_paths(
+            root,
+            Some(&first.base),
+            false,
+            Some(vec![root.join("src/code.rs")]),
+        )?;
+        assert!(
+            !one.files
+                .iter()
+                .any(|f| f.path == Path::new("src/code.rs") && f.uncommitted)
+        );
+        assert!(
+            one.files
+                .iter()
+                .any(|f| f.path == Path::new("deleted.txt") && f.uncommitted),
+            "an unrelated path must not be recomputed"
+        );
+        let two = repository_refresh_paths(
+            root,
+            Some(&first.base),
+            false,
+            Some(vec![root.join("deleted.txt")]),
+        )?;
+        assert!(
+            !two.files
+                .iter()
+                .any(|f| f.path == Path::new("deleted.txt") && f.uncommitted)
+        );
+        let unchanged = repository_refresh_paths(
+            root,
+            Some(&first.base),
+            false,
+            Some(vec![root.join("deleted.txt")]),
+        )?;
+        assert!(
+            std::sync::Arc::ptr_eq(&two.files, &unchanged.files),
+            "unchanged status reuses the shared file vector"
+        );
+        Ok(())
+    }
+
     #[test]
     fn automatic_status_preserves_untracked_files_and_full_refresh_reconciles_metadata()
     -> Result<()> {

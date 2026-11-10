@@ -105,10 +105,18 @@ struct TextClick {
 const MAX_HISTORY: usize = 200;
 const PROJECT_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
+struct StatusProjection {
+    key: u64,
+    colors: Arc<std::collections::BTreeMap<PathBuf, Color32>>,
+    extras: Arc<std::collections::BTreeSet<PathBuf>>,
+    tree: Option<crate::explorer::FileTree>,
+}
+
 struct WorkspaceIndex {
     files: Arc<Vec<PathBuf>>,
     folders: Arc<Vec<PathBuf>>,
     names: Arc<Vec<usize>>,
+    search: Option<Arc<crate::path_search::PathSearch>>,
     tree: crate::explorer::FileTree,
 }
 
@@ -131,6 +139,13 @@ pub struct Coder {
     files: Arc<Vec<PathBuf>>,
     folders: Arc<Vec<PathBuf>>,
     path_names: Arc<Vec<usize>>,
+    path_search: Option<Arc<crate::path_search::PathSearch>>,
+    index_delta: Arc<crate::workspace_delta::Delta>,
+    effective_files: usize,
+    effective_folders: usize,
+    delta_search: Option<Arc<crate::path_search::PathSearch>>,
+    patch_rx: Option<Receiver<anyhow::Result<Option<crate::workspace_delta::Patch>>>>,
+    pending_paths: Option<Vec<PathBuf>>,
     tree: crate::explorer::FileTree,
     selected_category: Option<navigation::MatchCategory>,
     extension_filter: Option<String>,
@@ -201,6 +216,7 @@ pub struct Coder {
     focus_editor: bool,
     /// Colors of the changed files, kept until the repository changes.
     git_colors: (u64, Arc<std::collections::BTreeMap<PathBuf, Color32>>),
+    git_colors_rx: Option<Receiver<StatusProjection>>,
     goto: Option<FocusSearch>,
     pending_click: Option<PendingClick>,
     deferred_revert: Option<crate::git_view::RevertHunk>,
@@ -482,6 +498,13 @@ impl Coder {
             files: Arc::default(),
             folders: Arc::default(),
             path_names: Arc::default(),
+            path_search: None,
+            index_delta: Arc::default(),
+            effective_files: 0,
+            effective_folders: 0,
+            delta_search: None,
+            patch_rx: None,
+            pending_paths: None,
             tree: Default::default(),
             selected_category: None,
             extension_filter: None,
@@ -550,6 +573,7 @@ impl Coder {
             search_highlight: Default::default(),
             focus_editor: false,
             git_colors: (0, Arc::new(std::collections::BTreeMap::new())),
+            git_colors_rx: None,
             goto: None,
             pending_click: None,
             deferred_revert: None,
@@ -665,6 +689,20 @@ impl Coder {
         self.search_rx = None;
         self.files_cancel.store(true, Ordering::Relaxed);
         self.files_rx = None;
+        let old_index_work = (
+            self.patch_rx.take(),
+            std::mem::take(&mut self.index_delta),
+            self.delta_search.take(),
+            self.path_search.take(),
+            std::mem::take(&mut self.path_names),
+        );
+        std::thread::spawn(move || drop(old_index_work));
+        self.effective_files = 0;
+        self.effective_folders = 0;
+        self.pending_paths = None;
+        let old_colors = std::mem::replace(&mut self.git_colors, (0, Arc::default()));
+        let old_colors_rx = self.git_colors_rx.take();
+        std::thread::spawn(move || drop((old_colors, old_colors_rx)));
         let old_watch = self.workspace_watch.take();
         self.files_requested = false;
         self.git_requested = false;
@@ -746,7 +784,37 @@ impl Coder {
         self.focus_editor = true;
     }
 
+    fn refresh_membership(&mut self, paths: Option<Vec<PathBuf>>) {
+        if self.files_rx.is_some() || self.patch_rx.is_some() {
+            return;
+        }
+        self.files_requested = false;
+        self.files_checked = Instant::now();
+        let root = self.root.clone();
+        let files = self.files.clone();
+        let folders = self.folders.clone();
+        let delta = self.index_delta.clone();
+        let repaint = self.io_context.clone();
+        let cancel = self.files_cancel.clone();
+        let (tx, rx) = mpsc::channel();
+        self.patch_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result =
+                crate::workspace_delta::reconcile(&root, paths, files, folders, delta, || {
+                    cancel.load(Ordering::Relaxed)
+                });
+            let _ = tx.send(result);
+            if let Some(ctx) = repaint {
+                ctx.request_repaint();
+            }
+        });
+    }
+
     fn refresh_files(&mut self) {
+        if self.path_search.is_some() {
+            self.refresh_membership(None);
+            return;
+        }
         // Never overlap workspace walks, including manual refreshes.
         if self.files_rx.is_some() {
             return;
@@ -757,8 +825,6 @@ impl Coder {
         let root = self.root.clone();
         let (tx, rx) = mpsc::channel();
         self.files_rx = Some(rx);
-        let files = self.files.clone();
-        let folders = self.folders.clone();
         self.files_cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.files_cancel.clone();
         std::thread::spawn(move || {
@@ -766,9 +832,6 @@ impl Coder {
                 navigation::workspace_paths_cancelled(&root, || cancel.load(Ordering::Relaxed))
                     .map(|paths| {
                         let paths = paths?;
-                        if *files == paths.files && *folders == paths.folders {
-                            return None;
-                        }
                         let files = Arc::new(paths.files);
                         let folders = Arc::new(paths.folders);
                         let tree = crate::explorer::FileTree::build_shared_cancellable(
@@ -777,15 +840,18 @@ impl Coder {
                             folders.clone(),
                             || cancel.load(Ordering::Relaxed),
                         )?;
-                        let paths: Vec<_> = files.iter().chain(folders.iter()).collect();
-                        let mut names: Vec<_> = (0..paths.len()).collect();
-                        names.sort_unstable_by(|a, b| {
-                            paths[*a].file_name().cmp(&paths[*b].file_name())
-                        });
+                        let search = crate::path_search::PathSearch::build(
+                            &root,
+                            files.clone(),
+                            folders.clone(),
+                            || cancel.load(Ordering::Relaxed),
+                        )
+                        .map(Arc::new)?;
                         Some(WorkspaceIndex {
+                            search: Some(search),
                             files,
                             folders,
-                            names: Arc::new(names),
+                            names: Arc::default(),
                             tree,
                         })
                     });
@@ -1201,15 +1267,61 @@ impl Coder {
         if !self.files.is_empty() || self.files_rx.is_none() {
             watch.set_index(self.files.clone(), self.folders.clone());
         }
+        watch.set_external_file(
+            self.documents
+                .get(self.active)
+                .filter(|doc| !doc.path.starts_with(&self.root))
+                .map(|doc| doc.path.clone()),
+        );
         let changes = watch.poll(Instant::now());
         let watched = watch.reliable();
         if let Some(delay) = watch.next_poll() {
             ctx.request_repaint_after(delay);
         }
+        if changes.external
+            && let Some(doc) = self.documents.get_mut(self.active)
+        {
+            doc.disk_event();
+        }
+        if changes.git {
+            for doc in &mut self.documents {
+                if changes
+                    .git_paths
+                    .as_ref()
+                    .is_none_or(|paths| paths.iter().any(|path| doc.path.starts_with(path)))
+                {
+                    doc.disk_event();
+                }
+            }
+        }
+        if changes.policy {
+            crate::ignore_rules::invalidate_cache();
+            self.git.invalidate_changed_cache();
+            self.files_generation = self.files_generation.wrapping_add(1);
+            if self.search_open && !self.query.trim().is_empty() {
+                self.run_search(self.search_kind, false);
+            }
+        }
         if changes.git {
             ctx.request_repaint_after(Duration::from_secs(2));
         }
-        self.files_requested |= changes.files;
+        if changes.files {
+            self.pending_paths = if self.files_requested {
+                match (self.pending_paths.take(), changes.paths) {
+                    (Some(mut old), Some(next)) => {
+                        old.extend(next);
+                        Some(old)
+                    }
+                    _ => None,
+                }
+            } else {
+                changes.paths
+            };
+            self.files_requested = true;
+        }
+        if changes.git {
+            self.git.request_changed_paths(changes.git_paths);
+        }
         self.git_requested |= changes.git;
         if changes.files || changes.git_metadata {
             self.git.request_full_refresh();
@@ -1217,25 +1329,24 @@ impl Coder {
         if self.git_requested && self.git.refresh_if_idle(&self.root, ctx) {
             self.git_requested = false;
         }
-        self.git.poll(&self.root, ctx);
+        self.git.poll_watched(&self.root, ctx, watched);
         self.search_highlight.poll();
         if let Some(rx) = &self.files_rx
             && let Ok(result) = rx.try_recv()
         {
             match result {
-                Ok(Some(mut index)) => {
-                    index.tree.sync_extra_files(
-                        &self.root,
-                        &index.files,
-                        &index.folders,
-                        self.git_colors.1.keys().cloned(),
-                    );
+                Ok(Some(index)) => {
                     let old_names = std::mem::replace(&mut self.path_names, index.names);
+                    let old_search = std::mem::replace(&mut self.path_search, index.search);
                     self.files_generation = self.files_generation.wrapping_add(1);
                     let old_tree = self.tree.adopt_index(&self.root, index.tree);
+                    self.effective_files = index.files.len();
+                    self.effective_folders = index.folders.len();
                     let old_files = std::mem::replace(&mut self.files, index.files);
                     let old_folders = std::mem::replace(&mut self.folders, index.folders);
-                    std::thread::spawn(move || drop((old_tree, old_files, old_folders, old_names)));
+                    std::thread::spawn(move || {
+                        drop((old_tree, old_files, old_folders, old_names, old_search))
+                    });
                 }
                 Ok(None) => {}
                 Err(error) => self.error = Some(format!("{error:#}")),
@@ -1246,6 +1357,43 @@ impl Coder {
                 watch.set_index(self.files.clone(), self.folders.clone());
             }
         }
+        if let Some(rx) = &self.patch_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.patch_rx = None;
+                    self.files_completed = Some(Instant::now());
+                    match result {
+                        Ok(Some(patch)) => {
+                            self.effective_files = patch.file_count;
+                            self.effective_folders = patch.folder_count;
+                            self.index_delta = patch.delta;
+                            let old_search =
+                                std::mem::replace(&mut self.delta_search, patch.search);
+                            std::thread::spawn(move || drop(old_search));
+                            self.files_generation = self.files_generation.wrapping_add(1);
+                            if let Some(tree) = patch.tree {
+                                let old = self.tree.adopt_index(&self.root, tree);
+                                std::thread::spawn(move || drop(old));
+                            } else {
+                                self.tree.apply_delta(&self.root, self.index_delta.clone());
+                            }
+                            self.git_colors.0 = self.git_colors.0.wrapping_add(1);
+                            if let Some(watch) = &mut self.workspace_watch {
+                                watch.set_delta(self.index_delta.clone());
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => self.error = Some(format!("{error:#}")),
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.patch_rx = None;
+                    self.files_requested = true;
+                    self.pending_paths = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         let refresh_interval = if self.files.len() > 100_000 {
             Duration::from_secs(300)
         } else if watched {
@@ -1254,17 +1402,28 @@ impl Coder {
             Duration::from_secs(2)
         };
         if self.files_rx.is_none()
-            && self.files_completed.is_none_or(|at| {
-                at.elapsed()
-                    >= Duration::from_secs(2).max(at.saturating_duration_since(self.files_checked))
-            })
+            && self.patch_rx.is_none()
+            && (self.pending_paths.is_some()
+                || self.files_completed.is_none_or(|at| {
+                    at.elapsed()
+                        >= Duration::from_secs(2)
+                            .max(at.saturating_duration_since(self.files_checked))
+                }))
             && (self.files_requested
-                || self.files_completed.unwrap_or(self.files_checked).elapsed() >= refresh_interval)
+                || (!watched
+                    && self.files_completed.unwrap_or(self.files_checked).elapsed()
+                        >= refresh_interval))
         {
-            self.refresh_files();
+            if self.path_search.is_some() {
+                let paths = self.pending_paths.take();
+                self.refresh_membership(paths);
+            } else {
+                self.refresh_files();
+            }
         }
         if self.files_requested
             && self.files_rx.is_none()
+            && self.patch_rx.is_none()
             && let Some(at) = self.files_completed
         {
             let gap = Duration::from_secs(2).max(at.saturating_duration_since(self.files_checked));
@@ -1870,35 +2029,121 @@ impl Coder {
             .filter(|doc| doc.dirty)
             .map(|doc| doc.path.clone())
             .collect();
-        let colors_key = eframe::egui::util::hash((self.git.generation, &dirty));
-        if self.git_colors.0 != colors_key {
-            let colors = self
+        let colors_key = eframe::egui::util::hash((
+            &self.root,
+            self.git.generation,
+            &dirty,
+            self.files_generation,
+        ));
+        if let Some(rx) = &self.git_colors_rx {
+            match rx.try_recv() {
+                Ok(projection) => {
+                    self.git_colors_rx = None;
+                    if projection.key == colors_key && self.files_rx.is_none() {
+                        if let Some(tree) = projection.tree {
+                            let old = self.tree.adopt_index(&self.root, tree);
+                            std::thread::spawn(move || drop(old));
+                        }
+                        self.tree
+                            .set_shared_extras(&self.root, &self.folders, projection.extras);
+                        let old = std::mem::replace(
+                            &mut self.git_colors,
+                            (colors_key, projection.colors),
+                        );
+                        std::thread::spawn(move || drop(old));
+                    } else {
+                        std::thread::spawn(move || drop(projection));
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.git_colors_rx = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.git_colors.0 != colors_key && self.git_colors_rx.is_none() {
+            if self
                 .git
                 .repo
                 .as_ref()
-                .map(|repo| {
-                    self.git
-                        .changed_files(&dirty)
-                        .iter()
-                        .map(|file| {
-                            (
-                                repo.root.join(&file.path),
-                                crate::git_view::file_color(file),
+                .is_some_and(|repo| repo.files.len() > 2000)
+            {
+                if self.files_rx.is_none() {
+                    let repo = self.git.repo.as_ref().unwrap().clone();
+                    let dirty = dirty.clone();
+                    let root = self.root.clone();
+                    let files = self.files.clone();
+                    let folders = self.folders.clone();
+                    let delta = self.index_delta.clone();
+                    let ctx = ctx.clone();
+                    let (tx, rx) = mpsc::channel();
+                    self.git_colors_rx = Some(rx);
+                    std::thread::spawn(move || {
+                        let changed = crate::git_view::tree_files(&repo, &dirty);
+                        let colors: std::collections::BTreeMap<_, _> = changed
+                            .iter()
+                            .map(|file| {
+                                (
+                                    repo.root.join(&file.path),
+                                    crate::git_view::file_color(file),
+                                )
+                            })
+                            .collect();
+                        let extras: std::collections::BTreeSet<_> = colors
+                            .keys()
+                            .filter(|path| {
+                                files.binary_search(path).is_err() || delta.hidden(path, false)
+                            })
+                            .cloned()
+                            .collect();
+                        let tree = if files.len() < crate::project_tree::THRESHOLD
+                            && files.len() + extras.len() >= crate::project_tree::THRESHOLD
+                        {
+                            crate::explorer::FileTree::build_large_shared(
+                                &root,
+                                files,
+                                folders,
+                                &|| false,
                             )
-                        })
-                        .collect::<std::collections::BTreeMap<_, _>>()
-                })
-                .unwrap_or_default();
-            self.tree.sync_extra_files(
-                &self.root,
-                &self.files,
-                &self.folders,
-                colors.keys().cloned(),
-            );
-            self.git_colors = (colors_key, Arc::new(colors));
+                        } else {
+                            None
+                        };
+                        let _ = tx.send(StatusProjection {
+                            key: colors_key,
+                            colors: Arc::new(colors),
+                            extras: Arc::new(extras),
+                            tree,
+                        });
+                        ctx.request_repaint();
+                    });
+                }
+            } else {
+                let colors = self
+                    .git
+                    .repo
+                    .as_ref()
+                    .map(|repo| {
+                        self.git
+                            .changed_files(&dirty)
+                            .iter()
+                            .map(|file| {
+                                (
+                                    repo.root.join(&file.path),
+                                    crate::git_view::file_color(file),
+                                )
+                            })
+                            .collect::<std::collections::BTreeMap<_, _>>()
+                    })
+                    .unwrap_or_default();
+                self.tree.sync_extra_files(
+                    &self.root,
+                    &self.files,
+                    &self.folders,
+                    colors.keys().cloned(),
+                );
+                self.git_colors = (colors_key, Arc::new(colors));
+            }
         }
         let colors = self.git_colors.1.clone();
-        self.tree.set_status_revision(colors_key);
+        self.tree.set_status_revision(self.git_colors.0);
         egui::SidePanel::right("explorer")
             .default_width(285.0)
             .width_range(160.0..=500.0)
@@ -1937,7 +2182,14 @@ impl Coder {
                         ui.horizontal(|ui| {
                             for (changed_only, label) in [
                                 (false, "All files".to_owned()),
-                                (true, format!("Changed · {changed_count}")),
+                                (
+                                    true,
+                                    if self.git_colors_rx.is_some() {
+                                        "Changed · …".to_owned()
+                                    } else {
+                                        format!("Changed · {changed_count}")
+                                    },
+                                ),
                             ] {
                                 let selected = self.files_changed_only == changed_only;
                                 let response = ui.add_sized(
@@ -1987,7 +2239,11 @@ impl Coder {
                                 if self.files_changed_only {
                                     changed_count
                                 } else {
-                                    self.files.len()
+                                    if self.path_search.is_some() {
+                                        self.effective_files
+                                    } else {
+                                        self.files.len()
+                                    }
                                 }
                             ))
                             .size(11.0)
@@ -3615,6 +3871,18 @@ impl Coder {
                 "Enter a single file name without directory separators."
             );
         }
+        let refresh_paths = match &action {
+            FileAction::NewFile(folder) => vec![folder.join(name)],
+            FileAction::Rename(path) => vec![path.clone(), path.with_file_name(name)],
+            FileAction::Delete(path) => vec![path.clone()],
+        };
+        let refresh_paths = (!refresh_paths.iter().any(|p| {
+            matches!(
+                p.file_name().and_then(|n| n.to_str()),
+                Some(".gitignore" | ".ignore" | ".rgignore")
+            )
+        }))
+        .then_some(refresh_paths);
         match action {
             FileAction::NewFile(folder) => {
                 let path = folder.join(name);
@@ -3665,8 +3933,28 @@ impl Coder {
                 self.recent_file_searches.retain(|recent| recent != &path);
             }
         }
+        self.pending_paths = if self.files_requested {
+            match (self.pending_paths.take(), refresh_paths) {
+                (Some(mut old), Some(paths)) => {
+                    old.extend(paths);
+                    Some(old)
+                }
+                _ => None,
+            }
+        } else {
+            refresh_paths
+        };
         self.files_requested = true;
-        self.refresh_files();
+        self.git_requested = true;
+        self.git.request_full_refresh();
+        if self.files_rx.is_none() && self.patch_rx.is_none() {
+            if self.path_search.is_some() {
+                let paths = self.pending_paths.take();
+                self.refresh_membership(paths);
+            } else {
+                self.refresh_files();
+            }
+        }
         Ok(())
     }
 
@@ -3700,6 +3988,9 @@ impl Coder {
             }
             self.picker_files_key = Some(key);
             if mode != Picker::Recent {
+                let search = self.path_search.clone();
+                let delta = self.index_delta.clone();
+                let delta_search = self.delta_search.clone();
                 let files = self.files.clone();
                 let folders = self.folders.clone();
                 let recent = self.recent_file_searches.clone();
@@ -3711,11 +4002,30 @@ impl Coder {
                 let (tx, rx) = mpsc::channel();
                 self.picker_files_worker = Some((rx, cancel));
                 std::thread::spawn(move || {
+                    let indexed = search.as_ref().map(|index| {
+                        let mut paths = index.query_filtered(
+                            &query,
+                            || stop.load(Ordering::Relaxed),
+                            |path| {
+                                !delta.hidden(
+                                    path,
+                                    delta.folders.contains(path)
+                                        || folders
+                                            .binary_search_by(|p| p.as_path().cmp(path))
+                                            .is_ok(),
+                                )
+                            },
+                        );
+                        if let Some(index) = delta_search {
+                            paths.extend(index.query(&query, || stop.load(Ordering::Relaxed)));
+                        }
+                        paths
+                    });
                     let paths = file_candidates_with_cancel(
                         &recent,
                         &open,
-                        &files,
-                        &folders,
+                        indexed.as_deref().unwrap_or(&files),
+                        if indexed.is_some() { &[] } else { &folders },
                         &root,
                         &query,
                         || stop.load(Ordering::Relaxed),
@@ -3856,6 +4166,29 @@ impl Coder {
         // A unique suffix can resolve filenames printed relative to a build
         // directory. Ambiguous matches go to the picker instead of guessing.
         let suffix = path.strip_prefix(".").unwrap_or(&path);
+        if let Some(index) = &self.path_search {
+            let accepts = |candidate: &Path| {
+                candidate.ends_with(suffix)
+                    && !self.index_delta.hidden(
+                        candidate,
+                        self.index_delta.folders.contains(candidate)
+                            || self
+                                .folders
+                                .binary_search_by(|p| p.as_path().cmp(candidate))
+                                .is_ok(),
+                    )
+            };
+            let query = suffix.to_string_lossy();
+            let mut matches = index.query_filtered(&query, || false, accepts);
+            if let Some(index) = &self.delta_search {
+                matches.extend(index.query_filtered(&query, || false, accepts));
+            }
+            let first = matches.first()?.clone();
+            if matches.iter().any(|candidate| *candidate != first) {
+                return None;
+            }
+            return existing(first);
+        }
         let at = |index: usize| {
             self.files
                 .get(index)
@@ -3881,7 +4214,16 @@ impl Coder {
             };
         let mut matches = candidates
             .by_ref()
-            .filter(|candidate| candidate.ends_with(suffix));
+            .chain(self.index_delta.files.iter())
+            .chain(self.index_delta.folders.iter())
+            .filter(|candidate| {
+                candidate.ends_with(suffix)
+                    && !self.index_delta.hidden(
+                        candidate,
+                        self.index_delta.folders.contains(*candidate)
+                            || self.folders.binary_search(candidate).is_ok(),
+                    )
+            });
         let first = matches.next()?;
         if matches.any(|candidate| candidate != first) {
             return None;
@@ -4160,7 +4502,8 @@ impl Coder {
                                     &display,
                                     parent.as_deref(),
                                     &location.path,
-                                    self.folders.binary_search(&location.path).is_ok(),
+                                    self.folders.binary_search(&location.path).is_ok()
+                                        || self.index_delta.folders.contains(&location.path),
                                     &highlight_term(&display, file_query),
                                     &highlight_term(parent.as_deref().unwrap_or(""), file_query),
                                     dialog_size,
@@ -5219,41 +5562,95 @@ fn markdown_preview(
                         render(ui);
                     }
                 };
-                cache.prepare_keyed(text, revision);
+                if !cache.request(text, revision, ui.available_width(), ui.ctx()) {
+                    ui.weak("Rendering Markdown…");
+                    return;
+                }
                 let layout_key = egui::util::hash((
                     ui.available_width().to_bits(),
                     ui.ctx().pixels_per_point().to_bits(),
                     ui.visuals().dark_mode,
                 ));
-                if cache.layout_key != Some(layout_key) {
-                    cache.heights.fill(None);
-                    cache.layout_key = Some(layout_key);
-                }
-                // Retain measured block heights. Offscreen blocks reserve their
-                // space without cloning events or laying out their widgets.
-                for (index, range) in cache.blocks.iter().enumerate() {
+                cache.resize(layout_key, ui.available_width());
+                let origin = ui.cursor().top();
+                let first = cache
+                    .positions
+                    .row((ui.clip_rect().top() - origin).max(0.0));
+                ui.add_space(cache.positions.prefix(first));
+                let mut index = first;
+                while index < cache.blocks.len() && ui.cursor().top() <= ui.clip_rect().bottom() {
                     let top = ui.cursor().top();
-                    let visible = cache.heights[index].is_none_or(|height| {
-                        top + height >= ui.clip_rect().top() && top <= ui.clip_rect().bottom()
-                    });
-                    if visible {
+                    if let Some(block) = cache.large.get(&index) {
+                        block.show(ui, directory.as_ref());
+                    } else if let Some(code) = cache.code.get(&index) {
+                        markdown_code(ui, code);
+                    } else {
                         let mut viewer = CommonMarkViewer::new()
                             .max_image_width(Some(ui.available_width().max(1.0) as usize))
                             .render_html_fn(Some(&html));
                         if let Some(directory) = &directory {
                             viewer = viewer.default_implicit_uri_scheme(directory.to_string());
                         }
+                        let range = cache.blocks[index].clone();
                         ui.push_id(index, |ui| {
                             viewer.show_events(
                                 ui,
                                 &mut cache.native,
-                                cache.events[range.clone()].iter().cloned(),
+                                cache.events[range].iter().cloned(),
                             );
                         });
-                        cache.heights[index] = Some(ui.cursor().top() - top);
-                    } else {
-                        ui.add_space(cache.heights[index].unwrap());
                     }
+                    let height = (ui.cursor().top() - top).max(1.0);
+                    cache.heights[index] = Some(height);
+                    cache.positions.set(index, height);
+                    index += 1;
+                }
+                ui.add_space(
+                    (cache.positions.prefix(cache.blocks.len()) - cache.positions.prefix(index))
+                        .max(0.0),
+                );
+            });
+        });
+}
+
+fn markdown_code(ui: &mut egui::Ui, code: &crate::preview::SourcePreview) {
+    let font = FontId::monospace(13.0);
+    let height = ui.fonts_mut(|fonts| fonts.row_height(&font));
+    egui::ScrollArea::horizontal()
+        .id_salt(("markdown-code", code as *const _ as usize))
+        .show(ui, |ui| {
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(
+                    ui.available_width().max(code.width),
+                    code.len() as f32 * height + 16.0,
+                ),
+                egui::Sense::hover(),
+            );
+            ui.painter().rect_filled(rect, 4.0, chrome::PANEL);
+            let origin = rect.min + egui::vec2(8.0, 8.0);
+            let first = ((ui.clip_rect().top() - origin.y) / height)
+                .floor()
+                .max(0.0) as usize;
+            let end = (((ui.clip_rect().bottom() - origin.y) / height)
+                .ceil()
+                .max(0.0) as usize)
+                .min(code.len());
+            for line in first.min(end)..end {
+                let mut job = code.line(line, "");
+                for section in &mut job.sections {
+                    section.format.font_id = font.clone();
+                }
+                let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+                ui.painter().galley(
+                    origin + egui::vec2(0.0, line as f32 * height),
+                    galley,
+                    chrome::TEXT,
+                );
+            }
+            response.context_menu(|ui| {
+                if ui.button("Copy code").clicked() {
+                    ui.ctx().copy_text(code.source().to_owned());
+                    ui.close();
                 }
             });
         });
@@ -5435,8 +5832,13 @@ fn source_loading_preview(
     if response.clicked() {
         response.request_focus();
     }
-    let mut starts = vec![0];
-    starts.extend(text.match_indices('\n').map(|(byte, _)| byte + 1));
+    let starts = crate::editor_layout::preview_lines(ui, id).unwrap_or_else(|| {
+        Arc::new(
+            std::iter::once(0)
+                .chain(text.match_indices('\n').take(128).map(|(byte, _)| byte + 1))
+                .collect(),
+        )
+    });
     let height = ui.fonts_mut(|fonts| fonts.row_height(&FontId::monospace(size)));
     let mut scroll = egui::ScrollArea::both().id_salt("source-scroll");
     if let Some((line, _)) = jump {
@@ -5446,7 +5848,11 @@ fn source_loading_preview(
         ui.spacing_mut().item_spacing.y = 0.0;
         scroll.show_rows(ui, height, starts.len(), |ui, rows| {
             for row in rows {
-                let end = starts.get(row + 1).copied().unwrap_or(text.len());
+                let end = starts.get(row + 1).copied().unwrap_or_else(|| {
+                    text[starts[row]..]
+                        .find('\n')
+                        .map_or(text.len(), |i| starts[row] + i)
+                });
                 ui.horizontal(|ui| {
                     ui.add_sized(
                         [62.0 * size / 13.0, height],
@@ -5657,10 +6063,16 @@ fn text_editor(
             folded,
         ));
         let layout_key = egui::util::hash((style_key, viewport));
-        if let Some(cached) = editor_layout.lock().unwrap().as_ref()
-            && cached.key == layout_key
         {
-            return cached.galley.clone();
+            let mut cached = editor_layout.lock().unwrap();
+            if let Some(cached) = cached.as_ref()
+                && cached.key == layout_key
+            {
+                return cached.galley.clone();
+            }
+            // The previous frame has been presented. Release our redundant
+            // reference so visible meshes can update the retained galley in place.
+            *cached = None;
         }
         if large
             && let Some(galley) = crate::editor_layout::repaint_folded_viewport(
@@ -5782,7 +6194,7 @@ fn text_editor(
                     && ui.input(|i| i.modifiers.command)
                     && let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
                     && let Some((range, token)) = cached_hovered_token(
-                        ui.ctx(),
+                        ui,
                         id,
                         source_hash,
                         edits.get(),
@@ -6365,7 +6777,7 @@ fn visible_occurrences(
 }
 
 fn cached_hovered_token(
-    ctx: &egui::Context,
+    ui: &egui::Ui,
     id: egui::Id,
     source: u64,
     edits: u64,
@@ -6380,18 +6792,54 @@ fn cached_hovered_token(
         galley.rows.as_ptr() as usize,
         position.x.to_bits(),
         position.y.to_bits(),
+        galley.pixels_per_point.to_bits(),
+        galley.rect.width().to_bits(),
+        galley.rect.height().to_bits(),
     ));
-    ctx.data_mut(|data| {
-        let id = id.with("hovered-token");
-        if let Some((old, hit)) = data.get_temp::<(u64, Hit)>(id)
-            && old == key
-        {
-            return hit;
-        }
-        let hit = hovered_token(text, galley, position);
-        data.insert_temp(id, (key, hit.clone()));
-        hit
-    })
+    let cache_id = id.with("hovered-token");
+    if let Some((old, hit)) = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<(u64, Hit)>(cache_id))
+        && old == key
+    {
+        return hit;
+    }
+    let row = galley
+        .rows
+        .partition_point(|row| row.pos.y + row.size.y <= position.y);
+    let hit = if let Some((byte, offset)) = crate::editor_layout::row_offsets(ui, id, row) {
+        galley.rows.get(row).and_then(|row| {
+            if position.y < row.pos.y || row.size.y == 0.0 || byte > text.len() {
+                return None;
+            }
+            let column = row.glyphs.partition_point(|glyph| {
+                row.pos.x + glyph.pos.x + glyph.advance_width <= position.x
+            });
+            let glyph = row.glyphs.get(column)?;
+            if position.x < row.pos.x + glyph.pos.x {
+                return None;
+            }
+            let end = text[byte..].find('\n').map_or(text.len(), |i| byte + i);
+            let line = &text[byte..end];
+            let token = navigation::token_at(line, column)?;
+            let at = line
+                .char_indices()
+                .nth(column)
+                .map_or(line.len(), |(i, _)| i);
+            let before = line[..at]
+                .chars()
+                .rev()
+                .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+                .count();
+            let start = offset + column - before;
+            Some((start..start + token.chars().count(), token))
+        })
+    } else {
+        hovered_token(text, galley, position)
+    };
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(cache_id, (key, hit.clone())));
+    hit
 }
 
 fn hovered_token(
@@ -6993,13 +7441,15 @@ mod tests {
         let refresh = |app: &mut Coder| {
             app.files_checked = Instant::now() - PROJECT_REFRESH_INTERVAL;
             app.files_completed = Some(Instant::now() - PROJECT_REFRESH_INTERVAL);
+            app.files_requested = true;
+            app.pending_paths = None;
             app.poll(&ctx);
-            assert!(app.files_rx.is_some());
+            assert!(app.files_rx.is_some() || app.patch_rx.is_some());
             let started = app.files_checked;
             app.refresh_files();
             assert_eq!(app.files_checked, started, "an in-flight scan is reused");
             let deadline = Instant::now() + Duration::from_secs(10);
-            while app.files_rx.is_some() {
+            while app.files_rx.is_some() || app.patch_rx.is_some() {
                 app.poll(&ctx);
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(5));
@@ -7010,8 +7460,8 @@ mod tests {
         let new = root.join("src/nested/external.rs");
         std::fs::write(&new, "fn external() {}")?;
         refresh(&mut app);
-        assert!(app.files.contains(&new));
-        assert!(app.folders.contains(&root.join("src/nested")));
+        assert!(app.index_delta.files.contains(&new));
+        assert!(app.index_delta.folders.contains(&root.join("src/nested")));
         app.tree.expand_all(true);
         let mut output = None;
         for _ in 0..3 {
@@ -7032,11 +7482,11 @@ mod tests {
         let renamed = new.with_file_name("renamed.rs");
         std::fs::rename(&new, &renamed)?;
         refresh(&mut app);
-        assert!(!app.files.contains(&new));
-        assert!(app.files.contains(&renamed));
+        assert!(!app.index_delta.files.contains(&new) && !app.files.contains(&new));
+        assert!(app.index_delta.files.contains(&renamed));
         std::fs::remove_file(&renamed)?;
         refresh(&mut app);
-        assert!(!app.files.contains(&renamed));
+        assert!(!app.index_delta.files.contains(&renamed));
         assert!(app.error.is_none());
         Ok(())
     }
@@ -7186,6 +7636,8 @@ mod tests {
         let mut clock = 0.0;
         let mut render = |app: &mut Coder, events| {
             clock += 1.0 / 120.0;
+            let cpu = crate::performance::thread_cpu_time();
+            let counters = crate::editor_layout::counters();
             let start = Instant::now();
             let _ = ctx.run(
                 egui::RawInput {
@@ -7199,7 +7651,20 @@ mod tests {
                 },
                 |ctx| app.draw(ctx),
             );
-            start.elapsed()
+            let wall = start.elapsed();
+            let cpu = cpu.and_then(|start| {
+                crate::performance::thread_cpu_time().map(|end| end.saturating_sub(start))
+            });
+            let after = crate::editor_layout::counters();
+            (
+                wall,
+                cpu,
+                (
+                    after.0 - counters.0,
+                    after.1 - counters.1,
+                    after.2 - counters.2,
+                ),
+            )
         };
         let deadline = Instant::now() + Duration::from_secs(15);
         while app.terminal.benchmark_title() != "READY" {
@@ -7234,6 +7699,7 @@ mod tests {
                 files,
                 folders: Arc::default(),
                 names: Arc::default(),
+                search: None,
                 tree,
             })));
             working.store(false, Ordering::Relaxed);
@@ -7241,6 +7707,8 @@ mod tests {
         app.query = "never_present_in_the_fixture".into();
         app.search_docked = true;
         let mut frames = Vec::new();
+        let mut cpu_frames = Vec::new();
+        let mut slow_frames = Vec::new();
         let mut replies = Vec::new();
         let mut overlap = 0;
         let mut indexed = 0;
@@ -7256,10 +7724,17 @@ mod tests {
             }
             app.terminal.benchmark_focus(&ctx);
             let byte = b'a' + (frames.len() % 20) as u8;
-            frames.push(render(
+            let (wall, cpu, layouts) = render(
                 &mut app,
                 vec![egui::Event::Text(char::from(byte).to_string())],
-            ));
+            );
+            if wall > Duration::from_millis(4) {
+                slow_frames.push(serde_json::json!({"frame":frames.len(),"wall_ms":wall.as_secs_f64()*1000.0,"thread_cpu_ms":cpu.map(|time|time.as_secs_f64()*1000.0),"full_layouts":layouts.0,"edit_layouts":layouts.1,"viewport_patches":layouts.2,"indexed_files":app.files.len()}));
+            }
+            frames.push(wall);
+            if let Some(cpu) = cpu {
+                cpu_frames.push(cpu);
+            }
             let title = format!("KEY_{}", char::from(byte));
             while app.terminal.benchmark_title() != title {
                 assert!(
@@ -7288,11 +7763,13 @@ mod tests {
             matches!(&app.documents[0].content, Content::Text(text) if text.as_str() == source.as_str())
         );
         frames.sort();
+        cpu_frames.sort();
         replies.sort();
         let quantile = |values: &[Duration], q: usize| {
             values[(values.len() - 1) * q / 100].as_secs_f64() * 1000.0
         };
         let report = serde_json::json!({ "frames": frames.len(), "overlapping_frames": overlap, "synthetic_indexed_files": indexed, "real_search_fixture_files": 2000,
+            "frame_thread_cpu_p99_ms":(!cpu_frames.is_empty()).then(||quantile(&cpu_frames,99)),"frame_thread_cpu_max_ms":cpu_frames.last().map(|time|time.as_secs_f64()*1000.0),"slow_frames":slow_frames,
             "frame_p50_ms": quantile(&frames,50), "frame_p95_ms": quantile(&frames,95), "frame_p99_ms": quantile(&frames,99), "frame_max_ms": frames.last().unwrap().as_secs_f64()*1000.0,
             "input_reply_p95_ms": quantile(&replies,95), "input_reply_p99_ms": quantile(&replies,99), "input_reply_max_ms": replies.last().unwrap().as_secs_f64()*1000.0 });
         eprintln!("Combined IDE stress: {report}");
@@ -8155,6 +8632,64 @@ mod tests {
     }
 
     #[test]
+    fn large_changed_file_colors_are_prepared_off_the_ui_thread() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let files = Arc::new(
+            (0..6000)
+                .map(|i| root.join(format!("src/file{i:05}.mark")))
+                .collect::<Vec<_>>(),
+        );
+        let mut app = Coder::empty(root.clone());
+        app.files = files.clone();
+        app.tree = crate::explorer::FileTree::build_shared_cancellable(
+            &root,
+            files,
+            Arc::default(),
+            || false,
+        )
+        .unwrap();
+        app.git.repo = Some(crate::git::Repository {
+            root: root.clone(),
+            branch: "main".into(),
+            head: "abc".into(),
+            base: "HEAD".into(),
+            merge_base: None,
+            branches: Vec::new(),
+            remote: None,
+            files: Arc::new(
+                app.files
+                    .iter()
+                    .map(|path| crate::git::ChangedFile {
+                        path: path.strip_prefix(&root).unwrap().to_owned(),
+                        uncommitted: true,
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+        });
+        let expected = crate::git_view::tree_files(app.git.repo.as_ref().unwrap(), &[]).len();
+        let ctx = egui::Context::default();
+        crate::chrome::install(&ctx);
+        let frame = |app: &mut Coder| {
+            let _ = ctx.run(Default::default(), |ctx| app.sidebar(ctx));
+        };
+        frame(&mut app);
+        assert!(
+            app.git_colors_rx.is_some(),
+            "large changed lists must use a worker"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.git_colors_rx.is_some() {
+            frame(&mut app);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.git_colors.1.len(), expected);
+        Ok(())
+    }
+
+    #[test]
     fn unified_files_panel_switches_scope_and_keeps_deleted_changes() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let root = dir.path().canonicalize()?;
@@ -8185,7 +8720,8 @@ mod tests {
                     committed: true,
                     ..Default::default()
                 },
-            ],
+            ]
+            .into(),
         });
         let ctx = egui::Context::default();
         chrome::install(&ctx);
@@ -8463,6 +8999,20 @@ mod tests {
         for _ in 0..4 {
             frame(&mut app, egui::pos2(700.0, 300.0));
         }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.documents[0]
+            .editor_id
+            .is_none_or(|id| !crate::editor_layout::ready(&ctx, id))
+        {
+            frame(&mut app, egui::pos2(700.0, 300.0));
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        // Let scrollbar geometry settle after the loading preview hands focus
+        // to the editable document, then inspect steady boundary behavior.
+        for _ in 0..4 {
+            frame(&mut app, egui::pos2(700.0, 300.0));
+        }
         let handle = ctx
             .read_response(egui::Id::new("terminal-panel").with("__resize"))
             .unwrap()
@@ -8520,7 +9070,8 @@ mod tests {
                     uncommitted: true,
                     ..Default::default()
                 },
-            ],
+            ]
+            .into(),
         });
         assert_eq!(
             app.opened_search_paths(),
@@ -9498,7 +10049,9 @@ mod tests {
         let ctx = egui::Context::default();
         chrome::install(&ctx);
         let mut cache = MarkdownCache::default();
-        let output = ctx.run(Default::default(), |ctx| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let output = loop {
+            let output = ctx.run(Default::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 markdown_preview(
                     ui,
@@ -9509,6 +10062,10 @@ mod tests {
                 );
             });
         });
+            if output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(t) if t.galley.text() == "Large heading")) { break output; }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        };
         let heading = output
             .shapes
             .iter()
@@ -9568,26 +10125,32 @@ mod tests {
                 ctx.add_bytes_loader(bytes);
                 let mut cache = MarkdownCache::default();
                 for _ in 0..2 {
-                    let output = ctx.run(
-                        egui::RawInput {
-                            screen_rect: Some(egui::Rect::from_min_size(
-                                egui::Pos2::ZERO,
-                                egui::vec2(pane_width, 900.0),
-                            )),
-                            ..Default::default()
-                        },
-                        |ctx| {
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                markdown_preview(
-                                    ui,
-                                    &mut cache,
-                                    source,
-                                    Path::new("/tmp/README.md"),
-                                    egui::util::hash(source),
-                                );
-                            });
-                        },
-                    );
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let output = loop {
+                        let output = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(pane_width, 900.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    markdown_preview(
+                                        ui,
+                                        &mut cache,
+                                        source,
+                                        Path::new("/tmp/README.md"),
+                                        egui::util::hash(source),
+                                    );
+                                });
+                            },
+                        );
+                        if output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.brush.is_some())) { break output; }
+                        assert!(Instant::now() < deadline, "image worker did not finish");
+                        std::thread::yield_now();
+                    };
                     let bounds = output
                         .shapes
                         .iter()

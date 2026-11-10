@@ -131,7 +131,7 @@ pub struct Document {
     /// document holds one copy less.
     disk_hash: Option<u64>,
     disk_checked: Instant,
-    disk_worker: Option<Receiver<Option<DiskStamp>>>,
+    disk_worker: Option<(Option<DiskStamp>, Receiver<Option<DiskStamp>>)>,
     dirty_check_needed: bool,
     dirty_worker: Option<(u64, SharedText, Receiver<bool>)>,
     /// Avoid retrying an invalid disk revision on every UI frame.
@@ -647,12 +647,18 @@ impl Document {
     /// so an idle editor does not re-read the same file twice a second. The
     /// hashes are kept as well, because the answer is asked every frame and
     /// hashing a large text every frame is wasteful.
+    pub fn disk_event(&mut self) {
+        self.disk_checked = Instant::now() - Duration::from_secs(2);
+    }
+
     pub fn can_reload(&mut self) -> bool {
         if let Some(ctx) = &self.io_context {
-            if let Some(rx) = &self.disk_worker {
+            if let Some((baseline, rx)) = &self.disk_worker {
                 match rx.try_recv() {
                     Ok(stamp) => {
-                        self.observed_stamp = stamp;
+                        if *baseline == self.disk_stamp {
+                            self.observed_stamp = stamp;
+                        }
                         self.disk_worker = None;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => self.disk_worker = None,
@@ -664,7 +670,7 @@ impl Document {
                 let path = self.path.clone();
                 let ctx = ctx.clone();
                 let (tx, rx) = mpsc::channel();
-                self.disk_worker = Some(rx);
+                self.disk_worker = Some((self.disk_stamp, rx));
                 std::thread::spawn(move || {
                     let _ = tx.send(disk_stamp(&path));
                     ctx.request_repaint();

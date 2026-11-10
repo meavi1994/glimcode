@@ -69,6 +69,8 @@ pub struct GitTool {
     repo_rx: Option<Job<Repository>>,
     last_refresh: Option<Instant>,
     full_requested: bool,
+    working_paths: Option<std::collections::BTreeSet<PathBuf>>,
+    path_refresh_pending: bool,
     pr: Option<PullRequest>,
     pr_note: Option<String>,
     pr_rx: Option<Job<Option<PullRequest>>>,
@@ -96,6 +98,11 @@ pub struct GitTool {
     pub include_tests: bool,
 }
 impl GitTool {
+    pub fn invalidate_changed_cache(&self) {
+        let old = self.changed_cache.borrow_mut().take();
+        std::thread::spawn(move || drop(old));
+    }
+
     pub fn changed_files(&self, dirty: &[PathBuf]) -> Arc<Vec<git::ChangedFile>> {
         let mut cache = self.changed_cache.borrow_mut();
         if let Some((generation, paths, at, files)) = cache.as_ref()
@@ -134,6 +141,21 @@ impl GitTool {
         *self = Self::default();
         self.refresh(project, ctx);
     }
+    pub fn request_changed_paths(&mut self, paths: Option<Vec<PathBuf>>) {
+        self.working_paths = if !self.path_refresh_pending {
+            paths.map(|paths| paths.into_iter().collect())
+        } else {
+            match (self.working_paths.take(), paths) {
+                (Some(mut old), Some(paths)) => {
+                    old.extend(paths);
+                    Some(old)
+                }
+                _ => None,
+            }
+        };
+        self.path_refresh_pending = true;
+    }
+
     pub fn request_full_refresh(&mut self) {
         self.full_requested = true;
     }
@@ -149,8 +171,13 @@ impl GitTool {
         self.project = project.to_path_buf();
         let root = self.project.clone();
         let base = self.selected_base.clone();
+        let paths = self
+            .working_paths
+            .take()
+            .map(|paths| paths.into_iter().collect());
+        self.path_refresh_pending = false;
         self.repo_rx = Some(worker(ctx, move || {
-            git::repository_refresh(&root, base.as_deref(), full)
+            git::repository_refresh_paths(&root, base.as_deref(), full, paths)
         }));
         self.full_requested = false;
         self.last_refresh = Some(Instant::now());
@@ -170,7 +197,12 @@ impl GitTool {
         true
     }
 
+    #[cfg(test)]
     pub fn poll(&mut self, project: &Path, ctx: &egui::Context) {
+        self.poll_watched(project, ctx, false);
+    }
+
+    pub fn poll_watched(&mut self, project: &Path, ctx: &egui::Context, watched: bool) {
         if self.project != project {
             self.reset(project, ctx);
         }
@@ -186,12 +218,12 @@ impl GitTool {
                         self.file = None;
                         self.failed_file = None;
                     }
-                    let tree_changed = self
-                        .repo
-                        .as_ref()
-                        .is_none_or(|old| old.root != repo.root || old.files != repo.files);
+                    let tree_changed = self.repo.as_ref().is_none_or(|old| {
+                        old.root != repo.root || !Arc::ptr_eq(&old.files, &repo.files)
+                    });
                     self.selected_base = Some(repo.base.clone());
-                    self.repo = Some(repo);
+                    let old = self.repo.replace(repo);
+                    std::thread::spawn(move || drop(old));
                     if tree_changed {
                         self.generation = self.generation.wrapping_add(1);
                     }
@@ -285,7 +317,8 @@ impl GitTool {
                 Err(note) => self.detail_note = Some(note),
             }
         }
-        if self.repo.is_some()
+        if !watched
+            && self.repo.is_some()
             && self.repo_rx.is_none()
             && self
                 .last_refresh
@@ -306,7 +339,7 @@ impl GitTool {
                 self.pr_rx = Some(worker(ctx, move || git::branch_pr(&repo)));
             }
         }
-        if self.repo.is_some() {
+        if !watched && self.repo.is_some() {
             ctx.request_repaint_after(Duration::from_secs(30));
         }
     }
@@ -999,7 +1032,7 @@ fn tree_files_with_ignores(
     dirty: &[PathBuf],
     ignores: &mut crate::ignore_rules::GlobalIgnores,
 ) -> Vec<git::ChangedFile> {
-    let mut files = repo.files.clone();
+    let mut files = repo.files.as_ref().clone();
     let positions: std::collections::HashMap<_, _> = files
         .iter()
         .enumerate()
@@ -2349,7 +2382,8 @@ mod tests {
                     uncommitted: true,
                     ..Default::default()
                 },
-            ],
+            ]
+            .into(),
         };
         let dirty = [
             root.join("tmp/unsaved.rs"),
@@ -2893,7 +2927,8 @@ mod tests {
                     deleted: true,
                     ..Default::default()
                 },
-            ],
+            ]
+            .into(),
         };
         let paths: Vec<_> = ["committed.ts", "working.ts", "deleted.ts", "clean.ts"]
             .iter()
@@ -2979,7 +3014,7 @@ mod tests {
             base: "main".into(),
             merge_base: None,
             branches: vec![],
-            files: vec![],
+            files: vec![].into(),
             remote: None,
         });
         assert!(tool.ensure_file(&path, "first", 1, &ctx).is_none());
@@ -3018,7 +3053,7 @@ mod tests {
                     merge_base: None,
                     branches: vec!["main".into(), "origin/a-very-long-base-branch-name".into()],
                     remote: None,
-                    files: vec![],
+                    files: vec![].into(),
                 }),
                 last_refresh: Some(Instant::now()),
                 ..Default::default()
@@ -3159,7 +3194,8 @@ mod tests {
                 files: vec![git::ChangedFile {
                     path: "main.go".into(),
                     ..Default::default()
-                }],
+                }]
+                .into(),
             }),
             ..Default::default()
         };

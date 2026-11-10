@@ -7,6 +7,72 @@ use comrak::{
     parse_document,
 };
 use egui_commonmark::CommonMarkCache;
+use std::{
+    sync::{Arc, mpsc},
+    time::{Duration, Instant},
+};
+
+#[derive(Default)]
+pub struct HeightIndex {
+    values: Vec<f32>,
+    tree: Vec<f32>,
+}
+impl HeightIndex {
+    pub fn reset(&mut self, values: Vec<f32>) {
+        self.tree = vec![0.0; values.len() + 1];
+        self.values = values;
+        for i in 0..self.values.len() {
+            let mut node = i + 1;
+            while node < self.tree.len() {
+                self.tree[node] += self.values[i];
+                node += node & node.wrapping_neg();
+            }
+        }
+    }
+    pub fn set(&mut self, index: usize, height: f32) {
+        let difference = height - self.values[index];
+        self.values[index] = height;
+        let mut node = index + 1;
+        while node < self.tree.len() {
+            self.tree[node] += difference;
+            node += node & node.wrapping_neg();
+        }
+    }
+    pub fn prefix(&self, count: usize) -> f32 {
+        let mut node = count;
+        let mut value = 0.0;
+        while node > 0 {
+            value += self.tree[node];
+            node &= node - 1;
+        }
+        value
+    }
+    pub fn row(&self, y: f32) -> usize {
+        if self.values.is_empty() {
+            return 0;
+        }
+        let mut index = 0;
+        let mut sum = 0.0;
+        let mut step = self.values.len().next_power_of_two();
+        while step > 0 {
+            let next = index + step;
+            if next < self.tree.len() && sum + self.tree[next] <= y {
+                sum += self.tree[next];
+                index = next;
+            }
+            step /= 2;
+        }
+        index.min(self.values.len() - 1)
+    }
+}
+struct Parsed {
+    large: std::collections::HashMap<usize, crate::markdown_virtual::Block>,
+    events: Vec<Event<'static>>,
+    blocks: Vec<std::ops::Range<usize>>,
+    units: Vec<(usize, usize)>,
+    code: std::collections::HashMap<usize, Arc<crate::preview::SourcePreview>>,
+}
+
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, LinkType, Tag};
 
 #[derive(Default)]
@@ -19,6 +85,12 @@ pub struct MarkdownCache {
     pub blocks: Vec<std::ops::Range<usize>>,
     pub heights: Vec<Option<f32>>,
     pub layout_key: Option<u64>,
+    pub positions: HeightIndex,
+    units: Vec<(usize, usize)>,
+    pub code: std::collections::HashMap<usize, Arc<crate::preview::SourcePreview>>,
+    pub large: std::collections::HashMap<usize, crate::markdown_virtual::Block>,
+    pending: Option<(u64, mpsc::Receiver<Parsed>)>,
+    desired: Option<(u64, Instant)>,
 }
 
 impl MarkdownCache {
@@ -27,30 +99,237 @@ impl MarkdownCache {
         self.prepare_keyed(source, eframe::egui::util::hash(source));
     }
 
+    #[cfg(test)]
     pub fn prepare_keyed(&mut self, source: &str, fingerprint: u64) {
         if fingerprint != self.fingerprint {
-            self.events = parse(source);
-            self.blocks.clear();
-            let mut depth = 0usize;
-            let mut start = 0;
-            for (i, event) in self.events.iter().enumerate() {
+            self.install(fingerprint, prepare(source, false));
+        }
+    }
+    fn install(&mut self, fingerprint: u64, parsed: Parsed) {
+        let old = std::mem::replace(&mut self.events, parsed.events);
+        if !old.is_empty() {
+            std::thread::spawn(move || drop(old));
+        }
+        self.blocks = parsed.blocks;
+        self.units = parsed.units;
+        self.code = parsed.code;
+        self.large = parsed.large;
+        self.heights = vec![None; self.blocks.len()];
+        self.layout_key = None;
+        self.fingerprint = fingerprint;
+    }
+    pub fn request(
+        &mut self,
+        source: &str,
+        fingerprint: u64,
+        width: f32,
+        ctx: &eframe::egui::Context,
+    ) -> bool {
+        let fingerprint = eframe::egui::util::hash((
+            fingerprint,
+            width.to_bits(),
+            ctx.pixels_per_point().to_bits(),
+            ctx.style().visuals.dark_mode,
+        ));
+        if let Some((version, rx)) = &self.pending {
+            match rx.try_recv() {
+                Ok(parsed) => {
+                    let version = *version;
+                    self.pending = None;
+                    if version == fingerprint {
+                        self.install(version, parsed);
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.pending = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.fingerprint == fingerprint {
+            return true;
+        }
+        if self.desired.is_none_or(|(old, _)| old != fingerprint) {
+            self.desired = Some((fingerprint, Instant::now()));
+        }
+        let delay = if self.events.is_empty() {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(200)
+        };
+        let elapsed = self.desired.unwrap().1.elapsed();
+        if self.pending.is_none() && elapsed >= delay {
+            let definitions = ctx.fonts(|fonts| fonts.definitions().clone());
+            let pixels = ctx.pixels_per_point();
+            let source = source.to_owned();
+            let dark = ctx.style().visuals.dark_mode;
+            let ctx = ctx.clone();
+            let (tx, rx) = mpsc::channel();
+            self.pending = Some((fingerprint, rx));
+            std::thread::spawn(move || {
+                let mut parsed = prepare(&source, dark);
+                let worker = eframe::egui::Context::default();
+                worker.set_fonts(definitions);
+                worker.set_pixels_per_point(pixels);
+                let _ = worker.run(Default::default(), |ctx| {
+                    eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                        for (i, range) in parsed.blocks.iter().enumerate() {
+                            if let Some(block) = crate::markdown_virtual::Block::build(
+                                ui,
+                                &parsed.events[range.clone()],
+                                width,
+                            ) {
+                                parsed.large.insert(i, block);
+                            }
+                        }
+                    });
+                });
+                let _ = tx.send(parsed);
+                ctx.request_repaint();
+            });
+        } else if self.pending.is_none() {
+            ctx.request_repaint_after(delay.saturating_sub(elapsed));
+        }
+        false
+    }
+    pub fn resize(&mut self, key: u64, width: f32) {
+        if self.layout_key == Some(key) {
+            return;
+        }
+        self.heights.fill(None);
+        self.layout_key = Some(key);
+        let columns = (width / 7.0).max(1.0);
+        self.positions.reset(
+            self.units
+                .iter()
+                .enumerate()
+                .map(|(i, (chars, lines))| {
+                    if let Some(block) = self.large.get(&i) {
+                        return block.height() + 12.0;
+                    }
+                    self.code.get(&i).map_or_else(
+                        || {
+                            ((*chars as f32 / columns).ceil() + *lines as f32).max(1.0) * 20.0
+                                + 12.0
+                        },
+                        |code| code.len() as f32 * 18.0 + 20.0,
+                    )
+                })
+                .collect(),
+        );
+    }
+}
+
+fn ranges(events: &[Event<'static>]) -> Vec<std::ops::Range<usize>> {
+    let mut result = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, event) in events.iter().enumerate() {
+        match event {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 0 {
+            result.push(start..i + 1);
+            start = i + 1;
+        }
+    }
+    if start < events.len() {
+        result.push(start..events.len());
+    }
+    result
+}
+fn prepare(source: &str, dark: bool) -> Parsed {
+    let source_events = parse(source);
+    let mut events = Vec::new();
+    // A long list is paged at item boundaries; reopened ordered lists retain
+    // the correct ordinal. Nested content remains balanced inside each item.
+    for range in ranges(&source_events) {
+        let slice = &source_events[range];
+        if let Some(Event::Start(Tag::List(number))) = slice.first()
+            && slice.len() > 256
+        {
+            let mut depth = 0;
+            let mut starts = Vec::new();
+            for (i, event) in slice.iter().enumerate() {
+                if depth == 1 && matches!(event, Event::Start(Tag::Item)) {
+                    starts.push(i);
+                }
                 match event {
                     Event::Start(_) => depth += 1,
-                    Event::End(_) => depth = depth.saturating_sub(1),
+                    Event::End(_) => depth -= 1,
                     _ => {}
                 }
-                if depth == 0 {
-                    self.blocks.push(start..i + 1);
-                    start = i + 1;
-                }
             }
-            if start < self.events.len() {
-                self.blocks.push(start..self.events.len());
+            starts.push(slice.len() - 1);
+            for (page, chunk) in starts[..starts.len() - 1].chunks(8).enumerate() {
+                events.push(Event::Start(Tag::List(number.map(|n| n + page as u64 * 8))));
+                let end = starts[(page * 8 + chunk.len()).min(starts.len() - 1)];
+                events.extend_from_slice(&slice[chunk[0]..end]);
+                events.push(Event::End(Tag::List(None).to_end()));
             }
-            self.heights = vec![None; self.blocks.len()];
-            self.layout_key = None;
-            self.fingerprint = fingerprint;
+        } else {
+            events.extend_from_slice(slice);
         }
+    }
+    let blocks = ranges(&events);
+    let mut units = Vec::new();
+    let mut code = std::collections::HashMap::new();
+    for (i, range) in blocks.iter().enumerate() {
+        let mut chars = 0;
+        let mut lines = 0;
+        for event in &events[range.clone()] {
+            match event {
+                Event::Text(t) | Event::Code(t) => {
+                    chars += t.chars().count();
+                    lines += t.bytes().filter(|b| *b == b'\n').count();
+                }
+                Event::SoftBreak | Event::HardBreak => lines += 1,
+                _ => {}
+            }
+        }
+        units.push((chars, lines));
+        if lines > 128
+            && let Event::Start(Tag::CodeBlock(kind)) = &events[range.start]
+        {
+            let language = match kind {
+                CodeBlockKind::Fenced(language) => {
+                    language.split_whitespace().next().unwrap_or("txt")
+                }
+                _ => "txt",
+            };
+            let extension = match language {
+                "rust" => "rs",
+                "python" => "py",
+                "javascript" => "js",
+                "typescript" => "ts",
+                other => other,
+            };
+            let text: String = events[range.clone()]
+                .iter()
+                .filter_map(|event| {
+                    if let Event::Text(t) = event {
+                        Some(t.as_ref())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if let Some(preview) = crate::preview::SourcePreview::build(
+                std::path::PathBuf::from(format!("markdown.{extension}")),
+                text,
+                dark,
+                &|| false,
+            ) {
+                code.insert(i, Arc::new(preview));
+            }
+        }
+    }
+    Parsed {
+        large: Default::default(),
+        events,
+        blocks,
+        units,
+        code,
     }
 }
 
@@ -327,6 +606,30 @@ mod tests {
         ));
         assert!(events.contains(&Event::Text("![code](not-an-image.png)\n".into())));
         assert!(!html.contains("not-an-image.png"));
+    }
+
+    #[test]
+    fn long_lists_are_paged_with_balanced_tags_and_correct_ordinals() {
+        let source = (0..1000)
+            .map(|i| format!("{}. item {i}\n", i + 1))
+            .collect::<String>();
+        let parsed = prepare(&source, false);
+        assert!(parsed.blocks.len() > 100);
+        for (page, range) in parsed.blocks.iter().enumerate() {
+            assert!(
+                matches!(&parsed.events[range.start],Event::Start(Tag::List(Some(start))) if *start==1+page as u64*8)
+            );
+            let mut depth = 0;
+            for event in &parsed.events[range.clone()] {
+                match event {
+                    Event::Start(_) => depth += 1,
+                    Event::End(_) => depth -= 1,
+                    _ => {}
+                }
+                assert!(depth >= 0);
+            }
+            assert_eq!(depth, 0);
+        }
     }
 
     #[test]

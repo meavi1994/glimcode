@@ -50,6 +50,7 @@ pub struct LargeTree {
     expanded: BTreeSet<PathBuf>,
     all_open: bool,
     extras: Arc<BTreeSet<PathBuf>>,
+    delta: Arc<crate::workspace_delta::Delta>,
     scope: Option<(String, bool, bool, u64)>,
     status_revision: u64,
     dirty: Option<Instant>,
@@ -156,6 +157,7 @@ impl LargeTree {
             expanded: BTreeSet::new(),
             all_open: false,
             extras: Arc::default(),
+            delta: Arc::default(),
             scope: None,
             status_revision: 0,
             dirty: None,
@@ -172,6 +174,11 @@ impl LargeTree {
             std::thread::spawn(move || drop(rx));
         }
         self.dirty = Some(Instant::now());
+    }
+
+    pub fn set_delta(&mut self, delta: Arc<crate::workspace_delta::Delta>) {
+        self.delta = delta;
+        self.invalidate();
     }
 
     pub fn expand_all(&mut self, open: bool) {
@@ -193,6 +200,15 @@ impl LargeTree {
             }
         }
         self.reveal = Some(path.to_owned());
+        self.invalidate();
+    }
+
+    pub fn set_shared_extras(&mut self, extras: Arc<BTreeSet<PathBuf>>) {
+        if Arc::ptr_eq(&self.extras, &extras) {
+            return;
+        }
+        let old = std::mem::replace(&mut self.extras, extras);
+        std::thread::spawn(move || drop(old));
         self.invalidate();
     }
 
@@ -267,6 +283,7 @@ impl LargeTree {
             let expanded = self.expanded.clone();
             let all_open = self.all_open;
             let extras = self.extras.clone();
+            let delta = self.delta.clone();
             let filter = filter.to_owned();
             let changed = changed_only.then(|| colors.keys().cloned().collect::<BTreeSet<_>>());
             let reveal = self.reveal.clone();
@@ -275,12 +292,13 @@ impl LargeTree {
             self.pending = Some((rx, cancel.clone()));
             let ctx = ui.ctx().clone();
             std::thread::spawn(move || {
-                if let Some(rows) = project(
+                if let Some(rows) = project_delta(
                     &index,
                     &root,
                     &expanded,
                     all_open,
                     &extras,
+                    &delta,
                     &filter,
                     changed.as_ref(),
                     hide_tests,
@@ -404,12 +422,41 @@ fn visible_rows(top: f32, clip: egui::Rect, count: usize, height: f32) -> std::o
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn project(
     index: &Index,
     root: &Path,
     expanded: &BTreeSet<PathBuf>,
     all_open: bool,
     extras: &BTreeSet<PathBuf>,
+    query: &str,
+    changed: Option<&BTreeSet<PathBuf>>,
+    hide_tests: bool,
+    reveal: Option<&Path>,
+    cancel: &AtomicBool,
+) -> Option<Projection> {
+    project_delta(
+        index,
+        root,
+        expanded,
+        all_open,
+        extras,
+        &crate::workspace_delta::Delta::default(),
+        query,
+        changed,
+        hide_tests,
+        reveal,
+        cancel,
+    )
+}
+
+fn project_delta(
+    index: &Index,
+    root: &Path,
+    expanded: &BTreeSet<PathBuf>,
+    all_open: bool,
+    extras: &BTreeSet<PathBuf>,
+    delta: &crate::workspace_delta::Delta,
     query: &str,
     changed: Option<&BTreeSet<PathBuf>>,
     hide_tests: bool,
@@ -449,6 +496,19 @@ fn project(
             }
         }
     }
+    for (paths, folder) in [(&delta.files, false), (&delta.folders, true)] {
+        for path in paths {
+            if let Some(parent) = path.parent() {
+                overlay
+                    .entry(parent.to_owned())
+                    .or_default()
+                    .push(Arc::new(Entry {
+                        path: EntryPath::Owned(path.clone()),
+                        folder,
+                    }));
+            }
+        }
+    }
     let mut allowed = BTreeSet::new();
     if scoped {
         for entries in index.values().chain(overlay.values()) {
@@ -481,6 +541,8 @@ fn project(
     }
     struct Walker<'a> {
         index: &'a Index,
+        delta: &'a crate::workspace_delta::Delta,
+        extras: &'a BTreeSet<PathBuf>,
         overlay: &'a Index,
         allowed: Option<&'a BTreeSet<PathBuf>>,
         expanded: &'a BTreeSet<PathBuf>,
@@ -512,6 +574,11 @@ fn project(
                     (None, Some(_)) => extra.next(),
                     (None, None) => break,
                 }?;
+                if self.delta.hidden(entry.path(), entry.folder)
+                    && !self.extras.contains(entry.path())
+                {
+                    continue;
+                }
                 if self
                     .allowed
                     .is_some_and(|paths| !paths.contains(entry.path()))
@@ -533,6 +600,8 @@ fn project(
     }
     let mut walker = Walker {
         index,
+        delta,
+        extras,
         overlay: &overlay,
         allowed: scoped.then_some(&allowed),
         expanded,

@@ -14,7 +14,9 @@ mod highlighting;
 mod ignore_rules;
 mod markdown;
 mod markdown_images;
+mod markdown_virtual;
 mod navigation;
+mod path_search;
 mod performance;
 mod preferences;
 mod preview;
@@ -26,6 +28,7 @@ mod session;
 mod sheet;
 mod terminal;
 mod test_files;
+mod workspace_delta;
 mod workspace_watch;
 mod worktrees;
 

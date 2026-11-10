@@ -13,6 +13,21 @@ use std::{
     },
 };
 
+#[cfg(test)]
+static FULL_LAYOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static EDIT_LAYOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static VIEWPORT_PATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub fn counters() -> (u64, u64, u64) {
+    (
+        FULL_LAYOUTS.load(Ordering::Relaxed),
+        EDIT_LAYOUTS.load(Ordering::Relaxed),
+        VIEWPORT_PATCHES.load(Ordering::Relaxed),
+    )
+}
+
 #[derive(Clone)]
 struct Line {
     galley: Arc<egui::Galley>,
@@ -21,25 +36,263 @@ struct Line {
     painted: bool,
 }
 
+/// A balanced implicit tree stores byte offsets and geometry summaries.
+/// Structural edits replace only the affected leaves and their ancestor paths.
+struct RowNode {
+    left: Option<Box<RowNode>>,
+    right: Option<Box<RowNode>>,
+    priority: u64,
+    count: usize,
+    total_bytes: usize,
+    total_chars: usize,
+    chars: usize,
+    bytes: usize,
+    own: Arc<egui::Galley>,
+    metrics: Arc<egui::Galley>,
+}
+struct RowIndex {
+    root: Option<Box<RowNode>>,
+    empty: Arc<LayoutJob>,
+    pixels: f32,
+}
+impl RowIndex {
+    fn new(lines: &[Arc<Line>], jobs: &[Arc<LayoutJob>], pixels: f32) -> Self {
+        let mut index = Self {
+            root: None,
+            empty: Arc::new(LayoutJob {
+                round_output_to_gui: false,
+                ..Default::default()
+            }),
+            pixels,
+        };
+        let rows: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                (
+                    jobs[i].text.len() + usize::from(i + 1 < lines.len()),
+                    line.clone(),
+                )
+            })
+            .collect();
+        index.root = index.build(&rows, 0);
+        index
+    }
+    fn leaf(line: &Line) -> Arc<egui::Galley> {
+        let mut metrics = (*line.metrics).clone();
+        metrics.mesh_bounds = line.galley.mesh_bounds;
+        metrics.num_vertices = line.galley.num_vertices;
+        metrics.num_indices = line.galley.num_indices;
+        Arc::new(metrics)
+    }
+    fn build(&self, rows: &[(usize, Arc<Line>)], depth: u32) -> Option<Box<RowNode>> {
+        if rows.is_empty() {
+            return None;
+        }
+        let middle = rows.len() / 2;
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+        let priority = ((255 - depth.min(255)) as u64) << 56
+            | (egui::util::hash(serial) & 0x00ff_ffff_ffff_ffff);
+        let own = Self::leaf(&rows[middle].1);
+        let mut node = Box::new(RowNode {
+            left: self.build(&rows[..middle], depth + 1),
+            right: self.build(&rows[middle + 1..], depth + 1),
+            priority,
+            count: 1,
+            total_bytes: rows[middle].0,
+            total_chars: 0,
+            chars: rows[middle].1.galley.job.text.chars().count()
+                + usize::from(rows[middle].0 > rows[middle].1.galley.job.text.len()),
+            bytes: rows[middle].0,
+            metrics: own.clone(),
+            own,
+        });
+        self.merge_summary(&mut node);
+        Some(node)
+    }
+    fn count(node: &Option<Box<RowNode>>) -> usize {
+        node.as_ref().map_or(0, |n| n.count)
+    }
+    fn bytes(node: &Option<Box<RowNode>>) -> usize {
+        node.as_ref().map_or(0, |n| n.total_bytes)
+    }
+    fn merge_summary(&self, node: &mut RowNode) {
+        let mut parts = Vec::with_capacity(3);
+        if let Some(left) = &node.left {
+            parts.push(left.metrics.clone());
+        }
+        parts.push(node.own.clone());
+        if let Some(right) = &node.right {
+            parts.push(right.metrics.clone());
+        }
+        let mut metrics = egui::Galley::concat(self.empty.clone(), &parts, self.pixels);
+        let mut y = 0.0;
+        let mut width: f32 = 0.0;
+        for part in parts {
+            metrics.mesh_bounds |= part.mesh_bounds.translate(egui::vec2(0.0, y));
+            y += part.rect.height();
+            width = width.max(part.rect.width());
+        }
+        metrics.rect = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(width, y));
+        node.count = Self::count(&node.left) + Self::count(&node.right) + 1;
+        node.total_bytes = Self::bytes(&node.left) + Self::bytes(&node.right) + node.bytes;
+        node.total_chars = node.left.as_ref().map_or(0, |n| n.total_chars)
+            + node.right.as_ref().map_or(0, |n| n.total_chars)
+            + node.chars;
+        node.metrics = Arc::new(metrics);
+    }
+    fn join(
+        &self,
+        left: Option<Box<RowNode>>,
+        right: Option<Box<RowNode>>,
+    ) -> Option<Box<RowNode>> {
+        match (left, right) {
+            (None, other) | (other, None) => other,
+            (Some(mut left), Some(mut right)) => {
+                if left.priority >= right.priority {
+                    left.right = self.join(left.right.take(), Some(right));
+                    self.merge_summary(&mut left);
+                    Some(left)
+                } else {
+                    right.left = self.join(Some(left), right.left.take());
+                    self.merge_summary(&mut right);
+                    Some(right)
+                }
+            }
+        }
+    }
+    fn split(
+        &self,
+        node: Option<Box<RowNode>>,
+        row: usize,
+    ) -> (Option<Box<RowNode>>, Option<Box<RowNode>>) {
+        let Some(mut node) = node else {
+            return (None, None);
+        };
+        let left_count = Self::count(&node.left);
+        if row <= left_count {
+            let (left, right) = self.split(node.left.take(), row);
+            node.left = right;
+            self.merge_summary(&mut node);
+            (left, Some(node))
+        } else {
+            let (left, right) = self.split(node.right.take(), row - left_count - 1);
+            node.right = left;
+            self.merge_summary(&mut node);
+            (Some(node), right)
+        }
+    }
+    fn splice(&mut self, range: std::ops::Range<usize>, rows: &[(usize, Arc<Line>)]) {
+        let root = self.root.take();
+        let (left, tail) = self.split(root, range.start);
+        let (_, right) = self.split(tail, range.len());
+        let inserted = self.build(rows, 0);
+        self.root = self.join(self.join(left, inserted), right);
+    }
+    fn update(&mut self, row: usize, bytes: usize, line: &Line) {
+        fn update(index: &RowIndex, node: &mut RowNode, row: usize, bytes: usize, line: &Line) {
+            let left = RowIndex::count(&node.left);
+            if row < left {
+                update(index, node.left.as_mut().unwrap(), row, bytes, line);
+            } else if row == left {
+                node.bytes = bytes;
+                node.chars = line.galley.job.text.chars().count()
+                    + usize::from(bytes > line.galley.job.text.len());
+                node.own = RowIndex::leaf(line);
+            } else {
+                update(
+                    index,
+                    node.right.as_mut().unwrap(),
+                    row - left - 1,
+                    bytes,
+                    line,
+                );
+            }
+            index.merge_summary(node);
+        }
+        let mut root = self.root.take().unwrap();
+        update(self, &mut root, row, bytes, line);
+        self.root = Some(root);
+    }
+    fn metric(&self) -> Arc<egui::Galley> {
+        self.root.as_ref().unwrap().metrics.clone()
+    }
+    fn position(&self, byte: usize, rows: usize) -> (usize, usize) {
+        if byte >= Self::bytes(&self.root) {
+            return (rows - 1, self.prefix(rows - 1));
+        }
+        let mut node = self.root.as_ref().unwrap();
+        let mut index = 0;
+        let mut before = 0;
+        loop {
+            let left_bytes = Self::bytes(&node.left);
+            let left_count = Self::count(&node.left);
+            if byte < before + left_bytes {
+                node = node.left.as_ref().unwrap();
+            } else if byte < before + left_bytes + node.bytes {
+                return (index + left_count, before + left_bytes);
+            } else {
+                before += left_bytes + node.bytes;
+                index += left_count + 1;
+                node = node.right.as_ref().unwrap();
+            }
+        }
+    }
+    fn prefix(&self, row: usize) -> usize {
+        self.prefixes(row).0
+    }
+    fn prefixes(&self, row: usize) -> (usize, usize) {
+        let mut node = self.root.as_ref();
+        let mut remaining = row;
+        let mut bytes = 0;
+        let mut chars = 0;
+        while let Some(current) = node {
+            let count = Self::count(&current.left);
+            if remaining <= count {
+                node = current.left.as_ref();
+            } else {
+                bytes += Self::bytes(&current.left) + current.bytes;
+                chars += current.left.as_ref().map_or(0, |n| n.total_chars) + current.chars;
+                remaining -= count + 1;
+                node = current.right.as_ref();
+            }
+        }
+        (bytes, chars)
+    }
+}
+
+enum Preparation {
+    Lines(Arc<Vec<usize>>),
+    Geometry(HashMap<u64, Arc<Line>>),
+}
+
 #[derive(Default)]
 struct Lines {
     entries: HashMap<u64, Arc<Line>>,
     previous: HashMap<u64, Arc<Line>>,
     geometry: HashMap<u64, Arc<Line>>,
     prepared_font: Option<u64>,
-    pending: Option<(mpsc::Receiver<HashMap<u64, Arc<Line>>>, Arc<AtomicBool>)>,
+    pending: Option<(mpsc::Receiver<Preparation>, Arc<AtomicBool>)>,
     deferred: Vec<egui::Event>,
+    preview_lines: Option<Arc<Vec<usize>>>,
     job_key: Option<u64>,
     job: Option<Arc<LayoutJob>>,
     ordered_jobs: Vec<Arc<LayoutJob>>,
     ordered_lines: Vec<Arc<Line>>,
     ordered_keys: Vec<u64>,
     ordered_geometry_keys: Vec<u64>,
+    style_generation: u64,
+    ordered_styles: Vec<u64>,
     composed: Option<Arc<egui::Galley>>,
     folded_composed: Option<Arc<egui::Galley>>,
     projection_key: Option<u64>,
     visible_rows: Vec<usize>,
     visible_tops: Vec<f32>,
+    rows: Option<RowIndex>,
+    uniform_metrics: bool,
+    uses: HashMap<u64, usize>,
+    geometry_uses: HashMap<u64, usize>,
 }
 
 impl Drop for Lines {
@@ -90,6 +343,7 @@ pub fn prepare(
             std::thread::spawn(move || drop(rx));
         }
         cache.prepared_font = Some(font_key);
+        cache.preview_lines = None;
         let definitions = ui.fonts(|fonts| fonts.definitions().clone());
         let font = font.clone();
         let text = text.to_owned();
@@ -99,6 +353,13 @@ pub fn prepare(
         let (tx, rx) = mpsc::channel();
         cache.pending = Some((rx, cancel));
         std::thread::spawn(move || {
+            let starts = Arc::new(
+                std::iter::once(0)
+                    .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+                    .collect(),
+            );
+            let _ = tx.send(Preparation::Lines(starts));
+            repaint.request_repaint();
             let worker = egui::Context::default();
             worker.set_fonts(definitions);
             worker.set_pixels_per_point(pixels);
@@ -119,25 +380,31 @@ pub fn prepare(
                         strip_meshes(&mut line);
                         entries.insert(key, Arc::new(line));
                     }
-                    let _ = tx.send(entries);
+                    let _ = tx.send(Preparation::Geometry(entries));
                     repaint.request_repaint();
                 });
             });
         });
     }
-    if let Some((rx, _)) = &cache.pending {
+    loop {
+        let Some((rx, _)) = &cache.pending else {
+            break;
+        };
         match rx.try_recv() {
-            Ok(geometry) => {
+            Ok(Preparation::Lines(starts)) => cache.preview_lines = Some(starts),
+            Ok(Preparation::Geometry(geometry)) => {
                 let previous = std::mem::replace(&mut cache.geometry, geometry);
                 std::thread::spawn(move || drop(previous));
                 cache.pending = None;
+                cache.preview_lines = None;
+                break;
             }
             Err(mpsc::TryRecvError::Disconnected) => {
-                // A failed preparation may be retried without disabling editing forever.
                 cache.prepared_font = None;
                 cache.pending = None;
+                break;
             }
-            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Empty) => break,
         }
     }
     let ready = cache.pending.is_none() && cache.prepared_font.is_some();
@@ -150,6 +417,19 @@ pub fn prepare(
         }
     }
     ready
+}
+
+pub fn row_offsets(ui: &egui::Ui, id: egui::Id, row: usize) -> Option<(usize, usize)> {
+    state(ui, id)
+        .lock()
+        .unwrap()
+        .rows
+        .as_ref()
+        .map(|rows| rows.prefixes(row))
+}
+
+pub fn preview_lines(ui: &egui::Ui, id: egui::Id) -> Option<Arc<Vec<usize>>> {
+    state(ui, id).lock().unwrap().preview_lines.clone()
 }
 
 pub fn defer_input(ui: &egui::Ui, id: egui::Id) {
@@ -300,8 +580,17 @@ pub fn repaint_folded_viewport(
     if cache.job_key != Some(key) {
         return None;
     }
-    let job = cache.job.clone()?;
-    project_rows(&mut cache, folds);
+    Some(paint_viewport(ui, &mut cache, viewport, folds))
+}
+
+fn paint_viewport(
+    ui: &egui::Ui,
+    cache: &mut Lines,
+    viewport: Option<(i32, i32)>,
+    folds: &[&crate::folding::Region],
+) -> Arc<egui::Galley> {
+    let job = cache.job.clone().unwrap();
+    project_rows(cache, folds);
     let (start, end) = viewport.map_or((0, cache.visible_rows.len()), |(top, bottom)| {
         (
             cache
@@ -312,9 +601,67 @@ pub fn repaint_folded_viewport(
                 .min(cache.visible_rows.len()),
         )
     });
-    let mut changed = false;
+    let mut changed = Vec::new();
     for index in start..end {
         let i = cache.visible_rows[index];
+        if cache.ordered_styles[i] != cache.style_generation {
+            let start = cache.rows.as_ref().unwrap().prefix(i);
+            let end = start + cache.ordered_jobs[i].text.len();
+            let first = job.sections.partition_point(|s| s.byte_range.end <= start);
+            let mut sections = Vec::new();
+            for section in &job.sections[first..] {
+                if section.byte_range.start > end {
+                    break;
+                }
+                sections.push(LayoutSection {
+                    leading_space: if start <= section.byte_range.start {
+                        section.leading_space
+                    } else {
+                        0.0
+                    },
+                    byte_range: section.byte_range.start.saturating_sub(start)
+                        ..section.byte_range.end.min(end).saturating_sub(start),
+                    format: section.format.clone(),
+                });
+            }
+            if sections.is_empty()
+                && let Some(section) = job.sections.get(first.saturating_sub(1))
+            {
+                sections.push(LayoutSection {
+                    leading_space: 0.0,
+                    byte_range: 0..0,
+                    format: section.format.clone(),
+                });
+            }
+            let mut line_job = (*cache.ordered_jobs[i]).clone();
+            line_job.sections = sections;
+            let key = egui::util::hash((&line_job, ui.ctx().pixels_per_point().to_bits()));
+            let old = cache.ordered_keys[i];
+            if let Some(count) = cache.uses.get_mut(&old) {
+                *count -= 1;
+                if *count == 0 {
+                    cache.uses.remove(&old);
+                    cache.entries.remove(&old);
+                }
+            }
+            *cache.uses.entry(key).or_default() += 1;
+            cache.ordered_keys[i] = key;
+            cache.ordered_jobs[i] = Arc::new(line_job);
+            cache.ordered_styles[i] = cache.style_generation;
+            // Geometry is unchanged; only this visible row needs a fresh mesh.
+            let line = cache
+                .entries
+                .get(&key)
+                .filter(|line| line.painted)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(make_line(ui, (*cache.ordered_jobs[i]).clone())));
+            cache.ordered_lines[i] = line.clone();
+            cache.entries.insert(key, line.clone());
+            let bytes =
+                cache.ordered_jobs[i].text.len() + usize::from(i + 1 < cache.ordered_jobs.len());
+            cache.rows.as_mut().unwrap().update(i, bytes, &line);
+            changed.push(i);
+        }
         if !cache.ordered_lines[i].painted {
             let key = cache.ordered_keys[i];
             let line = cache
@@ -324,19 +671,55 @@ pub fn repaint_folded_viewport(
                 .cloned()
                 .unwrap_or_else(|| Arc::new(make_line(ui, (*cache.ordered_jobs[i]).clone())));
             cache.ordered_lines[i] = line.clone();
-            cache.entries.insert(key, line);
-            changed = true;
+            cache.entries.insert(key, line.clone());
+            let bytes =
+                cache.ordered_jobs[i].text.len() + usize::from(i + 1 < cache.ordered_jobs.len());
+            if let Some(rows) = &mut cache.rows {
+                rows.update(i, bytes, &line);
+            }
+            changed.push(i);
         }
     }
-    if changed || cache.composed.is_none() {
+    if cache.composed.is_none() {
         cache.composed = Some(compose(
             job,
             &cache.ordered_lines,
             ui.ctx().pixels_per_point(),
         ));
         cache.folded_composed = None;
+    } else if !changed.is_empty() {
+        #[cfg(test)]
+        VIEWPORT_PATCHES.fetch_add(1, Ordering::Relaxed);
+        let lines = &cache.ordered_lines;
+        let replacements: Vec<_> = changed.iter().map(|i| (*i, lines[*i].clone())).collect();
+        let count = cache.ordered_lines.len();
+        let Lines {
+            composed,
+            folded_composed,
+            ..
+        } = cache;
+        for target in [composed, folded_composed].into_iter().flatten() {
+            let galley = Arc::make_mut(target);
+            for (i, line) in &replacements {
+                let replacement = if *i + 1 == count {
+                    &line.galley.rows[0]
+                } else {
+                    &line.continued[0]
+                };
+                let row = &mut galley.rows[*i];
+                if row.size.y == 0.0 {
+                    continue;
+                }
+                galley.num_vertices = galley.num_vertices - row.visuals.mesh.vertices.len()
+                    + replacement.visuals.mesh.vertices.len();
+                galley.num_indices = galley.num_indices - row.visuals.mesh.indices.len()
+                    + replacement.visuals.mesh.indices.len();
+                row.row = replacement.row.clone();
+                galley.mesh_bounds |= row.visuals.mesh_bounds.translate(row.pos.to_vec2());
+            }
+        }
     }
-    Some(composed_view(&mut cache, folds))
+    composed_view(cache, folds)
 }
 
 fn project_rows(cache: &mut Lines, folds: &[&crate::folding::Region]) {
@@ -377,7 +760,7 @@ pub fn layout_visible_keyed(
 pub fn layout_folded_visible_keyed(
     ui: &egui::Ui,
     id: egui::Id,
-    job: LayoutJob,
+    mut job: LayoutJob,
     viewport: Option<(i32, i32)>,
     job_key: u64,
     folds: &[&crate::folding::Region],
@@ -393,6 +776,45 @@ pub fn layout_folded_visible_keyed(
     }
     let state = state(ui, id);
     let mut cache = state.lock().unwrap();
+    if folds.is_empty() && update_plain_rows(ui, &mut cache, &mut job, job_key, viewport) {
+        #[cfg(test)]
+        EDIT_LAYOUTS.fetch_add(1, Ordering::Relaxed);
+        return cache.composed.as_ref().unwrap().clone();
+    }
+    // Syntax results change colors without changing row geometry. Install the
+    // new source job once and color rows only as they enter the viewport.
+    if cache.uniform_metrics
+        && cache.rows.is_some()
+        && cache.composed.is_some()
+        && let Some(previous) = &cache.job
+        && job.text == previous.text
+        && job.wrap == previous.wrap
+        && job.first_row_min_height == previous.first_row_min_height
+        && job.round_output_to_gui == previous.round_output_to_gui
+        && cache.composed.as_ref().unwrap().pixels_per_point == ui.ctx().pixels_per_point()
+        && let Some(first) = previous.sections.first()
+        && job
+            .sections
+            .iter()
+            .all(|s| s.leading_space == 0.0 && same_metrics(&s.format, &first.format))
+        && previous.sections.iter().all(|s| s.leading_space == 0.0)
+    {
+        let job = Arc::new(job);
+        cache.job = Some(job.clone());
+        cache.job_key = Some(job_key);
+        cache.style_generation = cache.style_generation.wrapping_add(1);
+        let Lines {
+            composed,
+            folded_composed,
+            ..
+        } = &mut *cache;
+        for target in [composed, folded_composed].into_iter().flatten() {
+            Arc::make_mut(target).job = job.clone();
+        }
+        return paint_viewport(ui, &mut cache, viewport, folds);
+    }
+    #[cfg(test)]
+    FULL_LAYOUTS.fetch_add(1, Ordering::Relaxed);
     let mut next = HashMap::with_capacity(cache.entries.len());
     let mut lines = Vec::new();
     let mut jobs = Vec::new();
@@ -522,17 +944,291 @@ pub fn layout_folded_visible_keyed(
     cache.previous = std::mem::replace(&mut cache.entries, next);
     cache.geometry = next_geometry;
     let job = Arc::new(job);
+    cache.uniform_metrics = job.sections.first().is_some_and(|first| {
+        job.sections
+            .iter()
+            .all(|section| same_metrics(&section.format, &first.format))
+    });
     cache.job = Some(job.clone());
     cache.job_key = Some(job_key);
+    cache.ordered_styles = vec![cache.style_generation; lines.len()];
     cache.ordered_lines = lines;
     cache.ordered_jobs = jobs;
     cache.ordered_keys = keys;
     cache.ordered_geometry_keys = geometry_keys;
+    cache.uses.clear();
+    cache.geometry_uses.clear();
+    let keys = cache.ordered_keys.clone();
+    let geometry = cache.ordered_geometry_keys.clone();
+    for key in keys {
+        *cache.uses.entry(key).or_default() += 1;
+    }
+    for key in geometry {
+        *cache.geometry_uses.entry(key).or_default() += 1;
+    }
+    cache.rows = Some(RowIndex::new(
+        &cache.ordered_lines,
+        &cache.ordered_jobs,
+        pixels,
+    ));
     cache.projection_key = None;
     project_rows(&mut cache, folds);
     cache.composed = Some(compose(job, &cache.ordered_lines, pixels));
     cache.folded_composed = None;
     composed_view(&mut cache, folds)
+}
+
+fn same_metrics(a: &egui::TextFormat, b: &egui::TextFormat) -> bool {
+    a.font_id == b.font_id
+        && a.line_height == b.line_height
+        && a.extra_letter_spacing == b.extra_letter_spacing
+        && a.valign == b.valign
+}
+
+/// Typing and structural edits split only the affected rows. Egui's flat row
+/// positions shift after inserted/deleted lines, but jobs, hashes, summaries and
+/// font geometry of unchanged lines are retained.
+fn update_plain_rows(
+    ui: &egui::Ui,
+    cache: &mut Lines,
+    job: &mut LayoutJob,
+    key: u64,
+    viewport: Option<(i32, i32)>,
+) -> bool {
+    let Some(previous) = &cache.job else {
+        return false;
+    };
+    if cache.composed.is_none()
+        || cache.rows.is_none()
+        || job.sections.len() != 1
+        || !cache.uniform_metrics
+        || previous.sections.is_empty()
+        || !same_metrics(&job.sections[0].format, &previous.sections[0].format)
+        || job.wrap != previous.wrap
+        || job.first_row_min_height != previous.first_row_min_height
+        || previous.wrap.max_width.is_finite()
+        || job.round_output_to_gui != previous.round_output_to_gui
+        || cache.composed.as_ref().unwrap().pixels_per_point != ui.ctx().pixels_per_point()
+        || job.sections[0].leading_space != previous.sections[0].leading_space
+    {
+        return false;
+    }
+    if job.text == previous.text {
+        if previous.sections.len() != 1 || job.sections[0].format != previous.sections[0].format {
+            return false;
+        }
+        cache.job_key = Some(key);
+        return true;
+    }
+    let old = &previous.text;
+    let new = &job.text;
+    let mut prefix = old
+        .bytes()
+        .zip(new.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let mut suffix = old[prefix..]
+        .bytes()
+        .rev()
+        .zip(new[prefix..].bytes().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix) {
+        suffix -= 1;
+    }
+    let rows = cache.rows.as_ref().unwrap();
+    let (first, start) = rows.position(prefix, cache.ordered_lines.len());
+    let (last, _) = rows.position(old.len() - suffix, cache.ordered_lines.len());
+    let end = rows.prefix(last + 1).min(old.len());
+    let Some(new_end) = end.checked_add_signed(new.len() as isize - old.len() as isize) else {
+        return false;
+    };
+    if new_end > new.len() || !new.is_char_boundary(new_end) {
+        return false;
+    }
+    let mut texts: Vec<_> = new[start..new_end]
+        .split_inclusive('\n')
+        .map(|line| line.strip_suffix('\n').unwrap_or(line))
+        .collect();
+    if last + 1 == cache.ordered_lines.len()
+        && new_end == new.len()
+        && (new.is_empty() || new.ends_with('\n'))
+    {
+        texts.push("");
+    }
+    let total = cache.ordered_lines.len() - (last + 1 - first) + texts.len();
+    let pixels = ui.ctx().pixels_per_point();
+    let mut replacements = Vec::new();
+    let mut paint_y = cache.composed.as_ref().unwrap().rows[first].pos.y;
+    let existing: HashMap<_, _> = (first..last + 1)
+        .map(|i| (cache.ordered_jobs[i].text.as_str(), i))
+        .collect();
+    for (offset, text) in texts.into_iter().enumerate() {
+        let i = first + offset;
+        if let Some(old) = existing.get(text).copied()
+            && cache.ordered_jobs[old].first_row_min_height
+                == if i == 0 {
+                    job.first_row_min_height
+                } else {
+                    0.0
+                }
+        {
+            let mut line = cache.ordered_lines[old].clone();
+            let height = line.galley.rect.height();
+            if !line.painted
+                && viewport.is_none_or(|(top, bottom)| {
+                    paint_y + height >= top as f32 - height && paint_y <= bottom as f32 + height
+                })
+            {
+                line = Arc::new(make_line(ui, (*cache.ordered_jobs[old]).clone()));
+            }
+            paint_y += height;
+            replacements.push((
+                i,
+                cache.ordered_jobs[old].clone(),
+                cache.ordered_keys[old],
+                cache.ordered_geometry_keys[old],
+                line,
+            ));
+            continue;
+        }
+        let line_job = Arc::new(LayoutJob {
+            text: text.into(),
+            sections: vec![LayoutSection {
+                leading_space: if i == 0 {
+                    job.sections[0].leading_space
+                } else {
+                    0.0
+                },
+                byte_range: 0..text.len(),
+                format: job.sections[0].format.clone(),
+            }],
+            first_row_min_height: if i == 0 {
+                job.first_row_min_height
+            } else {
+                0.0
+            },
+            wrap: job.wrap.clone(),
+            break_on_newline: job.break_on_newline,
+            halign: job.halign,
+            justify: job.justify,
+            round_output_to_gui: job.round_output_to_gui,
+        });
+        let style = egui::util::hash((line_job.as_ref(), pixels.to_bits()));
+        let geometry = geometry_key(&line_job, pixels);
+        let mut line = cache
+            .entries
+            .get(&style)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(make_line(ui, (*line_job).clone())));
+        let height = line.galley.rect.height();
+        if !line.painted
+            && viewport.is_none_or(|(top, bottom)| {
+                paint_y + height >= top as f32 - height && paint_y <= bottom as f32 + height
+            })
+        {
+            line = Arc::new(make_line(ui, (*line_job).clone()));
+        }
+        paint_y += height;
+        if line.galley.rows.len() != 1 {
+            return false;
+        }
+        replacements.push((i, line_job, style, geometry, line));
+    }
+    let old_height: f32 = cache.ordered_lines[first..last + 1]
+        .iter()
+        .map(|line| line.galley.rect.height())
+        .sum();
+    for i in first..last + 1 {
+        let style = cache.ordered_keys[i];
+        let geometry = cache.ordered_geometry_keys[i];
+        if let Some(count) = cache.uses.get_mut(&style) {
+            *count -= 1;
+            if *count == 0 {
+                cache.entries.remove(&style);
+                cache.uses.remove(&style);
+            }
+        }
+        if let Some(count) = cache.geometry_uses.get_mut(&geometry) {
+            *count -= 1;
+            if *count == 0 {
+                cache.geometry.remove(&geometry);
+                cache.geometry_uses.remove(&geometry);
+            }
+        }
+    }
+    for (_, _, style, geometry, line) in &replacements {
+        *cache.uses.entry(*style).or_default() += 1;
+        *cache.geometry_uses.entry(*geometry).or_default() += 1;
+        cache.entries.insert(*style, line.clone());
+        cache.geometry.insert(*geometry, line.clone());
+    }
+    let rows: Vec<_> = replacements
+        .iter()
+        .map(|(i, job, _, _, line)| (job.text.len() + usize::from(*i + 1 < total), line.clone()))
+        .collect();
+    cache.rows.as_mut().unwrap().splice(first..last + 1, &rows);
+    cache
+        .ordered_keys
+        .splice(first..last + 1, replacements.iter().map(|r| r.2));
+    cache
+        .ordered_geometry_keys
+        .splice(first..last + 1, replacements.iter().map(|r| r.3));
+    cache
+        .ordered_jobs
+        .splice(first..last + 1, replacements.iter().map(|r| r.1.clone()));
+    cache
+        .ordered_lines
+        .splice(first..last + 1, replacements.iter().map(|r| r.4.clone()));
+    cache.ordered_styles.splice(
+        first..last + 1,
+        std::iter::repeat_n(cache.style_generation, replacements.len()),
+    );
+    let job = Arc::new(std::mem::take(job));
+    let metrics = cache.rows.as_ref().unwrap().metric();
+    let mut old = cache.composed.take().unwrap();
+    let old = Arc::make_mut(&mut old);
+    let mut galley = egui::Galley::concat(job.clone(), &[metrics.clone()], pixels);
+    galley.rect = metrics.rect;
+    galley.mesh_bounds = metrics.mesh_bounds;
+    galley.rows = std::mem::take(&mut old.rows);
+    let mut y = galley.rows[first].pos.y;
+    let mut placed = Vec::new();
+    let mut new_height = 0.0;
+    for (i, _, _, _, line) in &replacements {
+        let mut row = if *i + 1 == total {
+            line.galley.rows[0].clone()
+        } else {
+            line.continued[0].clone()
+        };
+        row.pos.y = y;
+        y += row.size.y;
+        new_height += row.size.y;
+        placed.push(row);
+    }
+    let count = placed.len();
+    galley.rows.splice(first..last + 1, placed);
+    let shift = new_height - old_height;
+    if shift != 0.0 {
+        for row in &mut galley.rows[first + count..] {
+            row.pos.y += shift;
+        }
+    }
+    if job.round_output_to_gui {
+        galley.rect = galley.rect.round_ui();
+    }
+    cache.job = Some(job);
+    cache.job_key = Some(key);
+    cache.composed = Some(Arc::new(galley));
+    cache.folded_composed = None;
+    if count != last + 1 - first || shift != 0.0 {
+        cache.projection_key = None;
+        project_rows(cache, &[]);
+    }
+    true
 }
 
 fn composed_view(cache: &mut Lines, folds: &[&crate::folding::Region]) -> Arc<egui::Galley> {
@@ -726,6 +1422,228 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn structural_edits_match_native_layout_for_unicode_newlines_and_width_changes() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("structural-edits");
+        let mut source = "first\nunchanged 猫\nlast".to_owned();
+        let mut random = 123u64;
+        for step in 0..120 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let job = LayoutJob::simple(
+                        source.clone(),
+                        egui::FontId::monospace(13.0),
+                        egui::Color32::WHITE,
+                        f32::INFINITY,
+                    );
+                    let full = ui.fonts_mut(|fonts| fonts.layout_job(job.clone()));
+                    let incremental = layout(ui, id, job);
+                    assert_eq!(
+                        full.rows, incremental.rows,
+                        "rows after edit {step}: {source:?}"
+                    );
+                    assert_eq!(full.rect, incremental.rect, "bounds after edit {step}");
+                    assert_eq!(full.intrinsic_size(), incremental.intrinsic_size());
+                    assert_eq!(full.num_vertices, incremental.num_vertices);
+                    assert_eq!(full.mesh_bounds, incremental.mesh_bounds);
+                    let mut byte = 0;
+                    let mut chars = 0;
+                    for (row, line) in source.split('\n').enumerate() {
+                        assert_eq!(
+                            row_offsets(ui, id, row),
+                            Some((byte, chars)),
+                            "indexed row offsets after edit {step}"
+                        );
+                        byte += line.len() + 1;
+                        chars += line.chars().count() + 1;
+                    }
+                    for cursor in 0..=source.chars().count() {
+                        assert_eq!(
+                            full.pos_from_cursor(egui::text::CCursor::new(cursor)),
+                            incremental.pos_from_cursor(egui::text::CCursor::new(cursor))
+                        );
+                    }
+                });
+            });
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let boundaries: Vec<_> = source
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(source.len()))
+                .collect();
+            let from = random as usize % boundaries.len();
+            if step % 3 == 0 && from + 1 < boundaries.len() {
+                source.replace_range(
+                    boundaries[from]..boundaries[(from + 2).min(boundaries.len() - 1)],
+                    "",
+                );
+            } else {
+                source.insert_str(
+                    boundaries[from],
+                    ["猫", "e\u{301}", "\n", "foo\nbar", "\t", "λ"][step % 6],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn syntax_updates_color_only_visible_rows_and_refresh_on_scroll() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("lazy-syntax");
+        let source = (0..1000).map(|i| format!("line {i}\n")).collect::<String>();
+        let mut pointer = 0;
+        for step in 0..3 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut job = LayoutJob::simple(
+                        source.clone(),
+                        egui::FontId::monospace(13.0),
+                        if step == 0 {
+                            egui::Color32::WHITE
+                        } else {
+                            egui::Color32::RED
+                        },
+                        f32::INFINITY,
+                    );
+                    // Exercise multiple syntax sections with unchanged geometry.
+                    if step > 0 {
+                        crate::chrome::mark_matches(&mut job, "line");
+                    }
+                    let viewport = if step == 2 {
+                        Some((9000, 9300))
+                    } else {
+                        Some((0, 300))
+                    };
+                    let galley = if step == 2 {
+                        repaint_viewport(ui, id, 2, viewport).unwrap()
+                    } else {
+                        layout_visible_keyed(ui, id, job, viewport, step + 1)
+                    };
+                    if step == 0 {
+                        pointer = galley.rows.as_ptr() as usize;
+                    } else {
+                        assert_eq!(pointer, galley.rows.as_ptr() as usize);
+                    }
+                    let cache = state(ui, id);
+                    let cache = cache.lock().unwrap();
+                    let colored = cache
+                        .ordered_styles
+                        .iter()
+                        .filter(|g| **g == cache.style_generation)
+                        .count();
+                    if step == 1 {
+                        assert!(colored > 0 && colored < 40, "{colored}");
+                        assert_ne!(cache.ordered_styles[600], cache.style_generation);
+                    } else if step == 2 {
+                        assert_eq!(cache.ordered_styles[600], cache.style_generation);
+                        let expected = make_line(ui, (*cache.ordered_jobs[600]).clone());
+                        assert_eq!(
+                            galley.rows[600].visuals.mesh,
+                            expected.galley.rows[0].visuals.mesh
+                        );
+                    }
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn typing_preserves_unmodified_syntax_rows_until_new_analysis_arrives() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("retain-syntax");
+        let mut unchanged = None;
+        for (step, source) in [
+            "first\nkeep\nlast",
+            "first!\nkeep\nlast",
+            "first!\nnew\nkeep\nlast",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut job = LayoutJob::simple(
+                        (*source).into(),
+                        egui::FontId::monospace(13.0),
+                        egui::Color32::WHITE,
+                        f32::INFINITY,
+                    );
+                    if step == 0 {
+                        crate::chrome::mark_matches(&mut job, "keep");
+                    }
+                    let galley = layout(ui, id, job);
+                    let row = if step == 2 { 2 } else { 1 };
+                    if let Some(old) = &unchanged {
+                        assert!(Arc::ptr_eq(old, &galley.rows[row].row));
+                    }
+                    unchanged = Some(galley.rows[row].row.clone());
+                    assert_eq!(galley.job.text, *source);
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn scrolling_patches_the_existing_row_vector_when_no_snapshot_is_retained() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("patch-rows");
+        let source = (0..2000).map(|i| format!("row {i}\n")).collect::<String>();
+        let font = egui::FontId::monospace(13.0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut pointer = None;
+        while pointer.is_none() {
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if prepare(ui, id, &source, &font, egui::Color32::WHITE) {
+                        let galley = layout_visible(
+                            ui,
+                            id,
+                            LayoutJob::simple(
+                                source.clone(),
+                                font.clone(),
+                                egui::Color32::WHITE,
+                                f32::INFINITY,
+                            ),
+                            Some((0, 300)),
+                        );
+                        pointer = Some(galley.rows.as_ptr() as usize);
+                    }
+                });
+            });
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let galley = layout_visible(
+                    ui,
+                    id,
+                    LayoutJob::simple(
+                        source.clone(),
+                        font.clone(),
+                        egui::Color32::WHITE,
+                        f32::INFINITY,
+                    ),
+                    Some((10000, 10300)),
+                );
+                assert_eq!(
+                    Some(galley.rows.as_ptr() as usize),
+                    pointer,
+                    "scrolling must not recompose every row"
+                );
+                assert_eq!(
+                    galley.num_vertices,
+                    galley
+                        .rows
+                        .iter()
+                        .map(|row| row.visuals.mesh.vertices.len())
+                        .sum::<usize>()
+                );
+            });
+        });
     }
 
     #[test]
