@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const STATUS_INTERVAL: Duration = Duration::from_secs(3);
+const STATUS_INTERVAL: Duration = Duration::from_secs(30);
 const CURRENT_ACCENT: egui::Color32 = egui::Color32::from_rgb(194, 176, 255);
 
 fn status_badge(
@@ -43,21 +43,19 @@ fn status_badge(
 }
 
 fn has_uncommitted_changes(root: &Path) -> Result<bool> {
-    let output = Command::new("git")
-        .current_dir(root)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .args([
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=normal",
-            "--ignore-submodules=none",
-        ])
-        .output()?;
-    if !output.status.success() {
-        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    let mut command = Command::new("git");
+    command.current_dir(root).args([
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=normal",
+        "--ignore-submodules=none",
+    ]);
+    let output = crate::git::run(command, None, Duration::from_secs(5))?;
+    if !output.success {
+        bail!("{}", output.error);
     }
-    Ok(!output.stdout.is_empty())
+    Ok(!output.bytes.is_empty())
 }
 
 #[derive(Clone, Debug)]
@@ -193,6 +191,7 @@ impl Manager {
                 Ok(statuses) => {
                     self.statuses = statuses;
                     self.status_rx = None;
+                    self.status_checked = Some(Instant::now());
                 }
                 Err(mpsc::TryRecvError::Disconnected) => self.status_rx = None,
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -376,7 +375,7 @@ impl Manager {
                         .inner
                         .clicked();
                     if self.creating {
-                        ui.spinner();
+                        ui.weak("…");
                         ui.label("Creating worktree…");
                     }
                     cancel |= ui
@@ -457,7 +456,7 @@ impl Manager {
                         .inner
                         .clicked();
                     if self.deleting {
-                        ui.spinner();
+                        ui.weak("…");
                         ui.label("Deleting worktree…");
                     }
                     cancel |= ui
@@ -556,7 +555,7 @@ impl Manager {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.rx.is_some() {
-                        ui.spinner();
+                        ui.weak("…");
                     } else if chrome::icon_button(ui, chrome::Icon::Refresh, "Refresh worktrees")
                         .clicked()
                     {

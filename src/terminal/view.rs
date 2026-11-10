@@ -14,6 +14,8 @@ pub(super) struct TerminalView {
     // Keep attachments alive until the session closes: a CLI may read them
     // only when the user eventually submits the prompt.
     pub attachments: Vec<tempfile::TempPath>,
+    pub paint_rows: Vec<(u64, GridPaint)>,
+    pub paint_screen: Option<vt100::Screen>,
 }
 
 pub(super) struct ClipboardPaste {
@@ -177,9 +179,20 @@ pub(super) struct Find {
     revision: u64,
     refreshed: Option<Instant>,
     focus_ids: Vec<egui::Id>,
+    pending: Option<(String, bool, mpsc::Receiver<(u64, Vec<HistorySelection>)>)>,
 }
 
 impl Find {
+    pub fn paint_key(&self) -> u64 {
+        egui::util::hash((
+            self.open,
+            self.revision,
+            &self.cached,
+            self.active,
+            self.matches.len(),
+        ))
+    }
+
     pub fn focused(&self, ctx: &egui::Context) -> bool {
         self.open && ctx.memory(|memory| self.focus_ids.iter().any(|id| memory.has_focus(*id)))
     }
@@ -281,34 +294,64 @@ impl Find {
         close
     }
 
-    pub fn refresh(&mut self, screen: &mut vt100::Screen, revision: u64) {
+    pub fn refresh(&mut self, screen: &mut vt100::Screen, revision: u64, ctx: &egui::Context) {
         if !self.open {
             return;
         }
         let query_changed = self.cached != (self.query.clone(), self.case_sensitive);
+        let mut reveal = false;
+        if let Some((query, case, rx)) = &self.pending {
+            match rx.try_recv() {
+                Ok((version, matches)) => {
+                    if *query == self.query && *case == self.case_sensitive {
+                        let current = self.matches.get(self.active).copied();
+                        self.matches = matches;
+                        self.active = current
+                            .and_then(|current| self.matches.iter().position(|m| *m == current))
+                            .unwrap_or(0);
+                        self.cached = (self.query.clone(), self.case_sensitive);
+                        self.revision = version;
+                        self.refreshed = Some(Instant::now());
+                        reveal = query_changed;
+                    }
+                    self.pending = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.pending = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         let output_changed = self.revision != revision
             && self
                 .refreshed
                 .is_none_or(|time| time.elapsed() >= Duration::from_millis(200));
-        if query_changed || output_changed {
-            let current = self.matches.get(self.active).copied();
-            self.matches = find_matches(screen, &self.query, self.case_sensitive);
-            self.active = current
-                .and_then(|current| self.matches.iter().position(|m| *m == current))
-                .unwrap_or(0);
-            self.cached = (self.query.clone(), self.case_sensitive);
-            self.revision = revision;
-            self.refreshed = Some(Instant::now());
+        if self.pending.is_none()
+            && (self.cached != (self.query.clone(), self.case_sensitive) || output_changed)
+        {
+            // Rows share immutable cells; history scanning runs without the parser lock.
+            let snapshot = screen.clone();
+            let query = self.query.clone();
+            let case = self.case_sensitive;
+            let (tx, rx) = mpsc::channel();
+            self.pending = Some((query.clone(), case, rx));
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let matches = find_matches(&snapshot, &query, case);
+                let _ = tx.send((revision, matches));
+                ctx.request_repaint();
+            });
         }
-        let step = std::mem::take(&mut self.step);
-        if !self.matches.is_empty() && (step != 0 || query_changed) {
-            self.active =
-                (self.active as i32 + step).rem_euclid(self.matches.len() as i32) as usize;
-            let row = self.matches[self.active].0.0;
-            let (first, len, _) = screen.history_bounds();
-            let rows = u64::from(screen.size().0);
-            let live_top = first + len as u64 - rows;
-            screen.set_scrollback(live_top.saturating_sub(row.saturating_sub(rows / 2)) as usize);
+        if self.pending.is_none() {
+            let step = std::mem::take(&mut self.step);
+            if !self.matches.is_empty() && (step != 0 || reveal) {
+                self.active =
+                    (self.active as i32 + step).rem_euclid(self.matches.len() as i32) as usize;
+                let row = self.matches[self.active].0.0;
+                let (first, len, _) = screen.history_bounds();
+                let rows = u64::from(screen.size().0);
+                let live_top = first + len as u64 - rows;
+                screen
+                    .set_scrollback(live_top.saturating_sub(row.saturating_sub(rows / 2)) as usize);
+            }
         }
     }
 
@@ -513,6 +556,12 @@ mod tests {
         frame(&mut terminal, vec![key(Key::F, Modifiers::COMMAND)]);
         assert!(terminal.tabs[0].view.find.open);
         frame(&mut terminal, vec![egui::Event::Text("before".into())]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while terminal.tabs[0].view.find.matches.len() != 2 {
+            frame(&mut terminal, vec![]);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
         assert_eq!(terminal.tabs[0].view.find.matches.len(), 2);
         assert!(
             terminal.focused(&ctx),
@@ -584,14 +633,26 @@ mod tests {
             query: "before".into(),
             ..Default::default()
         };
-        find.refresh(parser.screen_mut(), 1);
+        find.refresh(parser.screen_mut(), 1, &egui::Context::default());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while find.pending.is_some() {
+            find.refresh(parser.screen_mut(), 1, &egui::Context::default());
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
         assert_eq!(find.matches.len(), 1);
         assert!(
             parser.screen().scrollback() > 0,
             "finding old output reveals it"
         );
         find.step = -1;
-        find.refresh(parser.screen_mut(), 1);
+        find.refresh(parser.screen_mut(), 1, &egui::Context::default());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while find.pending.is_some() {
+            find.refresh(parser.screen_mut(), 1, &egui::Context::default());
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
         assert_eq!(find.active, 0, "navigation wraps");
     }
 

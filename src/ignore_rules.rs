@@ -93,6 +93,7 @@ struct Cached {
     file: Option<PathBuf>,
     stamp: Option<(SystemTime, u64)>,
     loaded: Instant,
+    checked: Instant,
     rules: GlobalIgnores,
 }
 
@@ -105,11 +106,18 @@ thread_local! {
 pub fn with_global_ignores<T>(root: &Path, apply: impl FnOnce(&mut GlobalIgnores) -> T) -> T {
     CACHE.with(|cache| {
         let file = crate::preferences::global_ignore_path();
+        let mut cache = cache.borrow_mut();
+        if let Some(cached) = cache.as_ref()
+            && cached.root == root
+            && cached.file == file
+            && cached.checked.elapsed() < Duration::from_secs(2)
+        {
+            return apply(&mut cache.as_mut().unwrap().rules);
+        }
         let stamp = file
             .as_ref()
             .and_then(|file| std::fs::metadata(file).ok())
             .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
-        let mut cache = cache.borrow_mut();
         if cache.as_ref().is_none_or(|cached| {
             cached.root != root
                 || cached.file != file
@@ -123,6 +131,7 @@ pub fn with_global_ignores<T>(root: &Path, apply: impl FnOnce(&mut GlobalIgnores
                 file,
                 stamp,
                 loaded: Instant::now(),
+                checked: Instant::now(),
                 rules,
             });
         }

@@ -153,6 +153,7 @@ struct Request {
     path: PathBuf,
     source: Option<String>,
     dark: bool,
+    repaint: Option<eframe::egui::Context>,
 }
 
 /// A single cancellable worker and a small LRU cache keep category changes off the UI thread.
@@ -192,6 +193,9 @@ impl Default for PreviewService {
                     if results.send((request.version, preview)).is_err() {
                         break;
                     }
+                    if let Some(ctx) = request.repaint {
+                        ctx.request_repaint();
+                    }
                 }
             }
         });
@@ -228,12 +232,24 @@ impl PreviewService {
         }
     }
 
+    #[cfg(test)]
     pub fn request(
         &mut self,
         path: PathBuf,
         source: Option<String>,
         dark: bool,
         revision: Option<u64>,
+    ) {
+        self.request_with_context(path, source, dark, revision, None);
+    }
+
+    pub fn request_with_context(
+        &mut self,
+        path: PathBuf,
+        source: Option<String>,
+        dark: bool,
+        revision: Option<u64>,
+        repaint: Option<eframe::egui::Context>,
     ) {
         let source_version = SourceVersion::for_path(&path, revision);
         let version = self.version.fetch_add(1, Ordering::Relaxed) + 1;
@@ -257,6 +273,7 @@ impl PreviewService {
                 path,
                 source,
                 dark,
+                repaint,
             });
         }
     }
@@ -270,6 +287,7 @@ impl PreviewService {
         }
     }
 
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn loading(&self) -> bool {
         self.pending.is_some()
     }

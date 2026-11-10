@@ -13,11 +13,13 @@ use std::{
 const FILES: u8 = 1;
 const GIT: u8 = 2;
 const FAILED: u8 = 4;
+const METADATA: u8 = 8;
 
 #[derive(Default)]
 pub struct Changes {
     pub files: bool,
     pub git: bool,
+    pub git_metadata: bool,
 }
 
 #[derive(Clone)]
@@ -142,7 +144,11 @@ fn classify(event: &Event) -> u8 {
             .iter()
             .all(|path| path.components().any(|part| part.as_os_str() == ".git"))
     {
-        return GIT;
+        let metadata = event
+            .paths
+            .iter()
+            .any(|path| path.file_name().is_none_or(|name| name != "index.lock"));
+        return GIT | if metadata { METADATA } else { 0 };
     }
     let paths_changed = matches!(
         event.kind,
@@ -304,6 +310,11 @@ impl WorkspaceWatch {
         self.watching && self.flags.load(Ordering::Relaxed) & FAILED == 0
     }
 
+    pub fn next_poll(&self) -> Option<Duration> {
+        self.since
+            .map(|at| Duration::from_millis(200).saturating_sub(at.elapsed()))
+    }
+
     pub fn poll(&mut self, now: Instant) -> Changes {
         if let Some(rx) = &self.initializing {
             match rx.try_recv() {
@@ -316,7 +327,7 @@ impl WorkspaceWatch {
             }
         }
         let flags = self.flags.fetch_and(FAILED, Ordering::Relaxed);
-        self.pending |= flags & (FILES | GIT);
+        self.pending |= flags & (FILES | GIT | METADATA);
         if self.pending != 0 {
             let since = *self.since.get_or_insert(now);
             if now.saturating_duration_since(since) >= Duration::from_millis(200) {
@@ -325,6 +336,7 @@ impl WorkspaceWatch {
                 return Changes {
                     files: pending & FILES != 0,
                     git: pending & GIT != 0,
+                    git_metadata: pending & METADATA != 0,
                 };
             }
         }
@@ -450,7 +462,7 @@ mod tests {
                 &Event::new(EventKind::Create(notify::event::CreateKind::File))
                     .add_path("/project/.git/refs/heads/topic".into())
             ),
-            GIT
+            GIT | METADATA
         );
     }
 

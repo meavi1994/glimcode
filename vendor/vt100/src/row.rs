@@ -2,14 +2,18 @@ use crate::term::BufWrite as _;
 
 #[derive(Clone, Debug)]
 pub struct Row {
-    cells: Vec<crate::Cell>,
+    cells: std::sync::Arc<Vec<crate::Cell>>,
     wrapped: bool,
 }
 
 impl Row {
+    pub fn storage_id(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.cells) as usize
+    }
+
     pub fn new(cols: u16) -> Self {
         Self {
-            cells: vec![crate::Cell::new(); usize::from(cols)],
+            cells: std::sync::Arc::new(vec![crate::Cell::new(); usize::from(cols)]),
             wrapped: false,
         }
     }
@@ -23,7 +27,7 @@ impl Row {
     }
 
     pub fn clear(&mut self, attrs: crate::attrs::Attrs) {
-        for cell in &mut self.cells {
+        for cell in std::sync::Arc::make_mut(&mut self.cells) {
             cell.clear(attrs);
         }
         self.wrapped = false;
@@ -38,40 +42,40 @@ impl Row {
     }
 
     pub fn get_mut(&mut self, col: u16) -> Option<&mut crate::Cell> {
-        self.cells.get_mut(usize::from(col))
+        std::sync::Arc::make_mut(&mut self.cells).get_mut(usize::from(col))
     }
 
     pub fn insert(&mut self, i: u16, cell: crate::Cell) {
-        self.cells.insert(usize::from(i), cell);
+        std::sync::Arc::make_mut(&mut self.cells).insert(usize::from(i), cell);
         self.wrapped = false;
     }
 
     pub fn remove(&mut self, i: u16) {
         self.clear_wide(i);
-        self.cells.remove(usize::from(i));
+        std::sync::Arc::make_mut(&mut self.cells).remove(usize::from(i));
         self.wrapped = false;
     }
 
     pub fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
         let wide = self.cells[usize::from(i)].is_wide();
         self.clear_wide(i);
-        self.cells[usize::from(i)].clear(attrs);
+        std::sync::Arc::make_mut(&mut self.cells)[usize::from(i)].clear(attrs);
         if i == self.cols() - if wide { 2 } else { 1 } {
             self.wrapped = false;
         }
     }
 
     pub fn truncate(&mut self, len: u16) {
-        self.cells.truncate(usize::from(len));
+        std::sync::Arc::make_mut(&mut self.cells).truncate(usize::from(len));
         self.wrapped = false;
-        let last_cell = &mut self.cells[usize::from(len) - 1];
+        let last_cell = &mut std::sync::Arc::make_mut(&mut self.cells)[usize::from(len) - 1];
         if last_cell.is_wide() {
             last_cell.clear(*last_cell.attrs());
         }
     }
 
     pub fn resize(&mut self, len: u16, cell: crate::Cell) {
-        self.cells.resize(usize::from(len), cell);
+        std::sync::Arc::make_mut(&mut self.cells).resize(usize::from(len), cell);
         self.wrapped = false;
     }
 
@@ -86,9 +90,9 @@ impl Row {
     pub fn clear_wide(&mut self, col: u16) {
         let cell = &self.cells[usize::from(col)];
         let other = if cell.is_wide() {
-            &mut self.cells[usize::from(col + 1)]
+            &mut std::sync::Arc::make_mut(&mut self.cells)[usize::from(col + 1)]
         } else if cell.is_wide_continuation() {
-            &mut self.cells[usize::from(col - 1)]
+            &mut std::sync::Arc::make_mut(&mut self.cells)[usize::from(col - 1)]
         } else {
             return;
         };

@@ -59,6 +59,8 @@ pub struct GitTool {
     /// Bumped whenever the repository is replaced, so caches that depend on
     /// the changed files can be dropped.
     pub generation: u64,
+    changed_cache:
+        std::cell::RefCell<Option<(u64, Vec<PathBuf>, Instant, Arc<Vec<git::ChangedFile>>)>>,
     pub note: Option<String>,
     pub file_note: Option<String>,
     project: PathBuf,
@@ -66,6 +68,7 @@ pub struct GitTool {
     base_filter: String,
     repo_rx: Option<Job<Repository>>,
     last_refresh: Option<Instant>,
+    full_requested: bool,
     pr: Option<PullRequest>,
     pr_note: Option<String>,
     pr_rx: Option<Job<Option<PullRequest>>>,
@@ -93,6 +96,29 @@ pub struct GitTool {
     pub include_tests: bool,
 }
 impl GitTool {
+    pub fn changed_files(&self, dirty: &[PathBuf]) -> Arc<Vec<git::ChangedFile>> {
+        let mut cache = self.changed_cache.borrow_mut();
+        if let Some((generation, paths, at, files)) = cache.as_ref()
+            && *generation == self.generation
+            && paths == dirty
+            && at.elapsed() < Duration::from_secs(2)
+        {
+            return files.clone();
+        }
+        let files = Arc::new(
+            self.repo
+                .as_ref()
+                .map_or_else(Vec::new, |repo| tree_files(repo, dirty)),
+        );
+        *cache = Some((
+            self.generation,
+            dirty.to_vec(),
+            Instant::now(),
+            files.clone(),
+        ));
+        files
+    }
+
     pub fn resize_windows(&self) -> Vec<egui::Id> {
         let mut windows = Vec::new();
         if self.review_open {
@@ -108,21 +134,39 @@ impl GitTool {
         *self = Self::default();
         self.refresh(project, ctx);
     }
+    pub fn request_full_refresh(&mut self) {
+        self.full_requested = true;
+    }
+
     pub fn refresh(&mut self, project: &Path, ctx: &egui::Context) {
+        self.refresh_repository(project, ctx, true);
+    }
+
+    fn refresh_repository(&mut self, project: &Path, ctx: &egui::Context, full: bool) {
         if self.repo_rx.is_some() {
             return;
         }
         self.project = project.to_path_buf();
         let root = self.project.clone();
         let base = self.selected_base.clone();
-        self.repo_rx = Some(worker(ctx, move || git::repository(&root, base.as_deref())));
+        self.repo_rx = Some(worker(ctx, move || {
+            git::repository_refresh(&root, base.as_deref(), full)
+        }));
+        self.full_requested = false;
         self.last_refresh = Some(Instant::now());
     }
     pub fn refresh_if_idle(&mut self, project: &Path, ctx: &egui::Context) -> bool {
         if self.repo_rx.is_some() {
             return false;
         }
-        self.refresh(project, ctx);
+        if let Some(remaining) = self
+            .last_refresh
+            .and_then(|at| Duration::from_secs(3).checked_sub(at.elapsed()))
+        {
+            ctx.request_repaint_after(remaining);
+            return false;
+        }
+        self.refresh_repository(project, ctx, self.full_requested);
         true
     }
 
@@ -132,6 +176,7 @@ impl GitTool {
         }
         if let Some(result) = received(&self.repo_rx) {
             self.repo_rx = None;
+            self.last_refresh = Some(Instant::now());
             match result {
                 Ok(repo) => {
                     let changed = self.repo.as_ref().is_none_or(|old| {
@@ -261,16 +306,8 @@ impl GitTool {
                 self.pr_rx = Some(worker(ctx, move || git::branch_pr(&repo)));
             }
         }
-        if self.repo_rx.is_some()
-            || self.file_rx.is_some()
-            || self.pr_rx.is_some()
-            || self.review_rx.is_some()
-            || self.review_update_rx.is_some()
-            || self.detail_rx.is_some()
-        {
-            ctx.request_repaint_after(Duration::from_millis(50));
-        } else if self.repo.is_some() {
-            ctx.request_repaint_after(Duration::from_secs(2));
+        if self.repo.is_some() {
+            ctx.request_repaint_after(Duration::from_secs(30));
         }
     }
     fn annotation_key(&self, path: &Path, revision: u64) -> Option<u64> {
@@ -545,7 +582,7 @@ impl GitTool {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if self.repo_rx.is_some() {
-                                        ui.spinner();
+                                        ui.weak("…");
                                     } else if chrome::icon_button(
                                         ui,
                                         chrome::Icon::Refresh,
@@ -675,7 +712,7 @@ impl GitTool {
                         "Hide files in test folders and files with common test naming conventions.",
                     );
                 self.include_tests = !hide_tests;
-                let files = tree_files(repo, dirty);
+                let files = self.changed_files(dirty);
                 let total = files.len();
                 let hidden_tests = if hide_tests {
                     files
@@ -721,7 +758,7 @@ impl GitTool {
             }
         } else if self.repo_rx.is_some() {
             ui.horizontal(|ui| {
-                ui.spinner();
+                ui.weak("…");
                 ui.label("Reading repository…");
             });
         }
@@ -846,7 +883,7 @@ impl GitTool {
                         ui.label(note);
                     } else {
                         ui.horizontal(|ui| {
-                            ui.spinner();
+                            ui.weak("…");
                             ui.label("Preparing diff…");
                         });
                     }
@@ -937,7 +974,7 @@ impl GitTool {
                     } else if let Some(note) = &self.detail_note {
                         ui.label(note);
                     } else {
-                        ui.spinner();
+                        ui.weak("…");
                         ui.label("Loading commit and PR information…");
                     }
                     close |=
@@ -963,10 +1000,15 @@ fn tree_files_with_ignores(
     ignores: &mut crate::ignore_rules::GlobalIgnores,
 ) -> Vec<git::ChangedFile> {
     let mut files = repo.files.clone();
+    let positions: std::collections::HashMap<_, _> = files
+        .iter()
+        .enumerate()
+        .map(|(i, file)| (file.path.clone(), i))
+        .collect();
     for path in dirty {
         if let Ok(path) = path.strip_prefix(&repo.root) {
-            if let Some(file) = files.iter_mut().find(|file| file.path == path) {
-                file.uncommitted = true;
+            if let Some(index) = positions.get(path) {
+                files[*index].uncommitted = true;
             } else {
                 files.push(git::ChangedFile {
                     path: path.to_path_buf(),

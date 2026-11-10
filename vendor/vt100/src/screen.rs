@@ -117,6 +117,13 @@ impl Screen {
             hyperlinks: self.hyperlinks.clone(),
         }
     }
+    /// Identity of immutable row storage. Retain a snapshot while using this
+    /// identity: writes then copy only the rows they change.
+    pub fn visible_row_id(&self, row: u16) -> Option<usize> {
+        self.grid()
+            .visible_row(row)
+            .map(crate::row::Row::storage_id)
+    }
     /// Set an OSC 8 hyperlink; metadata is bounded to 4096 distinct targets.
     pub fn set_hyperlink(&mut self, target: &str) {
         self.hyperlink = 0;

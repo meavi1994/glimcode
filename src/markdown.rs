@@ -16,13 +16,39 @@ pub struct MarkdownCache {
     /// the document is not held twice.
     fingerprint: u64,
     pub events: Vec<Event<'static>>,
+    pub blocks: Vec<std::ops::Range<usize>>,
+    pub heights: Vec<Option<f32>>,
+    pub layout_key: Option<u64>,
 }
 
 impl MarkdownCache {
+    #[cfg(test)]
     pub fn prepare(&mut self, source: &str) {
-        let fingerprint = eframe::egui::util::hash(source);
+        self.prepare_keyed(source, eframe::egui::util::hash(source));
+    }
+
+    pub fn prepare_keyed(&mut self, source: &str, fingerprint: u64) {
         if fingerprint != self.fingerprint {
             self.events = parse(source);
+            self.blocks.clear();
+            let mut depth = 0usize;
+            let mut start = 0;
+            for (i, event) in self.events.iter().enumerate() {
+                match event {
+                    Event::Start(_) => depth += 1,
+                    Event::End(_) => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                if depth == 0 {
+                    self.blocks.push(start..i + 1);
+                    start = i + 1;
+                }
+            }
+            if start < self.events.len() {
+                self.blocks.push(start..self.events.len());
+            }
+            self.heights = vec![None; self.blocks.len()];
+            self.layout_key = None;
             self.fingerprint = fingerprint;
         }
     }
@@ -301,6 +327,28 @@ mod tests {
         ));
         assert!(events.contains(&Event::Text("![code](not-an-image.png)\n".into())));
         assert!(!html.contains("not-an-image.png"));
+    }
+
+    #[test]
+    fn virtual_blocks_keep_nested_lists_tables_and_code_balanced() {
+        let mut cache = MarkdownCache::default();
+        cache.prepare("# Title\n\n- outer\n  - inner\n\n| A | B |\n| - | - |\n| a | b |\n\n```rs\nfn main() {}\n```\n");
+        assert_eq!(cache.blocks.len(), 4);
+        for range in &cache.blocks {
+            let mut depth = 0;
+            for event in &cache.events[range.clone()] {
+                match event {
+                    Event::Start(_) => depth += 1,
+                    Event::End(_) => depth -= 1,
+                    _ => {}
+                }
+                assert!(depth >= 0);
+            }
+            assert_eq!(depth, 0);
+        }
+        cache.heights.fill(Some(50.0));
+        cache.prepare("# Edited");
+        assert_eq!(cache.heights, vec![None]);
     }
 
     #[test]

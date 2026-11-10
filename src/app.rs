@@ -103,10 +103,12 @@ struct TextClick {
 
 /// How many navigation steps are remembered.
 const MAX_HISTORY: usize = 200;
-const PROJECT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const PROJECT_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
 struct WorkspaceIndex {
-    paths: navigation::WorkspacePaths,
+    files: Arc<Vec<PathBuf>>,
+    folders: Arc<Vec<PathBuf>>,
+    names: Arc<Vec<usize>>,
     tree: crate::explorer::FileTree,
 }
 
@@ -128,6 +130,7 @@ pub struct Coder {
     root: PathBuf,
     files: Arc<Vec<PathBuf>>,
     folders: Arc<Vec<PathBuf>>,
+    path_names: Arc<Vec<usize>>,
     tree: crate::explorer::FileTree,
     selected_category: Option<navigation::MatchCategory>,
     extension_filter: Option<String>,
@@ -135,6 +138,7 @@ pub struct Coder {
     file_filter: String,
     files_rx: Option<Receiver<anyhow::Result<Option<WorkspaceIndex>>>>,
     files_checked: Instant,
+    files_completed: Option<Instant>,
     files_cancel: Arc<AtomicBool>,
     workspace_watch: Option<crate::workspace_watch::WorkspaceWatch>,
     files_requested: bool,
@@ -163,6 +167,7 @@ pub struct Coder {
     picker_selection: usize,
     files_generation: u64,
     picker_files_key: Option<u64>,
+    picker_accept_pending: Option<u64>,
     picker_files: Vec<PathBuf>,
     picker_files_worker: Option<(Receiver<Vec<PathBuf>>, Arc<AtomicBool>)>,
     recent_file_searches: Vec<PathBuf>,
@@ -476,6 +481,7 @@ impl Coder {
             root,
             files: Arc::default(),
             folders: Arc::default(),
+            path_names: Arc::default(),
             tree: Default::default(),
             selected_category: None,
             extension_filter: None,
@@ -483,6 +489,7 @@ impl Coder {
             file_filter: String::new(),
             files_rx: None,
             files_checked: Instant::now(),
+            files_completed: None,
             files_cancel: Arc::new(AtomicBool::new(false)),
             workspace_watch: None,
             files_requested: false,
@@ -511,6 +518,7 @@ impl Coder {
             picker_selection: 0,
             files_generation: 0,
             picker_files_key: None,
+            picker_accept_pending: None,
             picker_files: Vec::new(),
             picker_files_worker: None,
             recent_file_searches: vec![],
@@ -660,6 +668,7 @@ impl Coder {
         let old_watch = self.workspace_watch.take();
         self.files_requested = false;
         self.git_requested = false;
+        self.files_completed = None;
         self.preview.clear();
         self.root = root.canonicalize().unwrap_or(root);
         let old_documents = std::mem::take(&mut self.documents);
@@ -744,6 +753,7 @@ impl Coder {
         }
         self.files_requested = false;
         self.files_checked = Instant::now();
+        let repaint = self.io_context.clone();
         let root = self.root.clone();
         let (tx, rx) = mpsc::channel();
         self.files_rx = Some(rx);
@@ -759,15 +769,30 @@ impl Coder {
                         if *files == paths.files && *folders == paths.folders {
                             return None;
                         }
-                        let tree = crate::explorer::FileTree::build_cancellable(
+                        let files = Arc::new(paths.files);
+                        let folders = Arc::new(paths.folders);
+                        let tree = crate::explorer::FileTree::build_shared_cancellable(
                             &root,
-                            &paths.files,
-                            &paths.folders,
+                            files.clone(),
+                            folders.clone(),
                             || cancel.load(Ordering::Relaxed),
                         )?;
-                        Some(WorkspaceIndex { paths, tree })
+                        let paths: Vec<_> = files.iter().chain(folders.iter()).collect();
+                        let mut names: Vec<_> = (0..paths.len()).collect();
+                        names.sort_unstable_by(|a, b| {
+                            paths[*a].file_name().cmp(&paths[*b].file_name())
+                        });
+                        Some(WorkspaceIndex {
+                            files,
+                            folders,
+                            names: Arc::new(names),
+                            tree,
+                        })
                     });
             let _ = tx.send(result);
+            if let Some(ctx) = repaint {
+                ctx.request_repaint();
+            }
         });
     }
 
@@ -1040,6 +1065,7 @@ impl Coder {
         let cancelled = self.search_cancel.clone();
         let (tx, rx) = mpsc::channel();
         self.search_rx = Some(rx);
+        let repaint = self.io_context.clone();
         std::thread::spawn(move || {
             // A search can start before the first background Git refresh completes.
             if !git_known
@@ -1058,6 +1084,9 @@ impl Coder {
                 cancelled,
                 |update| {
                     let _ = tx.send(update);
+                    if let Some(ctx) = &repaint {
+                        ctx.request_repaint_after(Duration::from_millis(16));
+                    }
                 },
             );
         });
@@ -1174,8 +1203,17 @@ impl Coder {
         }
         let changes = watch.poll(Instant::now());
         let watched = watch.reliable();
+        if let Some(delay) = watch.next_poll() {
+            ctx.request_repaint_after(delay);
+        }
+        if changes.git {
+            ctx.request_repaint_after(Duration::from_secs(2));
+        }
         self.files_requested |= changes.files;
         self.git_requested |= changes.git;
+        if changes.files || changes.git_metadata {
+            self.git.request_full_refresh();
+        }
         if self.git_requested && self.git.refresh_if_idle(&self.root, ctx) {
             self.git_requested = false;
         }
@@ -1188,21 +1226,22 @@ impl Coder {
                 Ok(Some(mut index)) => {
                     index.tree.sync_extra_files(
                         &self.root,
-                        &index.paths.files,
-                        &index.paths.folders,
+                        &index.files,
+                        &index.folders,
                         self.git_colors.1.keys().cloned(),
                     );
+                    let old_names = std::mem::replace(&mut self.path_names, index.names);
                     self.files_generation = self.files_generation.wrapping_add(1);
                     let old_tree = self.tree.adopt_index(&self.root, index.tree);
-                    let old_files = std::mem::replace(&mut self.files, Arc::new(index.paths.files));
-                    let old_folders =
-                        std::mem::replace(&mut self.folders, Arc::new(index.paths.folders));
-                    std::thread::spawn(move || drop((old_tree, old_files, old_folders)));
+                    let old_files = std::mem::replace(&mut self.files, index.files);
+                    let old_folders = std::mem::replace(&mut self.folders, index.folders);
+                    std::thread::spawn(move || drop((old_tree, old_files, old_folders, old_names)));
                 }
                 Ok(None) => {}
                 Err(error) => self.error = Some(format!("{error:#}")),
             }
             self.files_rx = None;
+            self.files_completed = Some(Instant::now());
             if let Some(watch) = &mut self.workspace_watch {
                 watch.set_index(self.files.clone(), self.folders.clone());
             }
@@ -1215,12 +1254,29 @@ impl Coder {
             Duration::from_secs(2)
         };
         if self.files_rx.is_none()
-            && (self.files_requested || self.files_checked.elapsed() >= refresh_interval)
+            && self.files_completed.is_none_or(|at| {
+                at.elapsed()
+                    >= Duration::from_secs(2).max(at.saturating_duration_since(self.files_checked))
+            })
+            && (self.files_requested
+                || self.files_completed.unwrap_or(self.files_checked).elapsed() >= refresh_interval)
         {
             self.refresh_files();
         }
-        // Keep checking even when the editor is idle or no file is open.
-        ctx.request_repaint_after(Duration::from_millis(500));
+        if self.files_requested
+            && self.files_rx.is_none()
+            && let Some(at) = self.files_completed
+        {
+            let gap = Duration::from_secs(2).max(at.saturating_duration_since(self.files_checked));
+            ctx.request_repaint_after(gap.saturating_sub(at.elapsed()));
+        }
+        // Native events wake watched workspaces; retain a slower reconciliation
+        // for missed events and a short fallback when native watching fails.
+        ctx.request_repaint_after(if watched {
+            PROJECT_REFRESH_INTERVAL
+        } else {
+            Duration::from_secs(2)
+        });
         if let Some(doc) = self.documents.get_mut(self.active) {
             let result = if doc.needs_loading() {
                 doc.ensure_loaded(self.csv_headers)
@@ -1309,13 +1365,6 @@ impl Coder {
             doc.poll_outline(ctx);
         }
         self.poll_focus();
-        if self.files_rx.is_some()
-            || self.search_rx.is_some()
-            || self.goto.is_some()
-            || self.preview.loading()
-        {
-            ctx.request_repaint_after(Duration::from_millis(16));
-        }
     }
 
     /// The ranking of a click runs on a worker. When it finishes, the best
@@ -1519,9 +1568,13 @@ impl Coder {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let (tx, rx) = mpsc::channel();
+        let repaint = self.io_context.clone();
         std::thread::spawn(move || {
             let ranked = ranking::rank(&context, candidates, &buffers, &worker_cancel);
             let _ = tx.send(ranked);
+            if let Some(ctx) = repaint {
+                ctx.request_repaint();
+            }
         });
         self.goto = Some(FocusSearch {
             rx,
@@ -1824,7 +1877,8 @@ impl Coder {
                 .repo
                 .as_ref()
                 .map(|repo| {
-                    crate::git_view::tree_files(repo, &dirty)
+                    self.git
+                        .changed_files(&dirty)
                         .iter()
                         .map(|file| {
                             (
@@ -1872,12 +1926,7 @@ impl Coder {
                         }
                     });
                 });
-                let changed_count = self
-                    .git
-                    .repo
-                    .as_ref()
-                    .map(|repo| crate::git_view::tree_files(repo, &dirty).len())
-                    .unwrap_or(0);
+                let changed_count = colors.len();
                 egui::Frame::new()
                     .fill(chrome::PANEL)
                     .corner_radius(6)
@@ -2147,46 +2196,65 @@ impl Coder {
                             "Structure is available for Java, Kotlin, Go, Rust, Python, JS and TS.",
                         );
                     }
-                    let filter = self.structure_filter.to_lowercase();
-                    let symbols: Vec<_> = doc
-                        .outline
-                        .iter()
-                        .filter(|symbol| {
-                            symbol.name.to_lowercase().contains(&filter)
-                                || symbol.kind.to_lowercase().contains(&filter)
-                        })
-                        .collect();
-                    let syntax = match &doc.content {
-                        Content::Text(text) if !doc.editor_snapshot().1 => {
-                            // The colors are the ones the editor paints, so
-                            // the same cached result is used.
-                            let (fingerprint, _) = doc.editor_snapshot();
-                            Some(
-                                syntax_cache(
-                                    ui,
-                                    &doc.path,
-                                    text,
-                                    doc.path
-                                        .extension()
-                                        .and_then(|ext| ext.to_str())
-                                        .unwrap_or(""),
-                                    fingerprint,
-                                )
-                                .job,
-                            )
-                        }
+                    let analysis = match &doc.content {
+                        Content::Text(text) => crate::editor_analysis::get_keyed(
+                            ui,
+                            text,
+                            &doc.path,
+                            doc.editor_snapshot().0,
+                        ),
                         _ => None,
                     };
-                    let colors = syntax
-                        .as_ref()
-                        .map(|job| crate::highlighting::symbol_colors(job, &symbols))
-                        .unwrap_or_default();
+                    let key = egui::util::hash((
+                        doc.revision(),
+                        doc.outline.as_ptr() as usize,
+                        doc.outline.len(),
+                        &self.structure_filter,
+                        analysis.as_ref().map(|a| a.key),
+                    ));
+                    let rows = ui.ctx().data_mut(|data| {
+                        let id = egui::Id::new("structure-rows");
+                        if let Some(rows) = data.get_temp::<Arc<StructureRows>>(id)
+                            && rows.key == key
+                        {
+                            return rows;
+                        }
+                        let filter = self.structure_filter.to_lowercase();
+                        let symbols: Vec<_> = doc
+                            .outline
+                            .iter()
+                            .filter(|symbol| {
+                                filter.is_empty()
+                                    || symbol.name.to_lowercase().contains(&filter)
+                                    || symbol.kind.to_lowercase().contains(&filter)
+                            })
+                            .cloned()
+                            .collect();
+                        let colors = analysis
+                            .as_ref()
+                            .map(|a| {
+                                crate::highlighting::symbol_colors(
+                                    &a.syntax,
+                                    &symbols.iter().collect::<Vec<_>>(),
+                                )
+                            })
+                            .unwrap_or_default();
+                        let rows = Arc::new(StructureRows {
+                            key,
+                            symbols,
+                            colors,
+                        });
+                        data.insert_temp(id, rows.clone());
+                        rows
+                    });
+                    let symbols = &rows.symbols;
+                    let colors = &rows.colors;
                     ui.weak(format!("{} symbols", symbols.len()));
                     egui::ScrollArea::both()
                         .id_salt("structure-symbols")
                         .show_rows(ui, 24.0, symbols.len(), |ui, rows| {
                             for index in rows {
-                                let symbol = symbols[index];
+                                let symbol = &symbols[index];
                                 let (rect, response) = ui.allocate_exact_size(
                                     egui::vec2(ui.available_width(), 24.0),
                                     egui::Sense::click(),
@@ -2447,7 +2515,7 @@ impl Coder {
                     }
                 });
             if self.search_rx.is_some() {
-                ui.spinner();
+                ui.weak("…");
             }
         });
         ui.horizontal_wrapped(|ui| {
@@ -2721,8 +2789,13 @@ impl Coder {
             // Match the search worker: clean files come from disk, while
             // unsaved edits (including CSV grids) come from the editor.
             let source = document.map(|doc| doc.source_text().unwrap_or_default());
-            self.preview
-                .request(location.path.clone(), source, dark, revision);
+            self.preview.request_with_context(
+                location.path.clone(),
+                source,
+                dark,
+                revision,
+                Some(ui.ctx().clone()),
+            );
         }
         // Watch disk versions even when the search panel is otherwise idle.
         if revision.is_none() {
@@ -2740,11 +2813,10 @@ impl Coder {
                 .show(ui, |ui| {
                     ui.set_min_size(egui::vec2(ui.available_width(), height));
                     ui.horizontal(|ui| {
-                        ui.spinner();
+                        ui.weak("…");
                         ui.weak("Loading preview…");
                     });
                 });
-            ui.ctx().request_repaint_after(Duration::from_millis(16));
             return;
         };
         let scale = crate::preferences::editor_font_size(ui.ctx()) / 13.0;
@@ -3208,7 +3280,7 @@ impl Coder {
                 let path = doc.path.clone();
                 ui.push_id(&path, |ui| match &mut doc.content {
                     Content::Unloaded { .. } if loading => {
-                        ui.horizontal(|ui| { ui.spinner(); ui.label("Loading file…"); });
+                        ui.horizontal(|ui| { ui.weak("…"); ui.label("Loading file…"); });
                     }
                     Content::Unloaded { .. } => {
                         ui.label("Could not load this file. It may have been moved, deleted, or become unreadable.");
@@ -3231,7 +3303,7 @@ impl Coder {
                     Content::Text(text) => {
                         let mut changed = false;
                         if markdown && doc.markdown == MarkdownMode::Preview {
-                            markdown_preview(ui, &mut self.cache, text, &path);
+                            markdown_preview(ui, &mut self.cache, text, &path, snapshot.0);
                         } else if markdown && doc.markdown == MarkdownMode::Split {
                             ui.columns(2, |columns| {
                                 (changed, clicked_token, clicked_blame) = text_editor(
@@ -3250,7 +3322,7 @@ impl Coder {
                                         blame: self.git.show_blame,
                                     },
                                 );
-                                markdown_preview(&mut columns[1], &mut self.cache, text, &path);
+                                markdown_preview(&mut columns[1], &mut self.cache, text, &path, if changed { egui::util::hash(text.as_str()) } else { snapshot.0 });
                             });
                         } else {
                             (changed, clicked_token, clicked_blame) = text_editor(
@@ -3271,8 +3343,7 @@ impl Coder {
                             );
                         }
                         if changed {
-                            doc.dirty = *text != doc.original;
-                            doc.mark_changed();
+                            doc.mark_text_edited();
                             doc.outline_refresh = Some(Instant::now());
                         }
                     }
@@ -3390,7 +3461,7 @@ impl Coder {
                     chrome::modal_style(ui, 500.0);
                     if self.save_continuation {
                         ui.horizontal(|ui| {
-                            ui.spinner();
+                            ui.weak("…");
                             ui.label("Saving files…");
                         });
                         return;
@@ -3604,6 +3675,7 @@ impl Coder {
             cancel.store(true, Ordering::Relaxed);
         }
         self.picker_files_key = None;
+        self.picker_accept_pending = None;
         self.picker_files.clear();
     }
 
@@ -3623,9 +3695,11 @@ impl Coder {
             &self.recent_file_searches,
         ));
         if self.picker_files_key != Some(key) {
-            self.clear_picker_files();
+            if let Some((_, cancel)) = self.picker_files_worker.take() {
+                cancel.store(true, Ordering::Relaxed);
+            }
             self.picker_files_key = Some(key);
-            if mode != Picker::Recent && self.files.len() + self.folders.len() > 50_000 {
+            if mode != Picker::Recent {
                 let files = self.files.clone();
                 let folders = self.folders.clone();
                 let recent = self.recent_file_searches.clone();
@@ -3723,6 +3797,14 @@ impl Coder {
         }
     }
 
+    fn open_terminal_token(&mut self, token: String) {
+        self.terminal.maximized = false;
+        self.open_token_search(token, Intent::Declarations, None);
+        // Terminal output has no source context to rank against. Keep the
+        // requested Declarations tab selected even when it has no matches.
+        self.pending_click = None;
+    }
+
     fn resolve_terminal_path(&self, file: &str, directory: &Path) -> Option<PathBuf> {
         let path = if let Some(relative) = file.strip_prefix("~/") {
             std::env::var_os("HOME")
@@ -3774,13 +3856,32 @@ impl Coder {
         // A unique suffix can resolve filenames printed relative to a build
         // directory. Ambiguous matches go to the picker instead of guessing.
         let suffix = path.strip_prefix(".").unwrap_or(&path);
-        let mut matches = self
-            .files
-            .iter()
-            .chain(self.folders.iter())
-            .filter(|candidate| {
-                candidate.ends_with(suffix) && (candidate.is_file() || candidate.is_dir())
-            });
+        let at = |index: usize| {
+            self.files
+                .get(index)
+                .unwrap_or_else(|| &self.folders[index - self.files.len()])
+        };
+        let mut candidates: Box<dyn Iterator<Item = &PathBuf> + '_> =
+            if self.path_names.len() == self.files.len() + self.folders.len() {
+                let name = suffix.file_name();
+                let start = self
+                    .path_names
+                    .partition_point(|index| at(*index).file_name() < name);
+                let end = self
+                    .path_names
+                    .partition_point(|index| at(*index).file_name() <= name);
+                Box::new(
+                    self.path_names[start..end]
+                        .iter()
+                        .map(move |index| at(*index)),
+                )
+            } else {
+                // During initialization there may be a small restored/test index.
+                Box::new(self.files.iter().chain(self.folders.iter()))
+            };
+        let mut matches = candidates
+            .by_ref()
+            .filter(|candidate| candidate.ends_with(suffix));
         let first = matches.next()?;
         if matches.any(|candidate| candidate != first) {
             return None;
@@ -3933,7 +4034,7 @@ impl Coder {
                 if field.changed() {
                     self.picker_selection = 0;
                 }
-                let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
+                let mut enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
                 if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
                     close = true;
                 }
@@ -3989,8 +4090,18 @@ impl Coder {
                         }
                         let query = query.clone();
                         let paths = self.picker_paths(ctx, mode, &query).to_vec();
+                        if self.picker_accept_pending != self.picker_files_key {
+                            self.picker_accept_pending = None;
+                        }
                         if self.picker_files_worker.is_some() {
-                            ui.spinner();
+                            ui.weak("Searching…");
+                            if enter {
+                                self.picker_accept_pending = self.picker_files_key;
+                                enter = false;
+                            }
+                        } else if self.picker_accept_pending.is_some() {
+                            enter = true;
+                            self.picker_accept_pending = None;
                         }
                         for path in paths {
                             entries.push((
@@ -4211,6 +4322,9 @@ impl Coder {
         if let Some(link) = crate::terminal::take_file_link(ctx) {
             self.open_terminal_link(link);
         }
+        if let Some(token) = crate::terminal::take_token_link(ctx) {
+            self.open_terminal_token(token);
+        }
         if !self.search_docked {
             self.results_panel(ctx);
         }
@@ -4309,7 +4423,7 @@ impl Coder {
         if self.any_saving() && self.pending.is_none() {
             egui::Modal::new(egui::Id::new("saving-files")).show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    ui.weak("…");
                     ui.label("Saving files…");
                 });
             });
@@ -5020,7 +5134,13 @@ fn category_toggle(
     }
 }
 
-fn markdown_preview(ui: &mut egui::Ui, cache: &mut MarkdownCache, text: &str, path: &Path) {
+fn markdown_preview(
+    ui: &mut egui::Ui,
+    cache: &mut MarkdownCache,
+    text: &str,
+    path: &Path,
+    revision: u64,
+) {
     let scroll = egui::ScrollArea::vertical();
     #[cfg(feature = "ui-capture")]
     let scroll = if std::env::var("CODER_UI_PREVIEW").as_deref() == Ok("markdown") {
@@ -5099,14 +5219,42 @@ fn markdown_preview(ui: &mut egui::Ui, cache: &mut MarkdownCache, text: &str, pa
                         render(ui);
                     }
                 };
-                cache.prepare(text);
-                let mut viewer = CommonMarkViewer::new()
-                    .max_image_width(Some(ui.available_width().max(1.0) as usize))
-                    .render_html_fn(Some(&html));
-                if let Some(directory) = &directory {
-                    viewer = viewer.default_implicit_uri_scheme(directory.to_string());
+                cache.prepare_keyed(text, revision);
+                let layout_key = egui::util::hash((
+                    ui.available_width().to_bits(),
+                    ui.ctx().pixels_per_point().to_bits(),
+                    ui.visuals().dark_mode,
+                ));
+                if cache.layout_key != Some(layout_key) {
+                    cache.heights.fill(None);
+                    cache.layout_key = Some(layout_key);
                 }
-                viewer.show_events(ui, &mut cache.native, cache.events.iter().cloned());
+                // Retain measured block heights. Offscreen blocks reserve their
+                // space without cloning events or laying out their widgets.
+                for (index, range) in cache.blocks.iter().enumerate() {
+                    let top = ui.cursor().top();
+                    let visible = cache.heights[index].is_none_or(|height| {
+                        top + height >= ui.clip_rect().top() && top <= ui.clip_rect().bottom()
+                    });
+                    if visible {
+                        let mut viewer = CommonMarkViewer::new()
+                            .max_image_width(Some(ui.available_width().max(1.0) as usize))
+                            .render_html_fn(Some(&html));
+                        if let Some(directory) = &directory {
+                            viewer = viewer.default_implicit_uri_scheme(directory.to_string());
+                        }
+                        ui.push_id(index, |ui| {
+                            viewer.show_events(
+                                ui,
+                                &mut cache.native,
+                                cache.events[range.clone()].iter().cloned(),
+                            );
+                        });
+                        cache.heights[index] = Some(ui.cursor().top() - top);
+                    } else {
+                        ui.add_space(cache.heights[index].unwrap());
+                    }
+                }
             });
         });
 }
@@ -5235,77 +5383,13 @@ fn release_unloaded_editor(ctx: &egui::Context, doc: &Document) {
     if let Some(id) = doc.editor_id {
         release_editor_state(ctx, id);
     }
-    ctx.data_mut(|data| {
-        let key = egui::Id::new("editor-syntax");
-        if data
-            .get_temp::<SyntaxCache>(key)
-            .is_some_and(|cache| cache.path == doc.path)
-        {
-            data.remove::<SyntaxCache>(key);
-        }
-    });
 }
 
-/// The syntax colors of a document, kept between frames.
-///
-/// The text is parsed and laid out once per change instead of once per
-/// frame, and the editor and the panels share one copy of the result.
 #[derive(Clone)]
-struct SyntaxCache {
-    path: PathBuf,
-    /// The fingerprint of the text the colors belong to.
-    fingerprint: u64,
-    extension: String,
-    dark: bool,
-    /// The size of the editor font, which the colors are laid out for.
-    size: f32,
-    job: Arc<egui::text::LayoutJob>,
-    regions: Arc<Vec<crate::folding::Region>>,
-    structure: Arc<crate::editor_structure::Structure>,
-}
-
-/// The syntax colors of the text, computed when the text changed.
-///
-/// The caller passes the fingerprint of the text, so the text is not hashed
-/// again for every panel that shows it.
-fn syntax_cache(
-    ui: &egui::Ui,
-    path: &Path,
-    text: &str,
-    extension: &str,
-    fingerprint: u64,
-) -> SyntaxCache {
-    // One entry for the editor, so the memory of a file is released when
-    // another one is shown.
-    let id = egui::Id::new("editor-syntax");
-    let dark = ui.visuals().dark_mode;
-    let size = crate::preferences::editor_font_size(ui.ctx());
-    let cached = ui.ctx().data_mut(|data| data.get_temp::<SyntaxCache>(id));
-    if let Some(cache) = cached
-        && cache.path == path
-        && cache.fingerprint == fingerprint
-        && cache.extension == extension
-        && cache.dark == dark
-        && cache.size == size
-    {
-        return cache;
-    }
-    let job = crate::highlighting::highlight(ui, text, extension);
-    let structure = crate::editor_structure::Structure::build(&job);
-    let regions = crate::folding::regions(&job.text, &structure, extension);
-    let cache = SyntaxCache {
-        path: path.to_path_buf(),
-        fingerprint,
-        extension: extension.to_owned(),
-        dark,
-        size,
-        job: job.clone(),
-        regions: Arc::new(regions),
-        structure: Arc::new(structure),
-    };
-    ui.ctx()
-        .data_mut(|data| data.insert_temp(id, cache.clone()));
-    cache
+struct StructureRows {
+    key: u64,
+    symbols: Vec<navigation::Symbol>,
+    colors: Vec<Color32>,
 }
 
 /// Track mutations made by TextEdit between its layout calls in one frame.
@@ -5463,40 +5547,65 @@ fn text_editor(
         ui.memory_mut(|memory| memory.request_focus(id));
         *cursor = offset;
     }
-    let selected = egui::TextEdit::load_state(ui.ctx(), id)
+    let selected_range = egui::TextEdit::load_state(ui.ctx(), id)
         .and_then(|state| state.cursor.char_range())
         .filter(|range| !range.is_empty())
-        .map(|range| {
-            let indices = range.as_sorted_char_range();
-            text.as_str()
-                .chars()
-                .skip(indices.start)
-                .take(indices.len())
-                .collect::<String>()
-        })
-        .unwrap_or_default();
-    let occurrence = if find.query.is_empty() {
-        selected.as_str()
-    } else {
-        find.query
-    };
-    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("txt");
+        .map(|range| range.as_sorted_char_range());
+    let selection_key = (source_hash, selected_range.clone());
+    let selected = ui.ctx().data_mut(|data| {
+        let key = id.with("occurrence-selection");
+        if let Some((old, value)) =
+            data.get_temp::<((u64, Option<std::ops::Range<usize>>), String)>(key)
+            && old == selection_key
+        {
+            return value;
+        }
+        let value = selected_range
+            .filter(|range| range.len() <= 256)
+            .map(|range| {
+                let checkpoints_id = id.with("character-checkpoints");
+                let checkpoints = data
+                    .get_temp::<(u64, Arc<Vec<usize>>)>(checkpoints_id)
+                    .filter(|(revision, _)| *revision == source_hash)
+                    .map(|(_, checkpoints)| checkpoints)
+                    .unwrap_or_else(|| {
+                        let checkpoints = Arc::new(
+                            text.as_str()
+                                .char_indices()
+                                .enumerate()
+                                .filter_map(|(index, (byte, _))| {
+                                    (index % 1024 == 0).then_some(byte)
+                                })
+                                .collect::<Vec<_>>(),
+                        );
+                        data.insert_temp(checkpoints_id, (source_hash, checkpoints.clone()));
+                        checkpoints
+                    });
+                let block = range.start / 1024;
+                let byte = checkpoints
+                    .get(block)
+                    .copied()
+                    .unwrap_or(text.as_str().len());
+                text.as_str()[byte..]
+                    .chars()
+                    .skip(range.start % 1024)
+                    .take(range.len())
+                    .collect::<String>()
+            })
+            .filter(|value| !value.contains('\n'))
+            .unwrap_or_default();
+        data.insert_temp(key, (selection_key, value.clone()));
+        value
+    });
+    let occurrence = find.query;
     let fold_id = id.with(("folds", path));
     let mut folds = ui
         .ctx()
         .data_mut(|data| data.get_temp::<crate::folding::State>(fold_id))
         .unwrap_or_default();
     folds.sync(source_hash);
-    let analysis = large
-        .then(|| crate::editor_analysis::get_keyed(ui, text.as_str(), path, source_hash))
-        .flatten();
-    let small_cache =
-        (!large).then(|| syntax_cache(ui, path, text.as_str(), extension, source_hash));
-    let fold_regions = analysis
-        .as_ref()
-        .map(|a| a.folds.as_slice())
-        .or_else(|| small_cache.as_ref().map(|cache| cache.regions.as_slice()))
-        .unwrap_or(&[]);
+    let analysis = crate::editor_analysis::get_keyed(ui, text.as_str(), path, source_hash);
+    let fold_regions = analysis.as_ref().map(|a| a.folds.as_slice()).unwrap_or(&[]);
     if let Some(offset) = jump_offset.or(find_offset) {
         folds.reveal(fold_regions, offset..=offset);
     }
@@ -5527,12 +5636,16 @@ fn text_editor(
     let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, _wrap_width: f32| {
         let (generation, mut buffer_hash) = layout_fingerprint.get();
         if generation != edits.get() {
-            buffer_hash = egui::util::hash(buffer.as_str());
+            buffer_hash = egui::util::hash((source_hash, edits.get()));
             layout_fingerprint.set((edits.get(), buffer_hash));
         }
         let syntax = analysis.as_ref().filter(|_| buffer_hash == source_hash);
-        let viewport =
-            (large && active_folds.is_empty()).then(|| crate::editor_layout::viewport_key(ui));
+        let layout_folds = if buffer_hash == source_hash {
+            active_folds.as_slice()
+        } else {
+            &[]
+        };
+        let viewport = large.then(|| crate::editor_layout::viewport_key(ui));
         let style_key = egui::util::hash((
             buffer_hash,
             syntax.map(|a| a.key),
@@ -5550,21 +5663,21 @@ fn text_editor(
             return cached.galley.clone();
         }
         if large
-            && let Some(galley) =
-                crate::editor_layout::repaint_viewport(ui, id, style_key, viewport)
+            && let Some(galley) = crate::editor_layout::repaint_folded_viewport(
+                ui,
+                id,
+                style_key,
+                viewport,
+                layout_folds,
+            )
         {
-            let galley = if buffer_hash == source_hash {
-                crate::folding::layout(galley, &active_folds)
-            } else {
-                galley
-            };
             *editor_layout.lock().unwrap() = Some(crate::editor_analysis::CachedLayout {
                 key: layout_key,
                 galley: galley.clone(),
             });
             return galley;
         }
-        let mut job = if large {
+        let mut job = {
             syntax.map_or_else(
                 || {
                     egui::text::LayoutJob::simple(
@@ -5580,12 +5693,8 @@ fn text_editor(
                 },
                 |a| a.syntax.clone(),
             )
-        } else {
-            // The job is shared with the panels that show the same text, so
-            // it is copied only when it is changed here.
-            let mut shared = crate::highlighting::highlight(ui, buffer.as_str(), extension);
-            std::mem::take(&mut *Arc::make_mut(&mut shared))
         };
+
         for section in &mut job.sections {
             section.format.font_id.size = font_size;
         }
@@ -5602,17 +5711,14 @@ fn text_editor(
             }
         }
 
-        let galley = if large {
-            crate::editor_layout::layout_visible_keyed(ui, id, job, viewport, style_key)
-        } else {
-            ui.fonts_mut(|fonts| fonts.layout_job(job))
-        };
-        // Edits always lay out the full new buffer; anchors are rebuilt next frame.
-        let galley = if buffer_hash == source_hash {
-            crate::folding::layout(galley, &active_folds)
-        } else {
-            galley
-        };
+        let galley = crate::editor_layout::layout_folded_visible_keyed(
+            ui,
+            id,
+            job,
+            viewport,
+            style_key,
+            layout_folds,
+        );
         *editor_layout.lock().unwrap() = Some(crate::editor_analysis::CachedLayout {
             key: layout_key,
             galley: galley.clone(),
@@ -5644,6 +5750,7 @@ fn text_editor(
                 let guide_layer = ui.painter().add(egui::Shape::Noop);
                 let git_layer = ui.painter().add(egui::Shape::Noop);
                 let blame_hover_layer = ui.painter().add(egui::Shape::Noop);
+                let occurrence_layer = ui.painter().add(egui::Shape::Noop);
                 let mut tracked = TrackedText {
                     inner: &mut *text,
                     edits: &edits,
@@ -5660,11 +5767,29 @@ fn text_editor(
                 if let Some(range) = output.cursor_range {
                     *cursor = range.primary.index;
                 }
+                if find.query.is_empty() && !selected.is_empty() && edits.get() == 0 {
+                    ui.painter().set(
+                        occurrence_layer,
+                        visible_occurrences(
+                            &output.galley,
+                            output.galley_pos,
+                            ui.clip_rect(),
+                            &selected,
+                        ),
+                    );
+                }
                 if output.response.hovered()
                     && ui.input(|i| i.modifiers.command)
                     && let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
-                    && let Some((range, token)) =
-                        hovered_token(text.as_str(), &output.galley, pointer - output.galley_pos)
+                    && let Some((range, token)) = cached_hovered_token(
+                        ui.ctx(),
+                        id,
+                        source_hash,
+                        edits.get(),
+                        text.as_str(),
+                        &output.galley,
+                        pointer - output.galley_pos,
+                    )
                 {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     let left = output
@@ -5726,19 +5851,11 @@ fn text_editor(
                 } else {
                     Color32::from_rgb(116, 110, 98)
                 };
-                let small_structure = if large {
-                    Arc::new(crate::editor_structure::Structure::default())
-                } else if edits.get() == 0 {
-                    small_cache.as_ref().unwrap().structure.clone()
-                } else {
-                    Arc::new(crate::editor_structure::Structure::build(
-                        &output.galley.job,
-                    ))
-                };
+                let empty_structure = crate::editor_structure::Structure::default();
                 let structure = analysis
                     .as_ref()
                     .filter(|_| edits.get() == 0)
-                    .map_or(small_structure.as_ref(), |a| &a.structure);
+                    .map_or(&empty_structure, |a| &a.structure);
                 let active_pair = structure.matching(*cursor);
                 let caret_line = output
                     .galley
@@ -6205,6 +6322,78 @@ fn text_editor(
 }
 
 /// Hit-test glyph cells rather than rounded carets, so whitespace and line ends never link.
+/// Selection decorations never invalidate font layout. Scan only visible rows.
+fn visible_occurrences(
+    galley: &egui::Galley,
+    origin: egui::Pos2,
+    clip: egui::Rect,
+    query: &str,
+) -> egui::Shape {
+    let mut shapes = Vec::new();
+    if query.is_empty() {
+        return egui::Shape::Noop;
+    }
+    let first = galley
+        .rows
+        .partition_point(|row| origin.y + row.pos.y + row.size.y < clip.top());
+    for row in galley.rows[first..]
+        .iter()
+        .take_while(|row| origin.y + row.pos.y <= clip.bottom())
+    {
+        if row.size.y == 0.0 {
+            continue;
+        }
+        let text: String = row.glyphs.iter().map(|glyph| glyph.chr).collect();
+        for (byte, matched) in text.match_indices(query) {
+            let start = text[..byte].chars().count();
+            let end = start + matched.chars().count() - 1;
+            if let (Some(a), Some(b)) = (row.glyphs.get(start), row.glyphs.get(end)) {
+                shapes.push(egui::Shape::rect_filled(
+                    egui::Rect::from_min_max(
+                        origin + row.pos.to_vec2() + egui::vec2(a.pos.x, 0.0),
+                        origin
+                            + row.pos.to_vec2()
+                            + egui::vec2(b.pos.x + b.advance_width, row.size.y),
+                    ),
+                    0.0,
+                    Color32::from_rgb(77, 73, 39),
+                ));
+            }
+        }
+    }
+    egui::Shape::Vec(shapes)
+}
+
+fn cached_hovered_token(
+    ctx: &egui::Context,
+    id: egui::Id,
+    source: u64,
+    edits: u64,
+    text: &str,
+    galley: &egui::Galley,
+    position: egui::Vec2,
+) -> Option<(std::ops::Range<usize>, String)> {
+    type Hit = Option<(std::ops::Range<usize>, String)>;
+    let key = egui::util::hash((
+        source,
+        edits,
+        galley.rows.as_ptr() as usize,
+        position.x.to_bits(),
+        position.y.to_bits(),
+    ));
+    ctx.data_mut(|data| {
+        let id = id.with("hovered-token");
+        if let Some((old, hit)) = data.get_temp::<(u64, Hit)>(id)
+            && old == key
+        {
+            return hit;
+        }
+        let hit = hovered_token(text, galley, position);
+        data.insert_temp(id, (key, hit.clone()));
+        hit
+    })
+}
+
 fn hovered_token(
     text: &str,
     galley: &egui::Galley,
@@ -6803,6 +6992,7 @@ mod tests {
         let ctx = egui::Context::default();
         let refresh = |app: &mut Coder| {
             app.files_checked = Instant::now() - PROJECT_REFRESH_INTERVAL;
+            app.files_completed = Some(Instant::now() - PROJECT_REFRESH_INTERVAL);
             app.poll(&ctx);
             assert!(app.files_rx.is_some());
             let started = app.files_checked;
@@ -7032,14 +7222,18 @@ mod tests {
                 .collect();
             files.push(source_path);
             files.sort_unstable();
-            let tree =
-                crate::explorer::FileTree::build_cancellable(&index_root, &files, &[], || false)
-                    .unwrap();
+            let files = Arc::new(files);
+            let tree = crate::explorer::FileTree::build_shared_cancellable(
+                &index_root,
+                files.clone(),
+                Arc::default(),
+                || false,
+            )
+            .unwrap();
             let _ = tx.send(Ok(Some(WorkspaceIndex {
-                paths: navigation::WorkspacePaths {
-                    files,
-                    folders: Vec::new(),
-                },
+                files,
+                folders: Arc::default(),
+                names: Arc::default(),
                 tree,
             })));
             working.store(false, Ordering::Relaxed);
@@ -8570,6 +8764,12 @@ mod tests {
             )
         };
         frame(&mut app, vec![]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.picker_files_worker.is_some() {
+            frame(&mut app, vec![]);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
         let output = frame(&mut app, vec![]);
         for label in ["empty", "src/nested"] {
             assert!(
@@ -9076,6 +9276,42 @@ mod tests {
     }
 
     #[test]
+    fn terminal_tokens_search_declarations_without_an_open_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("main.rs"),
+            "fn needle() {}\nfn caller() { needle(); }\n",
+        )
+        .unwrap();
+        let mut app = Coder::empty(root);
+        let ctx = egui::Context::default();
+        app.terminal.maximized = true;
+        app.open_terminal_token("needle".into());
+        assert!(app.search_open);
+        assert!(!app.terminal.maximized);
+        assert_eq!(app.query, "needle");
+        wait_for_search(&mut app, &ctx);
+        assert_eq!(
+            app.selected_category,
+            Some(navigation::MatchCategory::Declaration)
+        );
+        assert!(
+            app.results
+                .iter()
+                .any(|location| location.category == navigation::MatchCategory::Declaration)
+        );
+
+        app.open_terminal_token("unknown_symbol".into());
+        wait_for_search(&mut app, &ctx);
+        assert!(app.results.is_empty());
+        assert_eq!(
+            app.selected_category,
+            Some(navigation::MatchCategory::Declaration)
+        );
+    }
+
+    #[test]
     fn cmd_click_opens_the_search_dialog_on_the_tab_that_matches_the_intent() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -9269,6 +9505,7 @@ mod tests {
                     &mut cache,
                     "# Large heading\n\nBody [link](https://example.org)\n\n- [x] Done\n\n| Engine | Support |\n| --- | --- |\n| Comrak | GFM |\n\n```rust\nfn main() {}\n```\n",
                     Path::new("/tmp/README.md"),
+                    1,
                 );
             });
         });
@@ -9346,6 +9583,7 @@ mod tests {
                                     &mut cache,
                                     source,
                                     Path::new("/tmp/README.md"),
+                                    egui::util::hash(source),
                                 );
                             });
                         },
@@ -9375,6 +9613,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn selection_occurrences_only_decorate_visible_unicode_rows() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let job = egui::text::LayoutJob::simple(
+                    "猫one\n猫two\n猫three".into(),
+                    FontId::monospace(13.0),
+                    Color32::WHITE,
+                    f32::INFINITY,
+                );
+                let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+                let origin = egui::pos2(100.0, 100.0);
+                let row = &galley.rows[1];
+                let clip = egui::Rect::from_min_max(
+                    origin + egui::vec2(0.0, row.pos.y + 1.0),
+                    origin + egui::vec2(500.0, row.pos.y + row.size.y - 1.0),
+                );
+                let egui::Shape::Vec(shapes) = visible_occurrences(&galley, origin, clip, "猫")
+                else {
+                    panic!("occurrence rectangles");
+                };
+                assert_eq!(shapes.len(), 1);
+                let egui::Shape::Rect(rect) = &shapes[0] else {
+                    panic!("rectangle");
+                };
+                assert_eq!(rect.rect.left(), origin.x + row.pos.x + row.glyphs[0].pos.x);
+                assert_eq!(rect.rect.width(), row.glyphs[0].advance_width);
+                assert_eq!(galley.text(), "猫one\n猫two\n猫three");
+            });
+        });
     }
 
     #[test]
@@ -9792,7 +10063,21 @@ mod tests {
             (output, folded)
         };
         frame(vec![], None);
-        let (output, _) = frame(vec![], None);
+        std::thread::sleep(Duration::from_millis(210));
+        frame(vec![], None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let output = loop {
+            let (output, _) = frame(vec![], None);
+            if output
+                .shapes
+                .iter()
+                .any(|s| matches!(&s.shape, egui::Shape::Path(path) if path.points.len() == 3))
+            {
+                break output;
+            }
+            assert!(Instant::now() < deadline, "fold analysis did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        };
         let source_shape = output
             .shapes
             .iter()

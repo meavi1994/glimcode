@@ -22,6 +22,7 @@ pub struct ChangedFile {
     pub deleted: bool,
     pub added: bool,
     pub conflict: bool,
+    pub untracked: bool,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Remote {
@@ -97,13 +98,17 @@ pub struct CommitDetail {
     pub prs: Vec<PullRequest>,
     pub pr_note: Option<String>,
 }
-struct Output {
-    success: bool,
-    bytes: Vec<u8>,
-    error: String,
+pub(crate) struct Output {
+    pub(crate) success: bool,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) error: String,
 }
 
-fn run(mut command: Command, input: Option<Vec<u8>>, timeout: Duration) -> Result<Output> {
+pub(crate) fn run(
+    mut command: Command,
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+) -> Result<Output> {
     command
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -211,6 +216,60 @@ pub fn remote(value: &str) -> Option<Remote> {
     Some(Remote { host, owner, name })
 }
 
+/// Automatic content refreshes reuse branch metadata and untracked results.
+/// Membership and Git metadata events, manual refreshes, and the periodic
+/// reconciliation all take the complete path.
+pub fn repository_refresh(root: &Path, base: Option<&str>, full: bool) -> Result<Repository> {
+    type Cached = std::collections::HashMap<PathBuf, (Instant, Repository)>;
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Cached>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let previous = cache.lock().unwrap().get(root).cloned();
+    if !full
+        && let Some((checked, mut previous)) = previous
+        && checked.elapsed() < Duration::from_secs(30)
+        && base.is_none_or(|base| base == previous.base)
+    {
+        let mut files: BTreeMap<_, _> = previous
+            .files
+            .into_iter()
+            .filter_map(|mut file| {
+                if file.committed || file.untracked {
+                    file.uncommitted = file.untracked;
+                    file.deleted = false;
+                    file.conflict = false;
+                    Some((file.path.clone(), file))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        parse_status(
+            &git(
+                &previous.root,
+                &["status", "--porcelain=v1", "-z", "--untracked-files=no"],
+            )?,
+            &mut files,
+        );
+        for file in files.values_mut() {
+            file.deleted = std::fs::symlink_metadata(previous.root.join(&file.path)).is_err();
+        }
+        previous.files = files.into_values().collect();
+        cache
+            .lock()
+            .unwrap()
+            .insert(root.to_owned(), (checked, previous.clone()));
+        return Ok(previous);
+    }
+    let repo = repository(root, base)?;
+    let mut cache = cache.lock().unwrap();
+    // Bound retained repositories when projects are switched repeatedly.
+    if cache.len() >= 4 && !cache.contains_key(root) {
+        cache.clear();
+    }
+    cache.insert(root.to_owned(), (Instant::now(), repo.clone()));
+    Ok(repo)
+}
+
 pub fn repository(project: &Path, requested_base: Option<&str>) -> Result<Repository> {
     let root = PathBuf::from(
         text(project, &["rev-parse", "--show-toplevel"])
@@ -304,7 +363,7 @@ pub fn repository(project: &Path, requested_base: Option<&str>) -> Result<Reposi
     );
     // A working-tree restoration of a committed deletion is no longer deleted.
     for file in files.values_mut() {
-        file.deleted = !root.join(&file.path).exists() && !root.join(&file.path).is_symlink();
+        file.deleted = std::fs::symlink_metadata(root.join(&file.path)).is_err();
     }
     let remote = text(&root, &["remote", "get-url", "origin"])
         .ok()
@@ -382,6 +441,7 @@ fn parse_status(bytes: &[u8], files: &mut BTreeMap<PathBuf, ChangedFile>) {
             ..Default::default()
         });
         file.uncommitted = true;
+        file.untracked = status == b"??";
         file.deleted = status.contains(&b'D');
         file.added |= status == b"??" || status.contains(&b'A');
         file.conflict = status.contains(&b'U') || status == b"AA" || status == b"DD";
@@ -769,6 +829,57 @@ pub(crate) mod tests {
         git(dir.path(), &["checkout", "-b", "feature"])?;
         Ok(dir)
     }
+    #[test]
+    fn automatic_status_preserves_untracked_files_and_full_refresh_reconciles_metadata()
+    -> Result<()> {
+        let dir = setup()?;
+        let root = dir.path();
+        std::fs::write(root.join("new.txt"), "new")?;
+        let first = repository_refresh(root, None, true)?;
+        assert!(
+            first
+                .files
+                .iter()
+                .any(|f| f.path == Path::new("new.txt") && f.untracked)
+        );
+        std::fs::write(root.join("src/code.rs"), "fn edited() {}")?;
+        let edited = repository_refresh(root, Some(&first.base), false)?;
+        assert!(
+            edited
+                .files
+                .iter()
+                .any(|f| f.path == Path::new("new.txt") && f.untracked)
+        );
+        assert!(
+            edited
+                .files
+                .iter()
+                .any(|f| f.path == Path::new("src/code.rs") && f.uncommitted)
+        );
+        git(root, &["add", "new.txt"])?;
+        let staged = repository_refresh(root, Some(&first.base), false)?;
+        assert!(
+            staged
+                .files
+                .iter()
+                .any(|f| f.path == Path::new("new.txt") && f.added && !f.untracked)
+        );
+        git(root, &["reset", "HEAD", "--", "new.txt"])?;
+        let reset = repository_refresh(root, Some(&first.base), true)?;
+        assert!(
+            reset
+                .files
+                .iter()
+                .any(|f| f.path == Path::new("new.txt") && f.untracked)
+        );
+        std::fs::remove_file(root.join("new.txt"))?;
+        git(root, &["checkout", "-b", "other"])?;
+        let changed = repository_refresh(root, Some(&first.base), true)?;
+        assert_eq!(changed.branch, "other");
+        assert!(!changed.files.iter().any(|f| f.path == Path::new("new.txt")));
+        Ok(())
+    }
+
     #[test]
     fn changed_files_include_commits_working_tree_deletions_renames_and_untracked() -> Result<()> {
         let dir = setup()?;

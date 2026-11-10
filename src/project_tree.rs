@@ -18,8 +18,20 @@ use std::{
 pub const THRESHOLD: usize = 100_000;
 
 struct Entry {
-    path: PathBuf,
+    path: EntryPath,
     folder: bool,
+}
+enum EntryPath {
+    Indexed(Arc<Vec<PathBuf>>, usize),
+    Owned(PathBuf),
+}
+impl Entry {
+    fn path(&self) -> &PathBuf {
+        match &self.path {
+            EntryPath::Indexed(paths, index) => &paths[*index],
+            EntryPath::Owned(path) => path,
+        }
+    }
 }
 type Index = BTreeMap<PathBuf, Vec<Arc<Entry>>>;
 struct Row {
@@ -61,10 +73,24 @@ impl LargeTree {
         folders: &[PathBuf],
         cancelled: &impl Fn() -> bool,
     ) -> Option<Self> {
+        Self::build_shared(
+            root,
+            Arc::new(files.to_vec()),
+            Arc::new(folders.to_vec()),
+            cancelled,
+        )
+    }
+
+    pub fn build_shared(
+        root: &Path,
+        files: Arc<Vec<PathBuf>>,
+        folders: Arc<Vec<PathBuf>>,
+        cancelled: &impl Fn() -> bool,
+    ) -> Option<Self> {
         let mut index = Index::new();
         let mut directories = BTreeSet::new();
         for (paths, folder) in [(files, false), (folders, true)] {
-            for path in paths {
+            for (path_index, path) in paths.iter().enumerate() {
                 if cancelled() {
                     return None;
                 }
@@ -78,7 +104,7 @@ impl LargeTree {
                         .entry(parent.to_owned())
                         .or_default()
                         .push(Arc::new(Entry {
-                            path: path.clone(),
+                            path: EntryPath::Indexed(paths.clone(), path_index),
                             folder: false,
                         }));
                 }
@@ -101,7 +127,7 @@ impl LargeTree {
                     .entry(parent.to_owned())
                     .or_default()
                     .push(Arc::new(Entry {
-                        path: path.clone(),
+                        path: EntryPath::Owned(path.clone()),
                         folder: true,
                     }));
             }
@@ -110,8 +136,9 @@ impl LargeTree {
             if cancelled() {
                 return None;
             }
-            entries
-                .sort_unstable_by(|a, b| b.folder.cmp(&a.folder).then_with(|| a.path.cmp(&b.path)));
+            entries.sort_unstable_by(|a, b| {
+                b.folder.cmp(&a.folder).then_with(|| a.path().cmp(b.path()))
+            });
         }
         let rows = index
             .get(root)
@@ -265,8 +292,9 @@ impl LargeTree {
                 }
             });
         }
-        if self.dirty.is_some() || self.pending.is_some() {
-            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        if let Some(at) = self.dirty {
+            ui.ctx()
+                .request_repaint_after(Duration::from_millis(100).saturating_sub(at.elapsed()));
         }
         let height = 25.0;
         let (rect, _) = ui.allocate_exact_size(
@@ -287,7 +315,7 @@ impl LargeTree {
         let mut toggle = None;
         for i in visible {
             let row = &self.rows.rows[i];
-            let path = &row.entry.path;
+            let path = row.entry.path();
             let bounds = egui::Rect::from_min_size(
                 rect.min + egui::vec2(0.0, i as f32 * height),
                 egui::vec2(rect.width(), height),
@@ -397,7 +425,7 @@ fn project(
                 .entry(parent.to_owned())
                 .or_default()
                 .push(Arc::new(Entry {
-                    path: path.clone(),
+                    path: EntryPath::Owned(path.clone()),
                     folder: false,
                 }));
         }
@@ -409,13 +437,13 @@ fn project(
             let grand = parent.parent()?;
             if !index
                 .get(grand)
-                .is_some_and(|entries| entries.iter().any(|e| e.path == parent))
+                .is_some_and(|entries| entries.iter().any(|e| e.path().as_path() == parent))
             {
                 overlay
                     .entry(grand.to_owned())
                     .or_default()
                     .push(Arc::new(Entry {
-                        path: parent.to_owned(),
+                        path: EntryPath::Owned(parent.to_owned()),
                         folder: true,
                     }));
             }
@@ -429,17 +457,17 @@ fn project(
                     return None;
                 }
                 if !entry.folder
-                    && changed.is_none_or(|paths| paths.contains(&entry.path))
-                    && (!hide_tests || !crate::test_files::is_test_file(&entry.path))
+                    && changed.is_none_or(|paths| paths.contains(entry.path()))
+                    && (!hide_tests || !crate::test_files::is_test_file(entry.path()))
                     && filter.matches(
                         &entry
-                            .path
+                            .path()
                             .strip_prefix(root)
-                            .unwrap_or(&entry.path)
+                            .unwrap_or(entry.path())
                             .to_string_lossy(),
                     )
                 {
-                    for path in entry.path.ancestors().take_while(|p| *p != root) {
+                    for path in entry.path().ancestors().take_while(|p| *p != root) {
                         allowed.insert(path.to_owned());
                     }
                 }
@@ -447,8 +475,9 @@ fn project(
         }
     }
     for entries in overlay.values_mut() {
-        entries.sort_unstable_by(|a, b| b.folder.cmp(&a.folder).then_with(|| a.path.cmp(&b.path)));
-        entries.dedup_by(|a, b| a.path == b.path);
+        entries
+            .sort_unstable_by(|a, b| b.folder.cmp(&a.folder).then_with(|| a.path().cmp(b.path())));
+        entries.dedup_by(|a, b| a.path() == b.path());
     }
     struct Walker<'a> {
         index: &'a Index,
@@ -470,7 +499,7 @@ fn project(
                 }
                 let entry = match (main.peek(), extra.peek()) {
                     (Some(a), Some(b)) => {
-                        match b.folder.cmp(&a.folder).then_with(|| a.path.cmp(&b.path)) {
+                        match b.folder.cmp(&a.folder).then_with(|| a.path().cmp(b.path())) {
                             std::cmp::Ordering::Less => main.next(),
                             std::cmp::Ordering::Equal => {
                                 extra.next();
@@ -485,7 +514,7 @@ fn project(
                 }?;
                 if self
                     .allowed
-                    .is_some_and(|paths| !paths.contains(&entry.path))
+                    .is_some_and(|paths| !paths.contains(entry.path()))
                 {
                     continue;
                 }
@@ -494,9 +523,9 @@ fn project(
                     depth,
                 });
                 if entry.folder
-                    && (self.all_open ^ self.expanded.contains(&entry.path) || self.filtered)
+                    && (self.all_open ^ self.expanded.contains(entry.path()) || self.filtered)
                 {
-                    self.visit(&entry.path, depth + 1)?;
+                    self.visit(entry.path(), depth + 1)?;
                 }
             }
             Some(())
@@ -514,7 +543,10 @@ fn project(
     };
     walker.visit(root, 0)?;
     let rows = walker.rows;
-    let reveal = reveal.and_then(|path| rows.iter().position(|row| row.entry.path == path));
+    let reveal = reveal.and_then(|path| {
+        rows.iter()
+            .position(|row| row.entry.path().as_path() == path)
+    });
     Some(Projection { rows, reveal })
 }
 
@@ -546,7 +578,7 @@ mod tests {
                 .iter()
                 .map(|r| r
                     .entry
-                    .path
+                    .path()
                     .file_name()
                     .unwrap()
                     .to_string_lossy()
@@ -570,7 +602,7 @@ mod tests {
             &cancel,
         )
         .unwrap();
-        assert_eq!(rows.rows[rows.reveal.unwrap()].entry.path, target);
+        assert_eq!(rows.rows[rows.reveal.unwrap()].entry.path(), &target);
         assert_eq!(rows.rows[2].depth, 1);
         let rows = project(
             &tree.index,
@@ -586,7 +618,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows.rows.len(), 2);
-        assert_eq!(rows.rows[1].entry.path, target);
+        assert_eq!(rows.rows[1].entry.path(), &target);
         let deleted = tree.root.join("removed/old.rs");
         let extras = BTreeSet::from([deleted.clone()]);
         let changed = BTreeSet::from([deleted.clone(), tree.root.join("src/main_test.rs")]);
@@ -604,7 +636,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows.rows.len(), 2);
-        assert_eq!(rows.rows[1].entry.path, deleted);
+        assert_eq!(rows.rows[1].entry.path(), &deleted);
         cancel.store(true, Ordering::Relaxed);
         assert!(
             project(

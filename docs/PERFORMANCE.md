@@ -72,3 +72,42 @@ A separate native run opened the real Kubernetes workspace and its 3,701-line ku
 Continuous redraw intervals had a median of 8.41 ms and p99 of 14.03 ms. These intervals include work outside the measured application/GPU stages and are not presentation timestamps. The capture therefore does not establish that every physical display frame met 8.33 ms, and does not establish physical key-to-photon latency. Input counts include scrolling and mouse input as well as keys; no key contents were recorded.
 
 Local artifacts are saved under `target/performance/`: `combined-stress.json`, `kubernetes-native-final.jsonl`, and the `kubernetes-native-final-all.txt` and `kubernetes-native-final-steady.txt` summaries. These generated captures are not committed. Results depend on the workload and machine; repeat the commands and live capture for subsequent changes.
+
+## Screenshot audit follow-up (10 November 2026)
+
+The screenshot findings referred to commit `b9525d9`. The current implementation was checked against each item. The changes below reduce repeated work while retaining full Git reconciliation, external-file detection, Unicode editing, terminal history, and folding.
+
+| Finding | Current behavior |
+| --- | --- |
+| 1–2: full Git refresh after content edits, including all untracked files | Automatic content refreshes use one tracked-only status command and reuse recent branch metadata and untracked results. Refreshes wait at least three seconds after the preceding completion. Membership changes, Git metadata changes, manual refreshes and the thirty-second reconciliation use the complete status path. Deleted-file detection uses one symlink-aware metadata lookup. |
+| 3: worktree status every three seconds | Cards refresh at thirty-second intervals measured from completion. Each status command has a five-second timeout and bounded output; unknown status remains unknown. |
+| 4: back-to-back workspace walks | Walks never overlap. Event-triggered follow-up walks wait at least two seconds, or the previous walk's duration if longer. Periodic reconciliation runs five minutes after completion when native watching works. Manual refresh remains immediate. |
+| 5, 8, 12: repaint loops | Index, search, ranking, preview, geometry, analysis and projection workers wake the UI when results arrive. Debounce timers schedule their actual deadlines. Loading indicators are static; terminal output repaint requests are coalesced to an eight-millisecond deadline. |
+| 6–7: terminal parser lock and repeated grid construction | Painting uses a visible snapshot after releasing the parser lock. Cached rows retain text galleys, backgrounds and decorations. Selection, links, find results, geometry and font changes invalidate the relevant cache keys. |
+| 9, 13: scrolling and folding | Visible row positions are indexed and binary-searched, including the positions after folds. Only newly visible rows receive meshes. Unchanged viewports reuse composed galleys; folded galleys are cached as well. |
+| 10: selection rebuilds layout | Bounded, single-line selection queries use revision/range caches and sparse character checkpoints. Occurrence decorations scan visible rows and do not enter the text-layout key. Select-all does not become an occurrence query. |
+| 11: repeated typing work | Unchanged line jobs and their style/geometry keys are reused. Mutation generations and document revisions replace UI-thread full-buffer hashes. Dirty-state comparisons run on a revision- and baseline-checked worker; undo can still restore the clean state. |
+| 14: synchronous parsing of small files | All source sizes use cancellable background analysis after input settles. Syntax, folding and structure share its results. Plain text remains editable while analysis runs. |
+| 15: changed-file lists and ignore-rule work | The Git tool shares a generation/dirty-path cache across consumers. The sidebar count reuses its color map. Dirty-path merging uses a hash index, and ignore-file metadata is checked at most every two seconds. |
+| 16: terminal-link suffix lookup | Indexing builds a sorted filename index. Suffix resolution narrows to matching basenames before checking ambiguity and performing the final filesystem lookup. |
+| 17: file picker scans | All project queries run on cancellable workers. Existing results remain visible during a new query, and Enter waits for the current query instead of opening stale results. |
+| 18: other terminal costs | Visible and synchronized snapshots share cell allocations through row-level copy-on-write. Metadata queries are limited to at most two per second per tab. The writer sleeps up to 250 ms when idle and receives explicit wakeups for protocol replies. History search runs on a shared-row snapshot on a worker. Pointer reporting does not clone text/paste events, and keyboard events are moved out of the input queue. |
+| 19: Markdown preview | Parsed events are keyed by document revision. Measured top-level blocks reserve offscreen space without cloning their events or laying out their widgets again. Width, scale, theme and content changes invalidate measurements. Nested lists, tables and code blocks stay together. |
+| 20: duplicate file-index storage | Large-tree file entries reference the same immutable path vector as the workspace index. Old indices and projections are retired on workers. |
+| Lower-priority findings | Watched workspaces use event wakeups and periodic reconciliation; disk metadata checks run on workers. Missing idle files are retried after another idle interval. Hover tokens, filtered outline rows and declaration colors are cached. The synchronous Git calls in the cited CLI preview modes are inside the optional `ui-capture` fixture code, not the ordinary startup path. |
+
+These are bounded-work and caching changes, not a replacement of every underlying data structure. Full filesystem reconciliation still walks and sorts the workspace; an old index remains available while its replacement is built. Egui TextEdit still requires full cursor geometry, and composing changed document geometry still visits rows. Markdown's first measurement, content edits and width changes still require block layout; a single very large top-level block is not subdivided. Git metadata and untracked results can remain stale until the next reconciliation if native events are lost. No physical key-to-photon or real two-million-file filesystem-traversal claim is made by the synthetic checks.
+
+### Validation for this follow-up
+
+`cargo test --offline --no-fail-fast` passed 334 tests, with 22 opt-in tests excluded. The UI-capture feature also compiles. The release source, terminal redraw, busy-PTY, two-million-path picker/tree, and combined IDE checks passed separately.
+
+| Release check | Observed result |
+| --- | --- |
+| 5,000-line source | First viewport 0.92 ms; typing frame 1.35 ms; next frame 1.09 ms. |
+| Warm terminal redraws | Approximately 0.046–0.082 ms at the two tested panel sizes, after initial frames. |
+| Busy terminal with input and a blocked metadata query | Maximum sampled UI frame 0.321 ms; maximum input-to-parsed-reply 0.321 ms. |
+| Two-million-file tree | Worker build 2.81 s; expanded projection 6.89 ms; sampled fully expanded UI frames 0.039–0.356 ms. |
+| Combined IDE | 511 frames, 481 with indexing/search/input overlap; frame p99 0.625 ms, maximum 7.203 ms; input-to-parsed-reply p99 0.628 ms, maximum 7.229 ms. |
+
+The combined index contained 2,000,001 synthetic paths and the search fixture contained 2,000 real search files. These are component/combined CPU and PTY measurements, not display presentation timings. Results vary between runs and machines. The combined report is written to `target/performance/combined-stress.json`; generated test logs and captures are not committed.

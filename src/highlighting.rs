@@ -1,6 +1,10 @@
 use eframe::egui::{self, text::LayoutJob};
-use egui_extras::syntax_highlighting::{CodeTheme, SyntectSettings, highlight_with};
-use std::sync::{Arc, OnceLock};
+use egui_extras::syntax_highlighting::SyntectSettings;
+#[cfg(test)]
+use egui_extras::syntax_highlighting::{CodeTheme, highlight_with};
+#[cfg(test)]
+use std::sync::Arc;
+use std::sync::OnceLock;
 use syntect::highlighting::{Color, FontStyle, StyleModifier, Theme, ThemeItem, ThemeSettings};
 
 fn color(hex: u32) -> Color {
@@ -238,6 +242,7 @@ pub fn background(
 ///
 /// The result is shared, so the editor and the panels that show the same
 /// document use one copy of the laid out text instead of one each.
+#[cfg(test)]
 pub fn highlight(ui: &egui::Ui, text: &str, extension: &str) -> Arc<LayoutJob> {
     highlight_base(ui, text, extension)
 }
@@ -294,6 +299,7 @@ pub fn symbol_badge(kind: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn highlight_base(ui: &egui::Ui, text: &str, extension: &str) -> Arc<LayoutJob> {
     let size = crate::preferences::editor_font_size(ui.ctx());
     if matches!(
@@ -753,8 +759,10 @@ func local(flag Config) { flag.String() }
     }
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct TypedHighlighter;
+#[cfg(test)]
 impl egui::cache::ComputerMut<(&str, &str, bool, u32), Arc<LayoutJob>> for TypedHighlighter {
     fn compute(
         &mut self,

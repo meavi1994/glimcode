@@ -131,6 +131,9 @@ pub struct Document {
     /// document holds one copy less.
     disk_hash: Option<u64>,
     disk_checked: Instant,
+    disk_worker: Option<Receiver<Option<DiskStamp>>>,
+    dirty_check_needed: bool,
+    dirty_worker: Option<(u64, SharedText, Receiver<bool>)>,
     /// Avoid retrying an invalid disk revision on every UI frame.
     auto_reload_stamp: Option<DiskStamp>,
     /// Hash of the buffer as it is now: (revision, hash). The status bar asks
@@ -257,6 +260,9 @@ impl Document {
             disk_stamp: opened_stamp,
             disk_hash: Some(content_hash(&source)),
             disk_checked: Instant::now(),
+            disk_worker: None,
+            dirty_check_needed: false,
+            dirty_worker: None,
             auto_reload_stamp: None,
             buffer_hash: std::cell::Cell::new(None),
             original_hash: std::cell::Cell::new(Some(content_hash(&source))),
@@ -296,6 +302,9 @@ impl Document {
             disk_stamp: None,
             disk_hash: None,
             disk_checked: Instant::now(),
+            disk_worker: None,
+            dirty_check_needed: false,
+            dirty_worker: None,
             auto_reload_stamp: None,
             buffer_hash: std::cell::Cell::new(None),
             original_hash: std::cell::Cell::new(None),
@@ -333,6 +342,7 @@ impl Document {
     /// Stale reads never replace edits made while I/O was running. A save
     /// updates the baseline to its snapshot, retaining any newer unsaved edits.
     pub fn poll_io(&mut self) -> Result<bool> {
+        self.poll_dirty();
         let mut changed = false;
         if let Some((revision, rx)) = &self.load_worker {
             let revision = *revision;
@@ -399,8 +409,11 @@ impl Document {
             || self.is_csv()
             || !matches!(self.content, Content::Text(_))
             || now.saturating_duration_since(self.last_active) < Duration::from_secs(300)
-            || std::fs::File::open(&self.path).is_err()
         {
+            return false;
+        }
+        if std::fs::File::open(&self.path).is_err() {
+            self.last_active = now;
             return false;
         }
         let (line, column) = self.cursor_line_column(self.cursor);
@@ -445,9 +458,7 @@ impl Document {
         if let Some((key, rx)) = &self.outline_worker {
             match rx.try_recv() {
                 Ok(outline) => {
-                    if let Content::Text(text) = &self.content
-                        && eframe::egui::util::hash((&self.path, text.as_str())) == *key
-                    {
+                    if matches!(self.content, Content::Text(_)) && self.revision == *key {
                         self.outline = outline;
                     }
                     self.outline_worker = None;
@@ -463,8 +474,8 @@ impl Document {
         {
             self.outline_refresh = None;
             if let Content::Text(text) = &self.content {
-                let key = eframe::egui::util::hash((&self.path, text.as_str()));
-                let text = text.to_string();
+                let key = self.revision;
+                let text = text.clone();
                 let path = self.path.clone();
                 let ctx = ctx.clone();
                 let (tx, rx) = mpsc::channel();
@@ -477,8 +488,8 @@ impl Document {
                     });
             }
         }
-        if self.outline_refresh.is_some() || self.outline_worker.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(100));
+        if let Some(at) = self.outline_refresh {
+            ctx.request_repaint_after(Duration::from_millis(300).saturating_sub(at.elapsed()));
         }
     }
 
@@ -487,7 +498,49 @@ impl Document {
         self.revision = next_revision();
     }
 
-    /// Content-derived keys are computed once per edit, not once per frame.
+    pub fn mark_text_edited(&mut self) {
+        self.mark_changed();
+        self.dirty = true;
+        self.dirty_check_needed = true;
+        self.poll_dirty();
+    }
+
+    fn poll_dirty(&mut self) {
+        if let Some((revision, baseline, rx)) = &self.dirty_worker {
+            match rx.try_recv() {
+                Ok(dirty) => {
+                    if *revision == self.revision && Arc::ptr_eq(&baseline.0, &self.original.0) {
+                        self.dirty = dirty;
+                        self.dirty_check_needed = false;
+                    }
+                    self.dirty_worker = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.dirty_worker = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.dirty_check_needed && self.dirty_worker.is_none() {
+            let Content::Text(text) = &self.content else {
+                self.dirty_check_needed = false;
+                return;
+            };
+            if let Some(ctx) = self.io_context.clone() {
+                let text = text.clone();
+                let original = self.original.clone();
+                let (tx, rx) = mpsc::channel();
+                self.dirty_worker = Some((self.revision, original.clone(), rx));
+                std::thread::spawn(move || {
+                    let _ = tx.send(text != original);
+                    ctx.request_repaint();
+                });
+            } else {
+                self.dirty = text != &self.original;
+                self.dirty_check_needed = false;
+            }
+        }
+    }
+
+    /// Revisions identify source snapshots without hashing the buffer on the UI thread.
     pub fn editor_snapshot(&self) -> (u64, bool) {
         if let Some((revision, fingerprint, large)) = self.editor_snapshot.get()
             && revision == self.revision
@@ -497,7 +550,7 @@ impl Document {
         let Content::Text(text) = &self.content else {
             return (0, false);
         };
-        let fingerprint = eframe::egui::util::hash(text.as_str());
+        let fingerprint = self.revision;
         let large = crate::editor_analysis::is_large(text);
         self.editor_snapshot
             .set(Some((self.revision, fingerprint, large)));
@@ -595,10 +648,27 @@ impl Document {
     /// hashes are kept as well, because the answer is asked every frame and
     /// hashing a large text every frame is wasteful.
     pub fn can_reload(&mut self) -> bool {
-        if self.io_context.is_some() {
-            if self.disk_checked.elapsed() >= Duration::from_millis(500) {
-                self.observed_stamp = disk_stamp(&self.path);
+        if let Some(ctx) = &self.io_context {
+            if let Some(rx) = &self.disk_worker {
+                match rx.try_recv() {
+                    Ok(stamp) => {
+                        self.observed_stamp = stamp;
+                        self.disk_worker = None;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => self.disk_worker = None,
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            if self.disk_worker.is_none() && self.disk_checked.elapsed() >= Duration::from_secs(2) {
                 self.disk_checked = Instant::now();
+                let path = self.path.clone();
+                let ctx = ctx.clone();
+                let (tx, rx) = mpsc::channel();
+                self.disk_worker = Some(rx);
+                std::thread::spawn(move || {
+                    let _ = tx.send(disk_stamp(&path));
+                    ctx.request_repaint();
+                });
             }
             return self.observed_stamp != self.disk_stamp;
         }
@@ -860,6 +930,36 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn background_dirty_comparison_rejects_stale_results_and_recognizes_undo() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("source.rs");
+        std::fs::write(&path, "saved 猫")?;
+        let mut doc = Document::open(path, true)?;
+        doc.io_context = Some(eframe::egui::Context::default());
+        doc.content = Content::Text("first edit".into());
+        doc.mark_text_edited();
+        doc.content = Content::Text("second edit".into());
+        doc.mark_text_edited();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while doc.dirty_check_needed || doc.dirty_worker.is_some() {
+            doc.poll_io()?;
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(doc.dirty);
+        doc.content = Content::Text("saved 猫".into());
+        doc.mark_text_edited();
+        while doc.dirty_check_needed || doc.dirty_worker.is_some() {
+            doc.poll_io()?;
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(!doc.dirty);
+        Ok(())
+    }
+
     use super::*;
     fn finish_io(doc: &mut Document) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1176,14 +1276,12 @@ mod tests {
         let mut doc = Document::open(path, true)?;
         assert!(doc.outline.is_empty());
         assert!(doc.outline_refresh.is_some());
-        let old_key = match &doc.content {
-            Content::Text(text) => eframe::egui::util::hash((&doc.path, text.as_str())),
-            _ => unreachable!(),
-        };
+        let old_key = doc.revision();
         let (tx, rx) = mpsc::channel();
         tx.send(navigation::symbols(&doc.path, "export const obsolete = 1;"))?;
         doc.outline_worker = Some((old_key, rx));
         doc.content = Content::Text("export const current = 2;".into());
+        doc.mark_changed();
         doc.poll_outline(&eframe::egui::Context::default());
         assert!(
             doc.outline.is_empty(),

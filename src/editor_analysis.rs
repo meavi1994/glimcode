@@ -140,7 +140,12 @@ pub fn get_keyed(
                 ctx.request_repaint();
             });
     }
-    ui.ctx().request_repaint_after(Duration::from_millis(100));
+    if state.pending.is_none() {
+        let delay = state.desired.map_or(Duration::ZERO, |(_, at)| {
+            Duration::from_millis(200).saturating_sub(at.elapsed())
+        });
+        ui.ctx().request_repaint_after(delay);
+    }
     None
 }
 

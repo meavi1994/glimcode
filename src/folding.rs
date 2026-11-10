@@ -150,7 +150,8 @@ pub fn layout(original: Arc<Galley>, active: &[&Region]) -> Arc<Galley> {
     if active.is_empty() {
         return original;
     }
-    let mut galley = (*original).clone();
+    let mut original = original;
+    let galley = Arc::make_mut(&mut original);
     let mut removed = 0.0;
     let mut region = 0;
     galley.mesh_bounds = Rect::NOTHING;
@@ -189,7 +190,7 @@ pub fn layout(original: Arc<Galley>, active: &[&Region]) -> Arc<Galley> {
             );
         }
     }
-    Arc::new(galley)
+    original
 }
 
 #[cfg(test)]

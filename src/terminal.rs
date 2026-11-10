@@ -352,6 +352,7 @@ impl Default for ScreenState {
 }
 enum Command {
     Input(Vec<u8>),
+    Wake,
     Resize(PtySize),
     Scroll(i64, (u16, u16)),
 }
@@ -363,7 +364,7 @@ impl StatusPoller {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             while matches!(
-                rx.recv_timeout(Duration::from_millis(50)),
+                rx.recv_timeout(Duration::from_millis(500)),
                 Err(mpsc::RecvTimeoutError::Timeout)
             ) {
                 poll();
@@ -464,6 +465,7 @@ impl Session {
         let shell = settings.shell.clone();
         let default_name = settings.tab_name.clone();
         let backend = persistent.clone();
+        let reader_wake = tx.clone();
         std::thread::spawn(move || {
             let result = (|| -> Result<()> {
                 // A shell reads the size of the terminal once, when it starts,
@@ -511,6 +513,7 @@ impl Session {
                 shared.lock().unwrap().status = "Running".into();
                 let output = shared.clone();
                 let repaint = ctx.clone();
+                let writer_wake = reader_wake;
                 let direct_pty = backend.as_ref().is_none_or(|session| session.is_zmx());
                 std::thread::spawn(move || {
                     let mut buffer = [0u8; 8192];
@@ -522,8 +525,11 @@ impl Session {
                         {
                             let mut state = output.lock().unwrap();
                             state.process_output(&buffer[..count], direct_pty);
+                            if !state.parser.callbacks().replies.is_empty() {
+                                let _ = writer_wake.try_send(Command::Wake);
+                            }
                         }
-                        repaint.request_repaint();
+                        repaint.request_repaint_after(Duration::from_millis(8));
                     }
                 });
                 // Metadata queries spawn external tmux/zmx processes. Keep them
@@ -538,7 +544,7 @@ impl Session {
                         let revision = shared.lock().unwrap().revision;
                         if directory_checked.elapsed() >= Duration::from_secs(2)
                             || (revision != directory_revision
-                                && directory_checked.elapsed() >= Duration::from_millis(50))
+                                && directory_checked.elapsed() >= Duration::from_millis(500))
                         {
                             if let Some((directory, activity, mouse)) = session.pane_status() {
                                 let mut state = shared.lock().unwrap();
@@ -579,9 +585,10 @@ impl Session {
                     // before the ones that arrive later.
                     let command = match queued.pop_front() {
                         Some(command) => Ok(command),
-                        None => rx.recv_timeout(Duration::from_millis(10)),
+                        None => rx.recv_timeout(Duration::from_millis(250)),
                     };
                     match command {
+                        Ok(Command::Wake) => {}
                         Ok(Command::Input(bytes)) => {
                             writer.write_all(&bytes)?;
                             writer.flush()?;
@@ -1934,10 +1941,15 @@ pub fn take_file_link(ctx: &egui::Context) -> Option<FileLink> {
     ctx.data_mut(|data| data.remove_temp(egui::Id::new("terminal-file-link")))
 }
 
+pub fn take_token_link(ctx: &egui::Context) -> Option<String> {
+    ctx.data_mut(|data| data.remove_temp(egui::Id::new("terminal-token-link")))
+}
+
 #[derive(Debug, PartialEq)]
 enum Link {
     Url(String),
     File(String),
+    Token(String),
 }
 
 fn parse_link(text: &str) -> Option<Link> {
@@ -1997,7 +2009,28 @@ fn terminal_link(
     directory: &Path,
     root: &Path,
 ) -> Option<(Link, (u16, u16), (u16, u16))> {
-    let (start, end) = terminal_word(screen, point)?;
+    // Multiplexers can repaint soft-wrapped output with explicit cursor moves,
+    // losing the parser's wrap flag. Rejoin full-width continuations for links.
+    let (start, end) = terminal_span(screen, point, true, is_link_character)?;
+    let text = terminal_span_text(screen, start, end);
+    if let Some(link) = parse_link(&text).or_else(|| {
+        let query = file_link_query(&text);
+        let path = query.split(':').next().unwrap_or(&query);
+        (!path.is_empty() && (directory.join(path).exists() || root.join(path).exists()))
+            .then(|| Link::File(query))
+    }) {
+        return Some((link, start, end));
+    }
+    let (start, end) = terminal_span(screen, point, false, |c| c.is_alphanumeric() || c == '_')?;
+    let token = terminal_span_text(screen, start, end);
+    // Numbers alone do not name declarations.
+    token
+        .chars()
+        .any(|c| c.is_alphabetic() || c == '_')
+        .then(|| (Link::Token(token), start, end))
+}
+
+fn terminal_span_text(screen: &vt100::Screen, start: (u16, u16), end: (u16, u16)) -> String {
     let (_, cols) = screen.size();
     let mut text = String::new();
     for row in start.0..=end.0 {
@@ -2011,26 +2044,29 @@ fn terminal_link(
             }
         }
     }
-    let link = parse_link(&text).or_else(|| {
-        let query = file_link_query(&text);
-        let path = query.split(':').next().unwrap_or(&query);
-        (!path.is_empty() && (directory.join(path).exists() || root.join(path).exists()))
-            .then(|| Link::File(query))
-    })?;
-    Some((link, start, end))
+    text
 }
 
 /// Keep path and URL punctuation inside a word; quotes and shell separators bound it.
 fn terminal_word(screen: &vt100::Screen, point: (u16, u16)) -> Option<((u16, u16), (u16, u16))> {
+    terminal_span(screen, point, false, is_link_character)
+}
+
+fn is_link_character(c: char) -> bool {
+    !c.is_whitespace() && !"\"'`()[]{}<>|;,".contains(c)
+}
+
+fn terminal_span(
+    screen: &vt100::Screen,
+    point: (u16, u16),
+    infer_wrap: bool,
+    character: impl Fn(char) -> bool,
+) -> Option<((u16, u16), (u16, u16))> {
     let (rows, cols) = screen.size();
     let is_word = |(row, col)| {
         screen.cell(row, col).is_some_and(|cell| {
             cell.is_wide_continuation()
-                || (!cell.contents().is_empty()
-                    && cell
-                        .contents()
-                        .chars()
-                        .all(|c| !c.is_whitespace() && !"\"'`()[]{}<>|;,".contains(c)))
+                || (!cell.contents().is_empty() && cell.contents().chars().all(&character))
         })
     };
     if point.0 >= rows || point.1 >= cols || !is_word(point) {
@@ -2040,7 +2076,7 @@ fn terminal_word(screen: &vt100::Screen, point: (u16, u16)) -> Option<((u16, u16
     loop {
         let previous = if start.1 > 0 {
             (start.0, start.1 - 1)
-        } else if start.0 > 0 && screen.row_wrapped(start.0 - 1) {
+        } else if start.0 > 0 && (screen.row_wrapped(start.0 - 1) || infer_wrap) {
             (start.0 - 1, cols - 1)
         } else {
             break;
@@ -2053,7 +2089,7 @@ fn terminal_word(screen: &vt100::Screen, point: (u16, u16)) -> Option<((u16, u16
     loop {
         let next = if end.1 + 1 < cols {
             (end.0, end.1 + 1)
-        } else if end.0 + 1 < rows && screen.row_wrapped(end.0) {
+        } else if end.0 + 1 < rows && (screen.row_wrapped(end.0) || infer_wrap) {
             (end.0 + 1, 0)
         } else {
             break;
@@ -2155,8 +2191,25 @@ impl TerminalStyle {
 ///
 /// Every cell contributes one character, so that the row keeps the columns of
 /// the grid. A cell that was never written is a blank.
+#[derive(Default)]
+struct GridPaint {
+    shapes: Vec<egui::Shape>,
+}
+impl GridPaint {
+    fn rect_filled(&mut self, rect: egui::Rect, radius: f32, color: Color32) {
+        self.shapes
+            .push(egui::Shape::rect_filled(rect, radius, color));
+    }
+    fn line_segment(&mut self, points: [egui::Pos2; 2], stroke: egui::Stroke) {
+        self.shapes.push(egui::Shape::line_segment(points, stroke));
+    }
+    fn galley(&mut self, pos: egui::Pos2, galley: Arc<egui::Galley>, color: Color32) {
+        self.shapes.push(egui::Shape::galley(pos, galley, color));
+    }
+}
+
 fn paint_terminal_run(
-    painter: &egui::Painter,
+    painter: &mut GridPaint,
     origin: egui::Pos2,
     galley: Arc<egui::Galley>,
     style: TerminalStyle,
@@ -2433,6 +2486,9 @@ fn render(
     {
         match link {
             Link::Url(url) => ui.ctx().open_url(egui::OpenUrl::new_tab(url)),
+            Link::Token(token) => ui.ctx().data_mut(|data| {
+                data.insert_temp(egui::Id::new("terminal-token-link"), token.clone())
+            }),
             Link::File(query) => {
                 let state = tab.screen.lock().unwrap();
                 let directory = state
@@ -2539,7 +2595,9 @@ fn render(
         }
     }
     let revision = state.revision;
-    tab.view.find.refresh(state.parser.screen_mut(), revision);
+    tab.view
+        .find
+        .refresh(state.parser.screen_mut(), revision, ui.ctx());
     if tab.view.find.needs_refresh(revision) {
         ui.ctx().request_repaint_after(Duration::from_millis(200));
     }
@@ -2567,7 +2625,18 @@ fn render(
         state.parser.callbacks_mut().last_focus = Some(terminal_focused);
     }
     if report_mouse {
-        for event in ui.input(|i| i.events.clone()) {
+        for event in ui.input(|i| {
+            i.events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        egui::Event::PointerButton { .. } | egui::Event::PointerMoved(_)
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        }) {
             let (pos, code, released) = match event {
                 egui::Event::PointerButton {
                     pos,
@@ -2704,9 +2773,10 @@ fn render(
     if focused {
         let events = ui.input_mut(|i| {
             let mut events = vec![];
-            i.events.retain(|event| {
+            let mut retained = vec![];
+            for event in std::mem::take(&mut i.events) {
                 if matches!(
-                    event,
+                    &event,
                     egui::Event::Text(_)
                         | egui::Event::Paste(_)
                         | egui::Event::Copy
@@ -2714,12 +2784,12 @@ fn render(
                         | egui::Event::Key { .. }
                         | egui::Event::Ime(_)
                 ) {
-                    events.push(event.clone());
-                    false
+                    events.push(event);
                 } else {
-                    true
+                    retained.push(event);
                 }
-            });
+            }
+            i.events = retained;
             events
         });
         let clipboard_copy = events
@@ -2873,32 +2943,75 @@ fn render(
         }
     }
     state.expire_synchronized_output();
+    let history_top = state.parser.screen().history_bounds().2;
+    let exited = state.exited;
+    let live_scrollback = state.parser.screen().scrollback();
+    let status = state.status.clone();
+    let error = state.error.clone();
+    let synchronized = state
+        .parser
+        .callbacks()
+        .synchronized
+        .as_ref()
+        .map(|(start, _)| *start);
     let screen = if let Some((start, snapshot)) = &state.parser.callbacks().synchronized {
         ui.ctx()
             .request_repaint_after(Duration::from_secs(1).saturating_sub(start.elapsed()));
-        snapshot
+        snapshot.visible_snapshot()
     } else {
-        state.parser.screen()
+        state.parser.screen().visible_snapshot()
     };
+    let paint_key = egui::util::hash((
+        synchronized,
+        size,
+        font.clone(),
+        (cell.x.to_bits(), cell.y.to_bits()),
+        ui.ctx().pixels_per_point().to_bits(),
+        tab.view.find.paint_key(),
+        ui.ctx()
+            .data(|data| data.get_temp::<bool>(egui::Id::new("terminal-bold-installed"))),
+    ));
+    drop(state);
     let painter = ui.painter().with_clip_rect(rect);
+    tab.view.paint_rows.truncate(size.0 as usize);
     for row in 0..size.0 {
+        let row_selection = selection.filter(|(start, end)| row >= start.0 && row <= end.0);
+        let row_link = hovered_link
+            .as_ref()
+            .filter(|(_, start, end)| row >= start.0 && row <= end.0)
+            .map(|(_, start, end)| (*start, *end));
+        let key = egui::util::hash((
+            paint_key,
+            row,
+            screen.visible_row_id(row),
+            row_selection,
+            row_link,
+            history_top,
+        ));
+        if tab
+            .view
+            .paint_rows
+            .get(row as usize)
+            .is_some_and(|(old, _)| *old == key)
+        {
+            continue;
+        }
+        let mut painter = GridPaint::default();
         // The background and the underline belong to the cell, not to the
         // text, so they are painted for every cell.
         for col in 0..size.1 {
             let Some(c) = screen.cell(row, col) else {
                 continue;
             };
-            let origin = rect.min + egui::vec2(f32::from(col) * cell.x, f32::from(row) * cell.y);
+            let origin =
+                egui::Pos2::ZERO + egui::vec2(f32::from(col) * cell.x, f32::from(row) * cell.y);
             let cell_rect = egui::Rect::from_min_size(
                 origin,
                 egui::vec2(cell.x * if c.is_wide() { 2.0 } else { 1.0 }, cell.y),
             );
             let (fg, mut bg) = cell_colors(c, selection, row, col);
             if bg != chrome::SELECTED
-                && let Some(highlight) = tab.view.find.highlight(
-                    state.parser.screen().history_bounds().2 + u64::from(row),
-                    col,
-                )
+                && let Some(highlight) = tab.view.find.highlight(history_top + u64::from(row), col)
             {
                 bg = highlight;
             }
@@ -2926,26 +3039,32 @@ fn render(
                     continue;
                 };
                 let origin =
-                    rect.min + egui::vec2(f32::from(col) * cell.x, f32::from(row) * cell.y);
+                    egui::Pos2::ZERO + egui::vec2(f32::from(col) * cell.x, f32::from(row) * cell.y);
                 if !c.is_wide_continuation() && !c.contents().is_empty() {
                     let (fg, _) = cell_colors(c, selection, row, col);
                     let style = TerminalStyle::from_cell(c, fg);
                     let mut job = egui::text::LayoutJob::default();
                     job.append(c.contents(), 0.0, style.format(ui.ctx(), &font));
                     let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-                    paint_terminal_run(&painter, origin, galley, style, ui.ctx());
+                    paint_terminal_run(&mut painter, origin, galley, style, ui.ctx());
                 }
+            }
+            if row as usize == tab.view.paint_rows.len() {
+                tab.view.paint_rows.push((key, painter));
+            } else {
+                tab.view.paint_rows[row as usize] = (key, painter);
             }
             continue;
         }
-        let (text, runs) = row_runs(screen, row, size.1, selection);
+        let (text, runs) = row_runs(&screen, row, size.1, selection);
         let mut column = 0;
         for (range, style) in runs {
             let mut job = egui::text::LayoutJob::default();
             job.append(&text[range.clone()], 0.0, style.format(ui.ctx(), &font));
             let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-            let origin = rect.min + egui::vec2(column as f32 * cell.x, f32::from(row) * cell.y);
-            paint_terminal_run(&painter, origin, galley, style, ui.ctx());
+            let origin =
+                egui::Pos2::ZERO + egui::vec2(column as f32 * cell.x, f32::from(row) * cell.y);
+            paint_terminal_run(&mut painter, origin, galley, style, ui.ctx());
             // Count terminal cells rather than Unicode scalars (combining marks).
             column += (column..size.1)
                 .take_while(|col| {
@@ -2956,8 +3075,19 @@ fn render(
                 })
                 .count() as u16;
         }
+        if row as usize == tab.view.paint_rows.len() {
+            tab.view.paint_rows.push((key, painter));
+        } else {
+            tab.view.paint_rows[row as usize] = (key, painter);
+        }
     }
-    if focused && !screen.hide_cursor() && screen.scrollback() == 0 && !state.exited {
+    for (_, paint) in &tab.view.paint_rows {
+        painter.extend(paint.shapes.iter().cloned().map(|mut shape| {
+            shape.translate(rect.min.to_vec2());
+            shape
+        }));
+    }
+    if focused && !screen.hide_cursor() && live_scrollback == 0 && !exited {
         let (row, col) = screen.cursor_position();
         let origin = rect.min + egui::vec2(f32::from(col) * cell.x, f32::from(row) * cell.y);
         painter.rect_filled(
@@ -2982,7 +3112,7 @@ fn render(
             egui::StrokeKind::Inside,
         );
     }
-    if let Some(error) = state.error.as_ref().or(tab.notice.as_ref()) {
+    if let Some(error) = error.as_ref().or(tab.notice.as_ref()) {
         painter.text(
             rect.left_bottom(),
             egui::Align2::LEFT_BOTTOM,
@@ -2990,11 +3120,11 @@ fn render(
             FontId::proportional(12.0),
             Color32::from_rgb(230, 115, 125),
         );
-    } else if state.exited || state.status == "Starting shell…" {
+    } else if exited || status == "Starting shell…" {
         painter.text(
             rect.left_bottom(),
             egui::Align2::LEFT_BOTTOM,
-            &state.status,
+            &status,
             FontId::proportional(12.0),
             chrome::MUTED,
         );
@@ -3028,6 +3158,9 @@ fn render(
             chrome::BLUE,
         );
     }
+    // Keep row allocations alive so parser writes invalidate row identities
+    // through copy-on-write, including synchronized-output snapshots.
+    tab.view.paint_screen = Some(screen);
     // Other tabs still use the desktop panel's dimensions; only this shared
     // session follows the browser grid.
     PtySize {
@@ -3041,6 +3174,25 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminal_snapshots_share_unchanged_rows_and_isolate_unicode_styles_and_links() {
+        let mut parser = vt100::Parser::new_with_callbacks(4, 20, 10, Callbacks::default());
+        parser.process(
+            "unchanged\r\n\x1b[31m猫\x1b[0m \x1b]8;;https://example.org\x1b\\link\x1b]8;;\x1b\\"
+                .as_bytes(),
+        );
+        let before = parser.screen().visible_snapshot();
+        assert_eq!(before.visible_row_id(0), parser.screen().visible_row_id(0));
+        assert_eq!(before.hyperlink(1, 3), Some("https://example.org"));
+        parser.process(b"\x1b[2;1Hchanged");
+        let after = parser.screen().visible_snapshot();
+        assert_eq!(before.visible_row_id(0), after.visible_row_id(0));
+        assert_ne!(before.visible_row_id(1), after.visible_row_id(1));
+        assert_eq!(before.cell(1, 0).unwrap().contents(), "猫");
+        assert_eq!(after.cell(1, 0).unwrap().contents(), "c");
+        assert_eq!(before.cell(1, 0).unwrap().fgcolor(), vt100::Color::Idx(1));
+        assert!(before.cell(1, 1).unwrap().is_wide_continuation());
+    }
 
     #[test]
     fn stopping_metadata_polling_does_not_wait_for_a_slow_query() {
@@ -3722,6 +3874,71 @@ while True:
                 .unwrap()
                 .0,
             Link::File("src/main.rs:42".into())
+        );
+    }
+
+    #[test]
+    fn terminal_links_search_the_identifier_under_the_pointer() {
+        let mut parser = vt100::Parser::new(6, 80, 0);
+        parser.process("error: module::needle() [猫_value] 123 --flag\r\n".as_bytes());
+        for (point, expected) in [
+            ((0, 7), "module"),
+            ((0, 15), "needle"),
+            ((0, 26), "猫_value"), // Wide glyph continuation.
+        ] {
+            assert_eq!(
+                terminal_link(parser.screen(), point, Path::new("/"), Path::new("/"))
+                    .unwrap()
+                    .0,
+                Link::Token(expected.into())
+            );
+        }
+        for point in [(0, 6), (0, 13), (0, 21), (0, 34), (5, 0)] {
+            assert!(
+                terminal_link(parser.screen(), point, Path::new("/"), Path::new("/")).is_none(),
+                "{point:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_file_links_rejoin_wrapped_and_repainted_rows() {
+        let path = "src/very_long_directory/main.rs:42:7";
+        for repaint in [false, true] {
+            let mut parser = vt100::Parser::new(8, 12, 20);
+            if repaint {
+                for (row, chunk) in path.as_bytes().chunks(12).enumerate() {
+                    parser.process(format!("\x1b[{};1H", row + 1).as_bytes());
+                    parser.process(chunk);
+                }
+                assert!(!parser.screen().row_wrapped(0));
+            } else {
+                parser.process(path.as_bytes());
+                assert!(parser.screen().row_wrapped(0));
+            }
+            for offset in 0..path.len() {
+                let (link, start, end) = terminal_link(
+                    parser.screen(),
+                    ((offset / 12) as u16, (offset % 12) as u16),
+                    Path::new("/"),
+                    Path::new("/"),
+                )
+                .unwrap();
+                assert_eq!(
+                    link,
+                    Link::File("src/very_long_directory/main.rs:42".into())
+                );
+                assert_eq!(start, (0, 0));
+                assert_eq!(end, (2, 11));
+            }
+        }
+        let mut parser = vt100::Parser::new(4, 12, 0);
+        parser.process(b"src/main.rs\r\nother.rs");
+        assert_eq!(
+            terminal_link(parser.screen(), (0, 0), Path::new("/"), Path::new("/"))
+                .unwrap()
+                .0,
+            Link::File("src/main.rs".into())
         );
     }
 

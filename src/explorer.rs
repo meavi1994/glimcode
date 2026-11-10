@@ -140,6 +140,23 @@ impl FileTree {
         Self::build_cancellable(root, files, folders, || false).expect("uncancelled build")
     }
 
+    pub fn build_shared_cancellable(
+        root: &Path,
+        files: std::sync::Arc<Vec<PathBuf>>,
+        folders: std::sync::Arc<Vec<PathBuf>>,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<Self> {
+        if files.len() >= crate::project_tree::THRESHOLD {
+            return Some(Self {
+                large: Some(crate::project_tree::LargeTree::build_shared(
+                    root, files, folders, &cancelled,
+                )?),
+                ..Default::default()
+            });
+        }
+        Self::build_cancellable(root, &files, &folders, cancelled)
+    }
+
     pub fn build_cancellable(
         root: &Path,
         files: &[PathBuf],
