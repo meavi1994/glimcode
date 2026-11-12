@@ -3,6 +3,181 @@ use super::tests::wait_for;
 use super::*;
 
 #[test]
+#[ignore = "requires zmx and permission to create local Unix sockets"]
+fn zmx_reconnect_preserves_panel_geometry_before_attaching() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let settings = Settings {
+        shell: "/bin/sh".into(),
+        terminal_backend: "zmx".into(),
+        tmux_enabled: true,
+        ..Default::default()
+    };
+    let ctx = egui::Context::default();
+    let mut terminal = Terminal {
+        settings: settings.clone(),
+        ..Default::default()
+    };
+    terminal.new_tab(dir.path(), &ctx);
+    let backend = terminal.tabs[0].persistent.clone().unwrap();
+    struct Cleanup(tmux::Persistent);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = zmx::run(self.0.executable(), &["kill", &self.0.name, "--force"]);
+        }
+    }
+    let _cleanup = Cleanup(backend);
+    ctx.data_mut(|d| {
+        d.insert_persisted(
+            egui::Id::new("terminal-panel"),
+            egui::containers::panel::PanelState {
+                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 450.0)),
+            },
+        )
+    });
+    let frame = |ctx: &egui::Context, terminal: &mut Terminal| {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| terminal.panel(ctx, dir.path(), true),
+        );
+    };
+    frame(&ctx, &mut terminal);
+    let original = terminal.tabs[0].size;
+    wait_for(&terminal.tabs[0].screen, |s| s.status == "Running");
+    let snapshot = terminal.snapshot();
+    let screen = terminal.tabs[0].screen.clone();
+    drop(terminal);
+    wait_for(&screen, |s| s.exited);
+    let reopened_ctx = egui::Context::default();
+    let mut reopened = Terminal {
+        settings,
+        ..Default::default()
+    };
+    reopened.restore(&snapshot);
+    frame(&reopened_ctx, &mut reopened);
+    assert_eq!(reopened.tabs[0].size, original);
+    wait_for(&reopened.tabs[0].screen, |s| s.status == "Running");
+    reopened.tabs[0].send(Command::Input(
+        b"stty size; printf 'GEOMETRY_RESTORED\\n'\n".to_vec(),
+    ));
+    wait_for(&reopened.tabs[0].screen, |s| {
+        s.parser.screen().contents().contains("GEOMETRY_RESTORED")
+            && s.parser
+                .screen()
+                .contents()
+                .contains(&format!("{} {}", original.0, original.1))
+    });
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires zmx, ttyd and permission to create Unix and TCP sockets"]
+fn zmx_stopping_unused_share_preserves_resized_hidden_desktop() -> Result<()> {
+    use std::net::{Ipv4Addr, TcpListener};
+    let ctx = egui::Context::default();
+    let dir = tempfile::tempdir()?;
+    let mut terminal = Terminal {
+        settings: Settings {
+            shell: "/bin/sh".into(),
+            terminal_backend: "zmx".into(),
+            tmux_enabled: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    terminal.new_tab(dir.path(), &ctx);
+    let backend = terminal.tabs[0].persistent.clone().unwrap();
+    struct Cleanup(tmux::Persistent);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = zmx::run(self.0.executable(), &["kill", &self.0.name, "--force"]);
+        }
+    }
+    let _cleanup = Cleanup(backend.clone());
+    let frame = |terminal: &mut Terminal, dimensions| {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, dimensions)),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| terminal.contents(ui, dir.path(), true));
+            },
+        );
+    };
+    frame(&mut terminal, egui::vec2(1000.0, 600.0));
+    let original = terminal.tabs[0].size;
+    wait_for(&terminal.tabs[0].screen, |s| s.status == "Running");
+    let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let port = reservation.local_addr()?.port();
+    drop(reservation);
+    let share = share::Share::start(
+        backend,
+        share::Options {
+            https: false,
+            port,
+            ..Default::default()
+        },
+        ctx.clone(),
+        terminal.tabs[0].resize(),
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(share.status(), share::Status::Running) {
+        if let share::Status::Failed(e) = share.status() {
+            bail!("share startup: {e}");
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    frame(&mut terminal, egui::vec2(800.0, 400.0));
+    let desired = terminal.tabs[0].size;
+    assert_ne!(desired, original);
+    wait_for(&terminal.tabs[0].screen, |s| {
+        s.parser.screen().size() == desired
+    });
+    assert!(share.size().is_none());
+    terminal.visible = false;
+    drop(share);
+    // The input marker is a barrier after any resize queued by Share::drop.
+    terminal.tabs[0].send(Command::Input(
+        b"printf '\\033]2;SHARE_STOPPED\\007'\n".to_vec(),
+    ));
+    wait_for(&terminal.tabs[0].screen, |s| {
+        s.parser.callbacks().title == "SHARE_STOPPED"
+    });
+    assert_eq!(
+        terminal.tabs[0]
+            .screen
+            .lock()
+            .unwrap()
+            .parser
+            .screen()
+            .size(),
+        desired
+    );
+    let phone = PtySize {
+        rows: 45,
+        cols: 42,
+        ..FALLBACK_SIZE
+    };
+    terminal.tabs[0].resize().remote(Some(phone));
+    wait_for(&terminal.tabs[0].screen, |s| {
+        s.parser.screen().size() == (phone.rows, phone.cols)
+    });
+    terminal.tabs[0].resize().remote(None);
+    wait_for(&terminal.tabs[0].screen, |s| {
+        s.parser.screen().size() == desired
+    });
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires GLIMCODE_ZMX_PATH and permission to create local Unix sockets"]
 fn zmx_output_reflows_after_narrowing_and_restoring_desktop_width() -> Result<()> {
     let dir = tempfile::tempdir()?;

@@ -66,8 +66,7 @@ impl Share {
         session: tmux::Persistent,
         options: Options,
         ctx: egui::Context,
-        sender: SyncSender<Command>,
-        desktop_size: PtySize,
+        resize: ResizeSender,
     ) -> Result<Self> {
         let executable = tmux::find_executable("ttyd").context(
             "ttyd is not installed. Install it with `brew install ttyd` on macOS, then try again.",
@@ -88,13 +87,13 @@ impl Share {
         let size = Arc::new(Mutex::new(None));
         let worker_size = size.clone();
         let worker = std::thread::spawn(move || {
-            struct RestoreSize(SyncSender<Command>, PtySize);
+            struct RestoreSize(ResizeSender);
             impl Drop for RestoreSize {
                 fn drop(&mut self) {
-                    let _ = self.0.try_send(Command::Resize(self.1));
+                    self.0.remote(None);
                 }
             }
-            let _restore = RestoreSize(sender.clone(), desktop_size);
+            let _restore = RestoreSize(resize.clone());
             let result = run(
                 &session,
                 &executable,
@@ -105,8 +104,7 @@ impl Share {
                 &ctx,
                 &worker_fingerprint,
                 &worker_size,
-                &sender,
-                desktop_size,
+                &resize,
             );
             *shared.lock().unwrap() = match result {
                 Ok(()) => Status::Stopped,
@@ -239,8 +237,7 @@ fn run(
     ctx: &egui::Context,
     fingerprint: &Mutex<Option<String>>,
     size: &Mutex<Option<PtySize>>,
-    sender: &SyncSender<Command>,
-    desktop_size: PtySize,
+    resize: &ResizeSender,
 ) -> Result<()> {
     if !session.exists() {
         bail!(
@@ -316,11 +313,9 @@ fn run(
         let connected = share_client::connected_size(size_directory.path());
         {
             let mut previous = size.lock().unwrap();
-            if *previous != connected
-                && sender
-                    .try_send(Command::Resize(connected.unwrap_or(desktop_size)))
-                    .is_ok()
-            {
+            let changed = *previous != connected;
+            // Retry after queue pressure; all producers share the sent-size cache.
+            if resize.remote(connected) && changed {
                 *previous = connected;
                 ctx.request_repaint();
             }
@@ -635,8 +630,7 @@ mod tests {
                 ..Default::default()
             },
             egui::Context::default(),
-            mpsc::sync_channel(128).0,
-            FALLBACK_SIZE,
+            ResizeSender::new(mpsc::sync_channel(128).0, Default::default()),
         )?;
         let deadline = Instant::now() + Duration::from_secs(6);
         while matches!(share.status(), Status::Starting) && Instant::now() < deadline {

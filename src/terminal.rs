@@ -5,6 +5,7 @@ mod https;
 mod macos;
 mod mobile;
 mod qr;
+mod resize;
 mod scrollbar;
 mod sessions;
 mod share;
@@ -18,6 +19,7 @@ mod zmx_trial;
 use anyhow::{Context, Result, bail};
 use eframe::egui::{self, Color32, FontId, Key, Modifiers};
 use portable_pty::{ChildKiller, CommandBuilder, PtySize};
+use resize::{ResizeSender, ResizeState};
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -396,6 +398,7 @@ struct Session {
     default_name: String,
     screen: Arc<Mutex<ScreenState>>,
     tx: SyncSender<Command>,
+    resize: Arc<Mutex<ResizeState>>,
     stopped: Arc<AtomicBool>,
     killer: Killer,
     size: (u16, u16),
@@ -458,6 +461,8 @@ impl Session {
         let stopped = Arc::new(AtomicBool::new(false));
         let killer: Killer = Arc::new(Mutex::new(None));
         let (tx, rx) = mpsc::sync_channel(128);
+        let resize = Arc::new(Mutex::new(ResizeState::default()));
+        let retry_resize = ResizeSender::new(tx.clone(), resize.clone());
         let shared = screen.clone();
         let stop = stopped.clone();
         let kill = killer.clone();
@@ -565,6 +570,9 @@ impl Session {
                     })
                 });
                 loop {
+                    // A share can stop while the input queue is full and the
+                    // panel is hidden. Retry its pending desktop restoration.
+                    retry_resize.retry();
                     if stop.load(Ordering::Relaxed) {
                         let _ = child.0.kill();
                         let _ = child.0.wait();
@@ -596,6 +604,9 @@ impl Session {
                         Ok(Command::Resize(size)) => {
                             // Keep output from being parsed with the old geometry after SIGWINCH.
                             let mut state = shared.lock().unwrap();
+                            if state.parser.screen().size() == (size.rows, size.cols) {
+                                continue;
+                            }
                             pair.master.resize(size)?;
                             if direct_pty {
                                 state
@@ -661,6 +672,7 @@ impl Session {
             default_name,
             screen,
             tx,
+            resize,
             stopped,
             killer,
             // Unknown, so the first frame always reports the real size.
@@ -673,7 +685,13 @@ impl Session {
         }
     }
     fn send(&self, command: Command) -> bool {
-        self.tx.try_send(command).is_ok()
+        match command {
+            Command::Resize(size) => self.resize().desktop(size),
+            command => self.tx.try_send(command).is_ok(),
+        }
+    }
+    fn resize(&self) -> ResizeSender {
+        ResizeSender::new(self.tx.clone(), self.resize.clone())
     }
 }
 
@@ -730,6 +748,8 @@ pub struct Terminal {
     /// The last size the panel reported, shared with the tabs in the
     /// background.
     size: Option<PtySize>,
+    panel_height: Option<f32>,
+    restore_panel_height: bool,
     next_id: u64,
     focus: bool,
     pending_close: Option<u64>,
@@ -883,6 +903,9 @@ impl Terminal {
         if sessions.iter().any(Option::is_some) {
             value["sessions"] = serde_json::json!(sessions);
         }
+        if let Some(height) = self.panel_height {
+            value["panel_height"] = serde_json::json!(height);
+        }
         value
     }
 
@@ -917,6 +940,12 @@ impl Terminal {
         self.visible = value["visible"].as_bool().unwrap_or(false);
         self.maximized = value["maximized"].as_bool().unwrap_or(false);
         self.metadata_changed = false;
+        self.panel_height = value["panel_height"]
+            .as_f64()
+            .filter(|h| h.is_finite() && *h >= 120.0 && *h <= 10000.0)
+            .map(|h| h as f32);
+        self.restore_panel_height = self.panel_height.is_some();
+        self.size = None;
     }
 
     fn materialize_restored_tabs(&mut self, ctx: &egui::Context) {
@@ -1020,12 +1049,29 @@ impl Terminal {
         if self.tabs.is_empty() {
             self.new_tab(root, ctx);
         }
-        egui::TopBottomPanel::bottom("terminal-panel")
+        if self.restore_panel_height {
+            self.restore_panel_height = false;
+            let height = self.panel_height.unwrap();
+            let width = ctx.available_rect().width();
+            ctx.data_mut(|data| {
+                data.insert_persisted(
+                    egui::Id::new("terminal-panel"),
+                    egui::containers::panel::PanelState {
+                        rect: egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, height),
+                        ),
+                    },
+                )
+            });
+        }
+        let response = egui::TopBottomPanel::bottom("terminal-panel")
             .resizable(true)
             .default_height(290.0)
             .min_height(120.0)
             .frame(egui::Frame::new().fill(chrome::EDITOR))
             .show(ctx, |ui| self.contents(ui, root, enabled));
+        self.panel_height = Some(response.response.rect.height());
     }
 
     pub fn central_panel(&mut self, ctx: &egui::Context, root: &Path, enabled: bool) {
@@ -1257,12 +1303,13 @@ impl Terminal {
         };
         for (index, tab) in self.tabs.iter_mut().enumerate() {
             tab.view.remote_size = self.shares.get(&tab.id).and_then(share::Share::size);
-            let pty = tab.view.remote_size.unwrap_or(pty);
-            if index != self.active
-                && tab.size != (pty.rows, pty.cols)
-                && tab.send(Command::Resize(pty))
-            {
-                tab.size = (pty.rows, pty.cols);
+            if index != self.active && tab.resize().desktop(pty) {
+                let effective = tab.view.remote_size.unwrap_or(pty);
+                if tab.size != (effective.rows, effective.cols) {
+                    tab.size = (effective.rows, effective.cols);
+                    tab.selection = None;
+                    tab.view.selection = None;
+                }
             }
         }
     }
@@ -1589,14 +1636,7 @@ impl Terminal {
             return;
         };
         let session = tab.persistent.clone();
-        let sender = tab.tx.clone();
-        let (rows, cols) = tab.screen.lock().unwrap().parser.screen().size();
-        let desktop_size = PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
+        let resize = tab.resize();
         let mut dismiss = false;
         let mut start = false;
         let mut stop = false;
@@ -1732,13 +1772,8 @@ impl Terminal {
         }
         if start {
             if let Some(session) = session {
-                match share::Share::start(
-                    session,
-                    self.share_options.clone(),
-                    ctx.clone(),
-                    sender,
-                    desktop_size,
-                ) {
+                match share::Share::start(session, self.share_options.clone(), ctx.clone(), resize)
+                {
                     Ok(server) => {
                         self.shares.insert(id, server);
                         self.share_error = None;
@@ -2337,18 +2372,27 @@ fn render(
     font_size: f32,
 ) -> PtySize {
     let id = egui::Id::new(("terminal-input", tab.id));
+    let mut font = FontId::monospace(font_size);
+    let mut cell =
+        ui.fonts_mut(|f| egui::vec2(f.glyph_width(&font, 'M'), f.row_height(&font) + 2.0));
+    let (_, panel_rect) = ui.allocate_space(ui.available_size().max(egui::vec2(10.0, 30.0)));
+    // Find overlays the grid so searching never resizes the running program
+    // or changes the geometry propagated to other tabs.
     if tab.view.find.open {
-        let closed = ui
-            .add_enabled_ui(enabled, |ui| tab.view.find.ui(ui, id))
+        let closed = egui::Area::new(id.with("find-overlay"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(panel_rect.min)
+            .constrain_to(panel_rect)
+            .show(ui.ctx(), |ui| {
+                ui.set_width(panel_rect.width());
+                ui.add_enabled_ui(enabled, |ui| tab.view.find.ui(ui, id))
+                    .inner
+            })
             .inner;
         if closed {
             *focus = true;
         }
     }
-    let mut font = FontId::monospace(font_size);
-    let mut cell =
-        ui.fonts_mut(|f| egui::vec2(f.glyph_width(&font, 'M'), f.row_height(&font) + 2.0));
-    let (_, panel_rect) = ui.allocate_space(ui.available_size().max(egui::vec2(10.0, 30.0)));
     let scrollbar_rect = egui::Rect::from_min_max(
         egui::pos2(panel_rect.right() - scrollbar::WIDTH, panel_rect.top()),
         panel_rect.max,
@@ -2401,7 +2445,12 @@ fn render(
         pixel_width: 0,
         pixel_height: 0,
     };
-    if size != tab.size && tab.send(Command::Resize(pty)) {
+    let desktop = PtySize {
+        rows: local_size.0,
+        cols: local_size.1,
+        ..pty
+    };
+    if tab.resize().desktop(desktop) && size != tab.size {
         tab.size = size;
         tab.selection = None;
         tab.view.selection = None;
@@ -3381,6 +3430,7 @@ while True:
                 default_name: "Local".into(),
                 screen: screen.clone(),
                 tx,
+                resize: Default::default(),
                 stopped: Arc::new(AtomicBool::new(false)),
                 killer: Arc::new(Mutex::new(None)),
                 size: (0, 0),
@@ -3468,6 +3518,32 @@ while True:
         parser.screen_mut().set_size_reflow(6, 24);
         assert!(parser.screen().contents().contains("0123456789abcdefghij"));
         assert_eq!(parser.screen().cell(3, 19).unwrap().contents(), "j");
+    }
+
+    #[test]
+    fn terminal_reflow_handles_history_widths_left_by_scroll_region_resizes() {
+        for intermediate in [10, 40] {
+            let mut parser = vt100::Parser::new(6, 24, 100);
+            let line = "history:abcdefghijklmnop";
+            parser.process(format!("{line}\r\n").repeat(20).as_bytes());
+            parser.process(b"\x1b[2;5r");
+            parser.screen_mut().set_size_reflow(6, intermediate);
+            parser.process(b"\x1b[r");
+            parser.screen_mut().set_size_reflow(6, 50);
+            parser.screen_mut().set_scrollback(100);
+            assert!(
+                parser.screen().contents().contains(line),
+                "history survives intermediate width {intermediate}"
+            );
+        }
+        // Clipping a wide glyph at a scroll-region boundary must not leave an
+        // orphaned leading cell that a subsequent reflow reads past.
+        let mut parser = vt100::Parser::new(6, 24, 100);
+        parser.process("123456789猫\x1b[2;5r".as_bytes());
+        parser.screen_mut().set_size_reflow(6, 10);
+        parser.process(b"\x1b[r");
+        parser.screen_mut().set_size_reflow(6, 40);
+        assert!(parser.screen().contents().contains("123456789"));
     }
 
     #[test]
@@ -3750,6 +3826,7 @@ while True:
                 default_name: String::new(),
                 screen,
                 tx,
+                resize: Default::default(),
                 stopped: Arc::new(AtomicBool::new(false)),
                 killer: Arc::new(Mutex::new(None)),
                 size: (24, 80),
@@ -4036,6 +4113,7 @@ while True:
             default_name: String::new(),
             screen,
             tx,
+            resize: Default::default(),
             stopped: Arc::new(AtomicBool::new(false)),
             killer: Arc::new(Mutex::new(None)),
             size: (24, 80),
@@ -4360,6 +4438,7 @@ while True:
             default_name: "Local".into(),
             screen: Arc::new(Mutex::new(ScreenState::default())),
             tx,
+            resize: Default::default(),
             stopped: Arc::new(AtomicBool::new(false)),
             killer: Arc::new(Mutex::new(None)),
             size: (24, 80),
@@ -5155,6 +5234,7 @@ while True:
             default_name: String::new(),
             screen: screen.clone(),
             tx,
+            resize: Default::default(),
             stopped: Arc::new(AtomicBool::new(false)),
             killer: Arc::new(Mutex::new(None)),
             size: (24, 80),
@@ -5279,6 +5359,7 @@ while True:
             default_name: String::new(),
             screen: screen.clone(),
             tx,
+            resize: Default::default(),
             stopped: Arc::new(AtomicBool::new(false)),
             killer: Arc::new(Mutex::new(None)),
             size: (24, 80),
@@ -5653,6 +5734,7 @@ while True:
             default_name: String::new(),
             screen: screen.clone(),
             tx,
+            resize: Default::default(),
             stopped: Arc::new(AtomicBool::new(false)),
             killer: Arc::new(Mutex::new(None)),
             size: (24, 80),
@@ -5702,6 +5784,7 @@ while True:
             default_name: String::new(),
             screen: screen.clone(),
             tx,
+            resize: Default::default(),
             stopped: Arc::new(AtomicBool::new(false)),
             killer: Arc::new(Mutex::new(None)),
             size: (0, 0),
@@ -5719,6 +5802,7 @@ while True:
             default_name: String::new(),
             screen,
             tx,
+            resize: Default::default(),
             stopped: Arc::new(AtomicBool::new(false)),
             killer: Arc::new(Mutex::new(None)),
             size: (24, 80),
@@ -5776,6 +5860,7 @@ while True:
             default_name: String::new(),
             screen,
             tx,
+            resize: Default::default(),
             stopped: Arc::new(AtomicBool::new(false)),
             killer: Arc::new(Mutex::new(None)),
             size: (24, 80),
@@ -5787,6 +5872,7 @@ while True:
         };
         let mut focus = true;
         let mut frame = |events, size, remote_size| {
+            tab.resize().remote(remote_size);
             tab.view.remote_size = remote_size;
             let _ = ctx.run(
                 egui::RawInput {

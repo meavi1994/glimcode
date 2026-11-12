@@ -510,6 +510,7 @@ mod tests {
             default_name: String::new(),
             screen: Arc::new(Mutex::new(ScreenState::default())),
             tx,
+            resize: Default::default(),
             stopped: Arc::new(AtomicBool::new(false)),
             killer: Arc::new(Mutex::new(None)),
             size: (24, 80),

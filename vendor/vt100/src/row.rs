@@ -18,7 +18,7 @@ impl Row {
         }
     }
 
-    fn cols(&self) -> u16 {
+    pub(crate) fn cols(&self) -> u16 {
         self.cells
             .len()
             .try_into()
@@ -75,6 +75,13 @@ impl Row {
     }
 
     pub fn resize(&mut self, len: u16, cell: crate::Cell) {
+        if len == self.cols() {
+            return;
+        }
+        if len < self.cols() {
+            self.truncate(len);
+            return;
+        }
         std::sync::Arc::make_mut(&mut self.cells).resize(usize::from(len), cell);
         self.wrapped = false;
     }

@@ -1,13 +1,10 @@
-## Changes in v0.2.0
+## Changes in v0.2.4
 
-- Added Git worktree creation, safe removal, and switching. Each workspace keeps its unsaved buffers, editor tabs, navigation history, and live terminals while the app is running.
-- Reworked workspace navigation with folder-first cards, branch labels, active and unsaved indicators, visible action menus, and a creation button above the scrolling list. New worktrees default to a sibling folder and a branch matching their name.
-- Refreshed the editor with a slate palette, clearer selected tabs, consistent controls, a useful welcome screen, and an active indentation guide for the current code scope.
-- Unified project files and changes into a right-side Files panel. Comparison controls start collapsed; expanding them reveals a full-width branch selector with bounded, searchable choices and long-name tooltips.
-- Added persistent folder sessions under `~/.glimcode/projects/`, shared settings in `~/.glimcode/settings.json`, and last-folder state in `~/.glimcode/state.json`. Existing `~/.coder` settings migrate while retaining the old file and unknown settings keys.
-- Reopening a folder restores file tabs, active tab, cursor locations, panel visibility, and terminal tabs. Restored terminals start fresh shells on demand in their reported or launch directories. Shell commands are never replayed. Unsaved buffers, running processes, and terminal scrollback are not restored after quitting.
-- Improved Git review with selectable source text, hunk reversion into editor buffers, synchronized comparisons, and changed-file navigation.
-- Reduced work during workspace rendering by removing worktree-list clones and moving path normalization off the render loop. Added regression coverage for session persistence, narrow comparison controls, workspace menus, scope guides, and panel resizing.
+- Fixed unnecessary terminal resizes when opening Find or switching terminal tabs. Find now overlays the terminal without changing the running program’s grid.
+- Restored window and panel dimensions across IDE restarts, including each project’s terminal panel height before reconnecting persistent zmx sessions.
+- Fixed a scrollback reflow crash after resizing an application that uses a scroll region, and preserved history written at different widths.
+- Unified desktop and browser resize requests, removed duplicate resizes, and made stopping sharing restore the latest desktop size, including when the terminal panel is hidden.
+- Added regression tests for resize ownership, queue pressure, Find, reconnect geometry, scroll regions, and live zmx sharing.
 
 ## Installation
 

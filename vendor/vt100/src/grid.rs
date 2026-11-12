@@ -64,6 +64,9 @@ impl Grid {
     }
 
     pub fn set_size(&mut self, size: Size) {
+        if size == self.size {
+            return;
+        }
         if size.cols != self.size.cols {
             for row in &mut self.rows {
                 row.wrap(false);
@@ -112,13 +115,12 @@ impl Grid {
         let cursor_row = history + usize::from(self.pos.row);
         let saved_row = history + usize::from(self.saved_pos.row);
         let viewport = history.saturating_sub(self.scrollback_offset);
-        let old_cols = self.size.cols;
         let mut source: Vec<_> = self.scrollback.drain(..).collect();
         source.append(&mut self.rows);
         // Empty rows below the cursor are spare screen space, not output.
         while source.len() > cursor_row.max(saved_row) + 1
             && source.last().is_some_and(|row| {
-                !row.wrapped() && (0..old_cols).all(|col| row.get(col) == Some(&crate::Cell::new()))
+                !row.wrapped() && (0..row.cols()).all(|col| row.get(col) == Some(&crate::Cell::new()))
             })
         {
             source.pop();
@@ -130,6 +132,8 @@ impl Grid {
         let mut saved = (0, 0);
         let mut view_row = 0;
         for (index, old) in source.iter().enumerate() {
+            // Scroll-region resizes keep history at its original width.
+            let old_cols = old.cols();
             if index == viewport {
                 view_row = rows.len();
             }
